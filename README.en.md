@@ -10,9 +10,11 @@ A headless browser that runs JavaScript but never draws anything, plus a reader
 that turns the settled page into Markdown.
 
 It exists because agents pay Chromium's full cost — layout, style cascade,
-compositing, GPU process, ~300 MB of resident memory — to obtain text. None of
-that machinery affects the text. Removing it leaves a browser that fits in a
-5 MB binary and renders a client-side page in single-digit milliseconds.
+compositing, GPU process — to obtain text. None of that machinery affects the
+text. Removing it leaves a 5.3 MB browser that renders a client-side page in
+8 ms and 6 MB of memory. The same page through `chrome-headless-shell` on the
+same machine: 118 ms and 66 MB. Every figure is measured; the harness is in
+`bench/`.
 
 ```
 $ mar read https://example.com/spa-page
@@ -23,19 +25,101 @@ Rolling deploys work by never taking the whole fleet out of rotation at once…
 
 ## What it costs
 
-Measured on an M-series Mac, release build, one page per process.
+Every figure below is measured, not estimated. The harness is in `bench/`: the
+same local pages are served to both engines, each gets a fresh process per page,
+time runs from spawn to exit, and peak memory comes from the kernel through
+`/usr/bin/time` rather than from either program's own accounting. Median of five
+runs, first discarded as a warm-up.
 
-| | mini-agent-reader | Headless Chromium |
+The comparison is against `chrome-headless-shell` 150, which is Chromium's
+lightest and fastest path: no interface, no GPU process. Full Chromium through
+Puppeteer costs more.
+
+```bash
+python3 bench/fixtures.py 8760 &     # the local pages
+python3 bench/run.py                 # the comparison
+```
+
+### One page, one process
+
+M-series Mac, release build. `mar fetch` and `chrome --dump-dom` do the same
+thing: run the scripts and print the resulting DOM.
+
+| Page | mar | Chromium | ratio |
+|---|---|---|---|
+| Article, 15 KB | **8 ms / 6 MB** | 121 ms / 66 MB | 15× time, 11× memory |
+| Client-rendered with `fetch` | **8 ms / 6 MB** | 118 ms / 66 MB | 15× / 11× |
+| Work spread over 3 s | **7 ms / 5 MB** | 119 ms / 66 MB | 17× / 13× |
+| Large page, 145 KB | **8 ms / 6 MB** | 139 ms / 70 MB | 17× / 12× |
+
+The harness checks that both engines did the same work: it looks in each
+engine's output for a marker that only appears once the scripts have run. For
+the client-rendered case that is text arriving from `fetch`; for the deferred
+page it is the sixth chunk, appended three seconds in. Both engines find both
+markers, so the timings compare equal amounts of work rather than two different
+ones.
+
+### Startup and size on disk
+
+| | mar | chrome-headless-shell |
 |---|---|---|
-| Binary | 5 MB | ~150 MB installed |
-| Peak RSS, typical page | 6–8 MB | 250–400 MB |
-| Peak RSS, large page (Wikipedia) | 19 MB | 400 MB+ |
-| Render time, local SPA | 4 ms | 300–800 ms |
-| Cold start | ~2 ms | 150–400 ms |
+| Cold start | **3.2 ms / 2.2 MB** | 9.4 ms / 5.8 MB |
+| On disk | **5.3 MB** | 193 MB |
 
-The virtual clock is the reason for the render figure. A page that spreads its
-work over three seconds of `setTimeout` settles in microseconds, because time
-only advances when nothing else is runnable.
+The 36× disk difference has practical consequences: container image size,
+deployment time, CI cache volume.
+
+### As a service
+
+The figures above include process startup on every page. A service starts once,
+and the picture changes:
+
+```
+60 client-rendered pages on 4 workers in 68 ms  =  888 pages/sec, 1.1 ms each
+```
+
+### Real sites
+
+Here the wall time includes the network and says more about the site than the
+engine. Memory does not: it is set by document size and how much script the page
+runs.
+
+| Site | total | render | memory | extracted | scripts |
+|---|---|---|---|---|---|
+| example.com | 268 ms | 10 ms | 6.9 MB | 125 chars | 0 |
+| lenta.ru | 213 ms | 9 ms | 9.1 MB | 15,982 | 10 |
+| ria.ru | 178 ms | 19 ms | 8.9 MB | 8,317 | 20 |
+| habr.com | 465 ms | 12 ms | 10.4 MB | 1,651 | 7 |
+| gosuslugi.ru | 9.9 s | 9.8 s | 8.3 MB | 82 | 1 |
+| docs.python.org | 1.0 s | 640 ms | 8.6 MB | 12,316 | 12 |
+| Wikipedia, long article | 572 ms | 80 ms | 27.7 MB | 91,550 | 4 |
+| MDN | 1.6 s | 1.3 s | 12.4 MB | 2,002 | 5 |
+
+The gosuslugi.ru row is shown deliberately: it is a heavy single-page
+application that exhausts the wall-clock budget and is cut short. A response
+comes back, but the page yields little readable text. Cases like this are
+flagged `truncated` in the report.
+
+Wikipedia is the memory ceiling: a document over a megabyte costs 27.7 MB, still
+half what Chromium spends on an empty tab.
+
+### Where the difference comes from
+
+Three sources, in order of contribution.
+
+**No renderer.** No layout, no style cascade, no paint, no compositor, no GPU
+process. That is most of Chromium's memory and time, and none of it affects the
+text.
+
+**A virtual clock.** A page spreading its work over three seconds of timers
+settles in microseconds, because time only advances when nothing else is
+runnable. Chromium has a comparable mechanism, `--virtual-time-budget`, and it
+is enabled in the comparison above — without it the gap on that row would be
+400×, not 17×.
+
+**An arena DOM.** Nodes live in a flat `Vec` addressed by a 32-bit index, with
+no per-node reference counting. Dropping a document is one walk rather than a
+cascade of counters.
 
 ## Russian sites out of the box
 
