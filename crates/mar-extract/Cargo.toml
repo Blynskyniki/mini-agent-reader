@@ -1,0 +1,11 @@
+[package]
+name = "mar-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mar-dom.workspace = true
+url.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/mar-dom", "crates/mar-js", "crates/mar-net", "crates/mar-extract", "crates/mar-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+html5ever = "0.39"
+markup5ever = "0.39"
+web_atoms = "0.2"
+tendril = "0.5"
+selectors = "0.40"
+cssparser = "0.37"
+string_cache = "0.11"
+anyhow = "1"
+rquickjs = { version = "0.12", features = ["macro", "classes", "properties", "array-buffer"] }
+mar-dom = { path = "crates/mar-dom" }
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mar-js = { path = "crates/mar-js" }
+ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip", "brotli", "cookies", "charset"] }
+encoding_rs = "0.8"
+tracing = "0.1"
+mar-net = { path = "crates/mar-net" }
+mar-extract = { path = "crates/mar-extract" }
+clap = { version = "4.6", features = ["derive", "env"] }
+tiny_http = "0.12"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

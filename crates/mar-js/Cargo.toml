@@ -1,0 +1,13 @@
+[package]
+name = "mar-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mar-dom.workspace = true
+rquickjs.workspace = true
+url.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

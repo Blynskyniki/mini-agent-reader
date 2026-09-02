@@ -1,0 +1,13 @@
+[package]
+name = "mar-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mar-js.workspace = true
+ureq.workspace = true
+encoding_rs.workspace = true
+url.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

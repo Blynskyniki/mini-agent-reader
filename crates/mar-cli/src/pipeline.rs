@@ -1,0 +1,377 @@
+//! Fetch, render, extract: the whole journey from a URL to Markdown.
+
+use mar_dom::{Document, LocalName, NodeId, StrTendril};
+use mar_extract::{MarkdownOptions, Reading};
+use mar_js::{Limits, Page};
+use mar_net::{ClientConfig, HttpClient, PageNetwork, Policy};
+use serde::Serialize;
+use std::time::Instant;
+use url::Url;
+
+/// How to handle one page.
+#[derive(Debug, Clone)]
+pub struct RenderOptions {
+    /// Run scripts. Off is much faster and enough for server-rendered pages.
+    pub javascript: bool,
+    /// Fetch and run `<script src=...>`. Off runs only inline scripts.
+    pub external_scripts: bool,
+    /// External scripts fetched before giving up on the rest.
+    pub max_external_scripts: usize,
+    /// Follow a `location.href` assignment or `location.replace` call made by
+    /// a script, the way a browser would.
+    pub follow_client_navigation: bool,
+    pub limits: Limits,
+    pub markdown: MarkdownOptions,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        RenderOptions {
+            javascript: true,
+            external_scripts: true,
+            max_external_scripts: 12,
+            follow_client_navigation: true,
+            limits: Limits::default(),
+            markdown: MarkdownOptions::default(),
+        }
+    }
+}
+
+/// What one page cost and produced.
+#[derive(Debug, Serialize)]
+pub struct RenderReport {
+    pub url: String,
+    pub final_url: String,
+    pub status: u16,
+    pub charset: String,
+    /// Whether scripts ran at all.
+    pub javascript: bool,
+    pub scripts_inlined: usize,
+    pub scripts_run: usize,
+    pub timer_callbacks: u64,
+    pub subresource_requests: usize,
+    /// Virtual milliseconds the page's own clock reached.
+    pub virtual_ms: i64,
+    pub fetch_ms: u128,
+    pub render_ms: u128,
+    pub extract_ms: u128,
+    pub total_ms: u128,
+    /// Script errors, capped. Present when something did not run cleanly.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+    /// Console output, only when the caller asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub console: Option<Vec<String>>,
+    /// A navigation the page requested and we did not follow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_navigation: Option<String>,
+    /// True when the settle loop hit a limit instead of going quiet.
+    pub truncated: bool,
+}
+
+/// A rendered page plus what it cost.
+pub struct Rendered {
+    pub document: Document,
+    pub report: RenderReport,
+    /// HTML after scripts ran.
+    pub html: String,
+}
+
+pub struct Renderer {
+    client: HttpClient,
+}
+
+impl Renderer {
+    pub fn new(policy: Policy) -> Self {
+        Renderer {
+            client: HttpClient::new(ClientConfig {
+                policy,
+                ..ClientConfig::default()
+            }),
+        }
+    }
+
+    /// Fetch `url`, run its scripts, and hand back the settled document.
+    ///
+    /// Follows redirects a browser would follow but HTTP does not express:
+    /// `<meta http-equiv="refresh">` and a script assigning `location`. Sites
+    /// that moved a URL, and consent or region gates, both work this way, so
+    /// without this a caller frequently gets a stub page.
+    pub fn render(&self, url: &str, options: &RenderOptions) -> anyhow::Result<Rendered> {
+        let started = Instant::now();
+        let mut target = url.to_owned();
+        let mut hops = 0usize;
+        let mut seen = vec![target.clone()];
+
+        loop {
+            let mut rendered = self.render_once(&target, options, started)?;
+            rendered.report.url = url.to_owned();
+
+            if !options.follow_client_navigation || hops >= MAX_NAVIGATION_HOPS {
+                return Ok(rendered);
+            }
+            let Some(next) = rendered.report.requested_navigation.clone() else {
+                return Ok(rendered);
+            };
+            // A loop between two pages is common when a gate misfires; stop and
+            // return what we have rather than bouncing until the hop limit.
+            if seen.contains(&next) {
+                return Ok(rendered);
+            }
+            seen.push(next.clone());
+            target = next;
+            hops += 1;
+        }
+    }
+
+    fn render_once(
+        &self,
+        url: &str,
+        options: &RenderOptions,
+        started: Instant,
+    ) -> anyhow::Result<Rendered> {
+        let fetch_start = Instant::now();
+        let mut fetched = self.client.get_document(url)?;
+        let mut document = mar_dom::parse_html(&fetched.body).document;
+        let mut hops = 0;
+        while hops < MAX_META_REFRESH_HOPS {
+            let base = Url::parse(&fetched.final_url).unwrap_or_else(|_| {
+                Url::parse(url).expect("the client already parsed this URL")
+            });
+            let Some(target) = meta_refresh_target(&document, &base) else {
+                break;
+            };
+            if target == fetched.final_url {
+                break;
+            }
+            let Ok(next) = self.client.get_document(&target) else {
+                break;
+            };
+            fetched = next;
+            document = mar_dom::parse_html(&fetched.body).document;
+            hops += 1;
+        }
+        let fetch_ms = fetch_start.elapsed().as_millis();
+        let base = Url::parse(&fetched.final_url).unwrap_or_else(|_| {
+            Url::parse(url).expect("the client already parsed this URL")
+        });
+
+        let mut report = RenderReport {
+            url: url.to_owned(),
+            final_url: fetched.final_url.clone(),
+            status: fetched.status,
+            charset: fetched.charset.clone(),
+            javascript: options.javascript,
+            scripts_inlined: 0,
+            scripts_run: 0,
+            timer_callbacks: 0,
+            subresource_requests: 0,
+            virtual_ms: 0,
+            fetch_ms,
+            render_ms: 0,
+            extract_ms: 0,
+            total_ms: 0,
+            errors: Vec::new(),
+            console: None,
+            requested_navigation: None,
+            truncated: false,
+        };
+
+        if !options.javascript {
+            report.total_ms = started.elapsed().as_millis();
+            let html = mar_dom::document_html(&document);
+            return Ok(Rendered {
+                document,
+                report,
+                html,
+            });
+        }
+
+        let render_start = Instant::now();
+        if options.external_scripts {
+            report.scripts_inlined =
+                self.inline_external_scripts(&mut document, &base, options.max_external_scripts);
+        }
+
+        let net = PageNetwork::new(self.client.clone(), &base);
+        let mut page = Page::with_document(document, base.clone(), options.limits.clone(), net)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let outcome = page.run();
+        report.render_ms = render_start.elapsed().as_millis();
+
+        report.scripts_run = outcome.scripts_run;
+        report.timer_callbacks = outcome.timer_callbacks;
+        report.subresource_requests = outcome.requests;
+        report.virtual_ms = outcome.virtual_ms;
+        report.truncated = outcome.truncated;
+        report.requested_navigation = outcome.requested_navigation.clone();
+        report.errors = outcome
+            .errors
+            .iter()
+            .take(20)
+            .map(|e| format!("{}: {}", e.source, e.message))
+            .collect();
+        report.console = Some(
+            outcome
+                .console
+                .iter()
+                .map(|m| format!("[{}] {}", m.level.as_str(), m.text))
+                .collect(),
+        );
+
+        let document = page.document().snapshot();
+        report.total_ms = started.elapsed().as_millis();
+
+        Ok(Rendered {
+            document,
+            report,
+            html: outcome.html,
+        })
+    }
+
+    /// Fetch, render and extract in one call.
+    pub fn read(&self, url: &str, options: &RenderOptions) -> anyhow::Result<(Reading, RenderReport)> {
+        let rendered = self.render(url, options)?;
+        let mut report = rendered.report;
+
+        let extract_start = Instant::now();
+        // Resolve relative URLs against where the page actually came from.
+        let mut markdown = options.markdown.clone();
+        if markdown.base_url.is_none() {
+            markdown.base_url = Url::parse(&report.final_url).ok();
+        }
+        let reading = mar_extract::read(&rendered.document, &markdown);
+        report.extract_ms = extract_start.elapsed().as_millis();
+        report.total_ms += report.extract_ms;
+
+        Ok((reading, report))
+    }
+
+    /// Render a page, then evaluate an expression in the settled page and
+    /// return its JSON encoding.
+    pub fn eval(
+        &self,
+        url: &str,
+        expression: &str,
+        options: &RenderOptions,
+    ) -> anyhow::Result<String> {
+        let fetched = self.client.get_document(url)?;
+        let base = Url::parse(&fetched.final_url)
+            .or_else(|_| Url::parse(url))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let mut document = mar_dom::parse_html(&fetched.body).document;
+        if options.javascript && options.external_scripts {
+            self.inline_external_scripts(&mut document, &base, options.max_external_scripts);
+        }
+
+        let net = PageNetwork::new(self.client.clone(), &base);
+        let mut page = Page::with_document(document, base, options.limits.clone(), net)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if options.javascript {
+            page.run();
+        }
+        page.eval_json(expression)
+            .map_err(|e| anyhow::anyhow!("evaluation failed: {e}"))
+    }
+
+    /// Replace `<script src=...>` with the script's own source.
+    ///
+    /// The engine deliberately does not fetch anything itself, so this is where
+    /// the decision to load a page's own code is made and bounded. Returns how
+    /// many scripts were inlined.
+    fn inline_external_scripts(&self, doc: &mut Document, base: &Url, max: usize) -> usize {
+        let targets: Vec<(NodeId, String)> = doc
+            .descendants(doc.root())
+            .filter_map(|id| {
+                let el = doc.element(id)?;
+                if el.local_name().as_ref() != "script" {
+                    return None;
+                }
+                let src = el.attr(&LocalName::from("src"))?;
+                // A script with a body as well as a src is unusual; leave it.
+                if !doc.text_content(id).trim().is_empty() {
+                    return None;
+                }
+                Some((id, src.to_owned()))
+            })
+            .take(max)
+            .collect();
+
+        let mut inlined = 0;
+        for (id, src) in targets {
+            let Ok(absolute) = base.join(&src) else {
+                continue;
+            };
+            // Only the page's own origin. Third-party bundles are almost always
+            // analytics and tag managers: slow to fetch, and they add nothing a
+            // reader wants.
+            if absolute.origin() != base.origin() {
+                continue;
+            }
+            let Ok(fetched) = self.client_execute(&absolute) else {
+                continue;
+            };
+            if !fetched.ok() || fetched.body.trim().is_empty() {
+                continue;
+            }
+            // Swap src for the body so the engine treats it as an inline script.
+            if let Some(el) = doc.element_mut(id) {
+                el.remove_attr(&LocalName::from("src"));
+            }
+            let text = doc.create(mar_dom::NodeData::Text(StrTendril::from(fetched.body)));
+            doc.append(id, text);
+            inlined += 1;
+        }
+        inlined
+    }
+
+    fn client_execute(&self, url: &Url) -> anyhow::Result<mar_net::Fetched> {
+        Ok(self.client.get_script(url.as_str())?)
+    }
+
+}
+
+/// A page may chain refreshes; a couple of hops is generous and bounds the work.
+const MAX_META_REFRESH_HOPS: usize = 3;
+
+/// Script-driven navigations followed before giving up.
+const MAX_NAVIGATION_HOPS: usize = 3;
+
+/// The URL a `<meta http-equiv="refresh">` points at, when it fires promptly.
+///
+/// A long delay is a "you will be redirected in 30 seconds" notice on a page
+/// worth reading in its own right, so only short ones count as a redirect.
+fn meta_refresh_target(doc: &Document, base: &Url) -> Option<String> {
+    for id in doc.descendants(doc.root()) {
+        let Some(el) = doc.element(id) else { continue };
+        if el.local_name().as_ref() != "meta" {
+            continue;
+        }
+        if el
+            .attr(&LocalName::from("http-equiv"))
+            .is_none_or(|v| !v.eq_ignore_ascii_case("refresh"))
+        {
+            continue;
+        }
+        let Some(content) = el.attr(&LocalName::from("content")) else {
+            continue;
+        };
+        // The value is "<seconds>" or "<seconds>; url=<target>".
+        let (delay, rest) = content.split_once(';').unwrap_or((content, ""));
+        if delay.trim().parse::<f64>().unwrap_or(f64::MAX) > 5.0 {
+            continue;
+        }
+        let target = rest
+            .trim()
+            .strip_prefix("url")
+            .or_else(|| rest.trim().strip_prefix("URL"))
+            .and_then(|r| r.trim_start().strip_prefix('='))
+            .map(|r| r.trim().trim_matches(['"', '\'']))?;
+        if target.is_empty() {
+            continue;
+        }
+        return base.join(target).ok().map(|u| u.to_string());
+    }
+    None
+}

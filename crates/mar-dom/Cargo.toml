@@ -1,0 +1,16 @@
+[package]
+name = "mar-dom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+html5ever.workspace = true
+markup5ever.workspace = true
+web_atoms.workspace = true
+tendril.workspace = true
+selectors.workspace = true
+precomputed-hash = "0.1"
+cssparser.workspace = true
+string_cache.workspace = true
+thiserror.workspace = true
