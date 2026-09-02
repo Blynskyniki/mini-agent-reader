@@ -53,9 +53,14 @@ $ mar read https://example.com/spa-page
 корень способен спасти сайт, который иначе не открылся бы, и никогда не может
 подменить тот, что и так работает.
 
+На практике это пять и более крупных сайтов, которые без встроенных корней не
+открываются вовсе. Проверено сравнением `--trust public-only` с поведением по
+умолчанию: `sberbank.ru`, `vtb.ru`, `alfabank.ru`, `mkb.ru`, `rzd.ru`.
+
 ```bash
 mar certs                    # что встроено и до какого срока
 mar read https://www.gosuslugi.ru/
+mar read https://sberbank.ru/
 ```
 
 Порядок меняется флагом `--trust public-only | combined | none`, свои корни

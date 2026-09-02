@@ -51,9 +51,14 @@ can issue a certificate for any domain, so trusting one unconditionally would
 let it intercept every site. This ordering means the bundled root can rescue a
 site that would otherwise fail, and can never override one that already works.
 
+In practice this covers five or more major sites that do not open at all
+without the bundled roots. Verified by comparing `--trust public-only` against
+the default: `sberbank.ru`, `vtb.ru`, `alfabank.ru`, `mkb.ru`, `rzd.ru`.
+
 ```bash
 mar certs                    # what is bundled, and until when
 mar read https://www.gosuslugi.ru/
+mar read https://sberbank.ru/
 ```
 
 Change the order with `--trust public-only | combined | none`, and add your own
