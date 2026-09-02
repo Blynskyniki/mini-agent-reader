@@ -3,7 +3,7 @@
 use mar_dom::{Document, LocalName, NodeId, StrTendril};
 use mar_extract::{MarkdownOptions, Reading};
 use mar_js::{Limits, Page};
-use mar_net::{ClientConfig, HttpClient, PageNetwork, Policy};
+use mar_net::{ClientConfig, HttpClient, PageNetwork};
 use serde::Serialize;
 use std::time::Instant;
 use url::Url;
@@ -44,6 +44,8 @@ pub struct RenderReport {
     pub final_url: String,
     pub status: u16,
     pub charset: String,
+    /// What the response actually held: html, pdf, json, image and so on.
+    pub content_kind: String,
     /// Whether scripts ran at all.
     pub javascript: bool,
     pub scripts_inlined: usize,
@@ -67,6 +69,9 @@ pub struct RenderReport {
     pub requested_navigation: Option<String>,
     /// True when the settle loop hit a limit instead of going quiet.
     pub truncated: bool,
+    /// Set when the response looks like a refusal rather than a page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
 }
 
 /// A rendered page plus what it cost.
@@ -82,13 +87,16 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(policy: Policy) -> Self {
+    pub fn new(config: ClientConfig) -> Self {
         Renderer {
-            client: HttpClient::new(ClientConfig {
-                policy,
-                ..ClientConfig::default()
-            }),
+            client: HttpClient::new(config),
         }
+    }
+
+    /// The client this renderer fetches through, so callers can inspect what
+    /// trust was used.
+    pub fn client(&self) -> &HttpClient {
+        &self.client
     }
 
     /// Fetch `url`, run its scripts, and hand back the settled document.
@@ -152,6 +160,24 @@ impl Renderer {
             hops += 1;
         }
         let fetch_ms = fetch_start.elapsed().as_millis();
+
+        // A URL is not a promise about content type. Handing a PDF or an image
+        // to the HTML parser yields a document of mojibake that reads like text
+        // and is not, so say plainly what arrived instead.
+        if !fetched.is_readable_as_html() {
+            return Err(anyhow::anyhow!(
+                "{} is {}, not HTML ({}). This tool reads HTML pages; \
+                 fetch the file directly, or use a converter for that format.",
+                fetched.final_url,
+                fetched.kind().as_str(),
+                if fetched.content_type().is_empty() {
+                    "no content-type"
+                } else {
+                    fetched.content_type()
+                },
+            ));
+        }
+
         let base = Url::parse(&fetched.final_url).unwrap_or_else(|_| {
             Url::parse(url).expect("the client already parsed this URL")
         });
@@ -161,6 +187,7 @@ impl Renderer {
             final_url: fetched.final_url.clone(),
             status: fetched.status,
             charset: fetched.charset.clone(),
+            content_kind: fetched.kind().as_str().to_owned(),
             javascript: options.javascript,
             scripts_inlined: 0,
             scripts_run: 0,
@@ -175,6 +202,7 @@ impl Renderer {
             console: None,
             requested_navigation: None,
             truncated: false,
+            blocked: None,
         };
 
         if !options.javascript {
@@ -229,6 +257,22 @@ impl Renderer {
         })
     }
 
+    /// Statuses that mean "we know who you are and you are not welcome".
+    ///
+    /// Returning an empty article for these is misleading: nothing was
+    /// extracted because nothing was served.
+    fn describe_block(status: u16, body_len: usize) -> Option<&'static str> {
+        match status {
+            403 => Some("403: the server refused the request"),
+            429 => Some("429: rate limited"),
+            // Several Russian sites use 439 for their bot check, and Cloudflare
+            // uses 503 with a challenge page.
+            439 => Some("439: the site's bot check refused the request"),
+            503 if body_len < 20_000 => Some("503: likely a bot-check interstitial"),
+            _ => None,
+        }
+    }
+
     /// Fetch, render and extract in one call.
     pub fn read(&self, url: &str, options: &RenderOptions) -> anyhow::Result<(Reading, RenderReport)> {
         let rendered = self.render(url, options)?;
@@ -240,9 +284,20 @@ impl Renderer {
         if markdown.base_url.is_none() {
             markdown.base_url = Url::parse(&report.final_url).ok();
         }
-        let reading = mar_extract::read(&rendered.document, &markdown);
+        let mut reading = mar_extract::read(&rendered.document, &markdown);
         report.extract_ms = extract_start.elapsed().as_millis();
         report.total_ms += report.extract_ms;
+
+        // An empty article after a refusal status is not an empty page; it is
+        // a page we were not shown. Say which.
+        if reading.length < 200
+            && let Some(reason) = Self::describe_block(report.status, rendered.html.len())
+        {
+            report.blocked = Some(reason.to_owned());
+            if reading.content.trim().is_empty() {
+                reading.content = format!("_Blocked: {reason}._\n");
+            }
+        }
 
         Ok((reading, report))
     }
@@ -309,7 +364,7 @@ impl Renderer {
             if absolute.origin() != base.origin() {
                 continue;
             }
-            let Ok(fetched) = self.client_execute(&absolute) else {
+            let Ok(fetched) = self.client_execute(&absolute, base) else {
                 continue;
             };
             if !fetched.ok() || fetched.body.trim().is_empty() {
@@ -326,8 +381,8 @@ impl Renderer {
         inlined
     }
 
-    fn client_execute(&self, url: &Url) -> anyhow::Result<mar_net::Fetched> {
-        Ok(self.client.get_script(url.as_str())?)
+    fn client_execute(&self, url: &Url, referer: &Url) -> anyhow::Result<mar_net::Fetched> {
+        Ok(self.client.get_script(url.as_str(), referer)?)
     }
 
 }

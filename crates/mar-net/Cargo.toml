@@ -8,6 +8,7 @@ license.workspace = true
 mar-js.workspace = true
 ureq.workspace = true
 encoding_rs.workspace = true
+webpki-roots.workspace = true
 url.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

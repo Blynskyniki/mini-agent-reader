@@ -1,5 +1,11 @@
 # mini-agent-reader
 
+[![Release](https://img.shields.io/github/v/release/Blynskyniki/mini-agent-reader?label=release&sort=semver)](https://github.com/Blynskyniki/mini-agent-reader/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/Blynskyniki/mini-agent-reader)](LICENSE)
+[![Русский](https://img.shields.io/badge/🇷🇺-Русский-informational)](README.ru.md)
+
+*[Читать на русском](README.ru.md)*
+
 A headless browser that runs JavaScript but never draws anything, plus a reader
 that turns the settled page into Markdown.
 
@@ -33,7 +39,7 @@ only advances when nothing else is runnable.
 
 ## What it is
 
-Five crates, each usable on its own.
+Six crates, each usable on its own.
 
 - **`mar-dom`** — HTML parsing and an arena DOM. Nodes live in a flat `Vec`
   addressed by a 32-bit index, with no per-node reference counting. CSS matching
@@ -43,7 +49,9 @@ Five crates, each usable on its own.
 - **`mar-net`** — HTTP with browser-shaped headers, charset sniffing per the
   HTML spec, and a policy layer that blocks private address space.
 - **`mar-extract`** — Readability-style article detection, metadata, Markdown.
-- **`mar-cli`** — the `mar` binary and the HTTP server.
+- **`mar-cdp`** — a Chrome DevTools Protocol endpoint, so Puppeteer, Playwright
+  and chrome-remote-interface can drive this browser unchanged.
+- **`mar-cli`** — the `mar` binary, the HTTP server and the CDP server.
 
 ## Design
 
@@ -71,11 +79,19 @@ responses.
 virtual-time horizon, timer-callback budget, subresource-request budget, console
 byte budget. A page that misbehaves is truncated and reported as truncated.
 
-## Use
+## Install
+
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon) and
+Windows are attached to every [release](https://github.com/Blynskyniki/mini-agent-reader/releases/latest).
+Download the archive for your platform, unpack it, and run `mar`.
+
+Or build from source:
 
 ```bash
 cargo build --release          # ~30s, no system dependencies beyond a C compiler
 ```
+
+## Use
 
 Read a page as Markdown:
 
@@ -123,6 +139,23 @@ GET  /health
 
 Each worker renders one page at a time. Twelve concurrent requests against a
 local page complete in about 40 ms on three workers.
+
+Or speak Chrome DevTools Protocol, so existing Puppeteer/Playwright code
+points at `mar` unchanged:
+
+```bash
+mar cdp --bind 127.0.0.1:9222
+```
+
+## TLS trust
+
+Some sites — `gosuslugi.ru` and `mos.ru` among them — present certificates
+issued by the Russian Ministry of Digital Development, a root no browser or OS
+ships. `mar` bundles it, but only consults it after the public trust store has
+already rejected the chain, so it can rescue a site that would otherwise fail
+and can never override one that already works. `mar certs` lists what is
+bundled; `--trust public-only|combined|none` and `--ca-bundle <file>` change
+the policy.
 
 ## Safety
 

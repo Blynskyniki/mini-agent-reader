@@ -330,6 +330,18 @@ fn install_document(
         })),
     )?;
 
+    // Address a node by its arena id. The CDP layer resolves a client's nodeId
+    // to an arena id, then needs the live node to hand back as a handle.
+    let d = doc.clone();
+    api.set(
+        "node_by_id",
+        Func::from(hr_iv(move |ctx, raw: u32| {
+            let id = mar_dom::NodeId::from_u32(raw);
+            let exists = id.is_some_and(|id| id.index() < d.borrow().len() + 1);
+            DomNode::wrap_opt(&ctx, &d, exists.then_some(id).flatten())
+        })),
+    )?;
+
     let d = doc.clone();
     api.set(
         "title",
@@ -681,6 +693,13 @@ fn install_url(api: &Object<'_>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+fn hr_iv<F>(f: F) -> F
+where
+    F: for<'js> Fn(Ctx<'js>, u32) -> Result<Value<'js>>,
+{
+    f
 }
 
 fn hr_url<F>(f: F) -> F

@@ -1,25 +1,18 @@
 [package]
-name = "mar-cli"
+name = "mar-cdp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[[bin]]
-name = "mar"
-path = "src/main.rs"
 
 [dependencies]
 mar-dom.workspace = true
 mar-js.workspace = true
 mar-net.workspace = true
 mar-extract.workspace = true
-mar-cdp.workspace = true
-ureq.workspace = true
-clap.workspace = true
-tiny_http.workspace = true
+tungstenite.workspace = true
+sha1.workspace = true
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 url.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true

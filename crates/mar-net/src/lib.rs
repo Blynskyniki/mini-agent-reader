@@ -6,9 +6,11 @@
 
 mod charset;
 mod policy;
+pub mod tls;
 
 pub use charset::{decode_body, sniff_charset};
 pub use policy::{Policy, PolicyError, ResourceKind};
+pub use tls::{BundledCert, TrustMode, bundled_certs, load_pem_bundle};
 
 use mar_js::{HttpRequest, HttpResponse, NetworkProvider};
 use std::sync::Arc;
@@ -26,6 +28,10 @@ pub struct ClientConfig {
     /// Response bodies larger than this are truncated.
     pub max_body_bytes: usize,
     pub policy: Policy,
+    /// Which roots to verify against, and in what order.
+    pub trust: TrustMode,
+    /// Extra roots beyond the bundled ones, from a caller-supplied PEM bundle.
+    pub extra_roots: Vec<ureq::tls::Certificate<'static>>,
 }
 
 impl Default for ClientConfig {
@@ -37,6 +43,8 @@ impl Default for ClientConfig {
             max_redirects: 5,
             max_body_bytes: 8 * 1024 * 1024,
             policy: Policy::default(),
+            trust: TrustMode::default(),
+            extra_roots: Vec::new(),
         }
     }
 }
@@ -62,26 +70,62 @@ pub enum NetError {
 #[derive(Clone)]
 pub struct HttpClient {
     agent: ureq::Agent,
+    /// Used only to retry a request the primary agent rejected on certificate
+    /// grounds. See [`tls::TrustMode`].
+    fallback_agent: Option<ureq::Agent>,
     config: Arc<ClientConfig>,
     requests: Arc<AtomicUsize>,
+    /// Hosts already known to need the fallback, so the second and later
+    /// requests to one skip the handshake that is going to fail.
+    needs_fallback: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 }
 
 impl HttpClient {
     pub fn new(config: ClientConfig) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(config.timeout))
-            // Redirects are followed here rather than in the engine so the
-            // page only ever sees the final URL.
-            .max_redirects(config.max_redirects)
-            .save_redirect_history(true)
-            .user_agent(&config.user_agent)
-            .build()
-            .into();
+        // The bundled roots plus anything the caller added.
+        let mut extra = tls::extra_roots();
+        extra.extend(config.extra_roots.iter().cloned());
+
+        let build = |tls_config: ureq::tls::TlsConfig| -> ureq::Agent {
+            ureq::Agent::config_builder()
+                .timeout_global(Some(config.timeout))
+                // Redirects are followed here rather than in the engine so the
+                // page only ever sees the final URL.
+                .max_redirects(config.max_redirects)
+                .save_redirect_history(true)
+                .user_agent(&config.user_agent)
+                .tls_config(tls_config)
+                .build()
+                .into()
+        };
+
+        let agent = build(tls::primary_config(config.trust, &extra));
+        let fallback_agent = tls::fallback_config(config.trust, &extra).map(build);
+
         HttpClient {
             agent,
+            fallback_agent,
             config: Arc::new(config),
             requests: Arc::new(AtomicUsize::new(0)),
+            needs_fallback: Arc::new(std::sync::RwLock::new(Default::default())),
         }
+    }
+
+    /// Does this client carry a second trust set to fall back on?
+    pub fn has_extended_trust(&self) -> bool {
+        self.fallback_agent.is_some()
+    }
+
+    /// Hosts that needed the extended trust set during this client's life.
+    pub fn hosts_using_extended_trust(&self) -> Vec<String> {
+        self.needs_fallback
+            .read()
+            .map(|set| {
+                let mut hosts: Vec<String> = set.iter().cloned().collect();
+                hosts.sort();
+                hosts
+            })
+            .unwrap_or_default()
     }
 
     pub fn config(&self) -> &ClientConfig {
@@ -95,19 +139,24 @@ impl HttpClient {
 
     /// Fetch a top-level document.
     pub fn get_document(&self, url: &str) -> Result<Fetched, NetError> {
-        self.execute("GET", url, &[], None, ResourceKind::Document)
+        self.execute("GET", url, &[], None, ResourceKind::Document, None)
     }
 
     /// Fetch a script the page referenced, so it can be inlined and run.
-    pub fn get_script(&self, url: &str) -> Result<Fetched, NetError> {
-        self.execute("GET", url, &[], None, ResourceKind::Script)
+    pub fn get_script(&self, url: &str, referer: &url::Url) -> Result<Fetched, NetError> {
+        self.execute("GET", url, &[], None, ResourceKind::Script, Some(referer))
     }
 
     /// The header set a browser sends, minus anything that would be a lie.
     ///
     /// Servers do branch on these: a request without `Accept` or `Sec-Fetch-*`
     /// is frequently served a different page, or none at all.
-    fn browser_headers(&self, kind: ResourceKind, url: &url::Url) -> Vec<(&'static str, String)> {
+    fn browser_headers(
+        &self,
+        kind: ResourceKind,
+        url: &url::Url,
+        referer: Option<&url::Url>,
+    ) -> Vec<(&'static str, String)> {
         let mut headers = vec![
             ("Accept-Language", self.config.accept_language.clone()),
             ("Accept-Encoding", "gzip, deflate, br".to_owned()),
@@ -133,15 +182,26 @@ impl HttpClient {
                 headers.push(("Accept", "*/*".to_owned()));
                 headers.push(("Sec-Fetch-Dest", "script".to_owned()));
                 headers.push(("Sec-Fetch-Mode", "no-cors".to_owned()));
-                headers.push(("Sec-Fetch-Site", "same-origin".to_owned()));
-                headers.push(("Referer", url.origin().ascii_serialization() + "/"));
+                headers.push(("Sec-Fetch-Site", site_relation(referer, url)));
+                // The referring page, not just its origin. A site that checks
+                // where a script was requested from sees the real page here,
+                // which is what a browser sends.
+                if let Some(referer) = referer {
+                    headers.push(("Referer", referer.to_string()));
+                }
             }
             ResourceKind::Xhr => {
                 headers.push(("Accept", "*/*".to_owned()));
                 headers.push(("Sec-Fetch-Dest", "empty".to_owned()));
                 headers.push(("Sec-Fetch-Mode", "cors".to_owned()));
-                headers.push(("Sec-Fetch-Site", "same-origin".to_owned()));
-                headers.push(("Referer", url.origin().ascii_serialization() + "/"));
+                headers.push(("Sec-Fetch-Site", site_relation(referer, url)));
+                if let Some(referer) = referer {
+                    headers.push(("Referer", referer.to_string()));
+                    // A browser sends Origin on any request a script made,
+                    // except a plain same-origin GET. Its absence is one of the
+                    // cheapest ways for a server to spot a non-browser client.
+                    headers.push(("Origin", referer.origin().ascii_serialization()));
+                }
             }
         }
         headers
@@ -154,6 +214,7 @@ impl HttpClient {
         extra_headers: &[(String, String)],
         body: Option<&str>,
         kind: ResourceKind,
+        referer: Option<&url::Url>,
     ) -> Result<Fetched, NetError> {
         let parsed = url::Url::parse(url).map_err(|source| NetError::Url {
             url: url.to_owned(),
@@ -164,22 +225,83 @@ impl HttpClient {
 
         // ureq 3 exposes typed per-method builders; going through the http
         // crate keeps one code path for every method, body or not.
-        let mut builder = ureq::http::Request::builder()
-            .method(method)
-            .uri(parsed.as_str());
-        for (name, value) in self.browser_headers(kind, &parsed) {
-            builder = builder.header(name, value);
-        }
+        let mut header_pairs: Vec<(String, String)> = self
+            .browser_headers(kind, &parsed, referer)
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
         // Caller headers win: a page's own Content-Type or Authorization must
         // not be shadowed by the defaults above.
         for (name, value) in extra_headers {
-            builder = builder.header(name.as_str(), value.as_str());
+            header_pairs.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            header_pairs.push((name.clone(), value.clone()));
         }
-        let request = builder
-            .body(body.unwrap_or(""))
-            .map_err(|e| NetError::Transport(e.to_string()))?;
 
-        let mut response = match self.agent.run(request) {
+        let body = body.filter(|b| !b.is_empty());
+        let uri = parsed.as_str().to_owned();
+        let method = method.to_owned();
+
+        // Built fresh for each attempt: `Agent::run` consumes the request, and
+        // a certificate retry needs an identical second copy.
+        let build = || -> Result<ureq::http::request::Builder, NetError> {
+            let mut builder = ureq::http::Request::builder()
+                .method(method.as_str())
+                .uri(&uri);
+            for (name, value) in &header_pairs {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            Ok(builder)
+        };
+
+        // A bodyless request must carry no body at all. Handing ureq an empty
+        // string instead produces `Content-Length: 0` on a GET, which no
+        // browser sends and which a bot check reads as an automated client.
+        let send = |agent: &ureq::Agent| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+            let builder = match build() {
+                Ok(b) => b,
+                Err(_) => return Err(ureq::Error::BadUri(uri.clone())),
+            };
+            match body {
+                Some(text) => agent.run(builder.body(text).map_err(ureq::Error::Http)?),
+                None => agent.run(builder.body(()).map_err(ureq::Error::Http)?),
+            }
+        };
+
+        // A host already known to need the extended trust set skips straight
+        // to it rather than repeating a handshake that is going to fail.
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let known_fallback = self
+            .needs_fallback
+            .read()
+            .map(|set| set.contains(&host))
+            .unwrap_or(false);
+
+        let first_agent = match (known_fallback, &self.fallback_agent) {
+            (true, Some(agent)) => agent,
+            _ => &self.agent,
+        };
+
+        let mut outcome = send(first_agent);
+
+        // Retry once against the extended trust set when the public roots
+        // rejected the chain. Only a certificate failure qualifies: a refused
+        // connection or a timeout would fail the same way twice.
+        if !known_fallback
+            && let Some(fallback) = &self.fallback_agent
+            && let Err(e) = &outcome
+            && tls::is_certificate_error(&e.to_string())
+        {
+            tracing::debug!(host = %host, "retrying with the extended trust set");
+            let retried = send(fallback);
+            if retried.is_ok()
+                && let Ok(mut set) = self.needs_fallback.write()
+            {
+                set.insert(host.clone());
+            }
+            outcome = retried;
+        }
+
+        let mut response = match outcome {
             Ok(r) => r,
             // A 4xx/5xx is a real response and the body often matters, so it is
             // returned rather than treated as a transport failure.
@@ -192,6 +314,7 @@ impl HttpClient {
                     body: String::new(),
                     charset: "utf-8".into(),
                     truncated: false,
+                    raw_prefix: Vec::new(),
                 });
             }
             Err(e) => return Err(NetError::Transport(e.to_string())),
@@ -218,6 +341,10 @@ impl HttpClient {
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
 
+        // Bodies come back as raw bytes: ureq's own charset support is not
+        // enabled, because it transcodes from the Content-Type header alone and
+        // would decode a body this crate then decodes again. `decode_body`
+        // below follows the full sniffing order instead.
         let limit = self.config.max_body_bytes;
         let raw = response
             .body_mut()
@@ -229,6 +356,9 @@ impl HttpClient {
         let truncated = raw.len() > limit;
         let raw = if truncated { &raw[..limit] } else { &raw[..] };
 
+        // Keep a small window of the original bytes: the decoded text cannot
+        // be used to recognise a binary format.
+        let raw_prefix = raw[..raw.len().min(1024)].to_vec();
         let (body, charset) = decode_body(raw, &content_type);
 
         Ok(Fetched {
@@ -239,8 +369,76 @@ impl HttpClient {
             body,
             charset,
             truncated,
+            raw_prefix,
         })
     }
+}
+
+
+/// The `Sec-Fetch-Site` value for a request made from `referer` to `url`.
+///
+/// Servers do read this. Sending "same-origin" for a cross-site request, or
+/// "none" for one a script made, is a mismatch a bot check can see.
+fn site_relation(referer: Option<&url::Url>, url: &url::Url) -> String {
+    let Some(referer) = referer else {
+        return "none".to_owned();
+    };
+    if referer.origin() == url.origin() {
+        return "same-origin".to_owned();
+    }
+    // Same registrable domain but a different subdomain or scheme is
+    // "same-site"; anything else is "cross-site".
+    match (referer.host_str(), url.host_str()) {
+        (Some(a), Some(b)) if registrable(a) == registrable(b) => "same-site".to_owned(),
+        _ => "cross-site".to_owned(),
+    }
+}
+
+/// The last two labels of a host, as a rough registrable domain. Good enough
+/// to tell "api.example.com" from "example.org" without a public-suffix list.
+fn registrable(host: &str) -> String {
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() <= 2 {
+        return host.to_ascii_lowercase();
+    }
+    labels[labels.len() - 2..].join(".").to_ascii_lowercase()
+}
+
+/// What kind of resource a response holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseKind {
+    Html,
+    Json,
+    Xml,
+    Text,
+    Pdf,
+    Image,
+    Media,
+    Other,
+}
+
+impl ResponseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResponseKind::Html => "html",
+            ResponseKind::Json => "json",
+            ResponseKind::Xml => "xml",
+            ResponseKind::Text => "text",
+            ResponseKind::Pdf => "pdf",
+            ResponseKind::Image => "image",
+            ResponseKind::Media => "media",
+            ResponseKind::Other => "other",
+        }
+    }
+}
+
+/// Does this look like HTML, for a server that declared nothing?
+fn looks_like_html(prefix: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&prefix[..prefix.len().min(512)]).to_ascii_lowercase();
+    let head = head.trim_start();
+    head.starts_with("<!doctype html")
+        || head.starts_with("<html")
+        || (head.starts_with('<') && head.contains("<body"))
 }
 
 /// A fetched resource, decoded to text.
@@ -256,6 +454,8 @@ pub struct Fetched {
     pub charset: String,
     /// True when the body hit the size limit and was cut short.
     pub truncated: bool,
+    /// First bytes of the undecoded body, for sniffing the real type.
+    raw_prefix: Vec<u8>,
 }
 
 impl Fetched {
@@ -271,8 +471,52 @@ impl Fetched {
     }
 
     pub fn is_html(&self) -> bool {
+        matches!(self.kind(), ResponseKind::Html)
+    }
+
+    /// What kind of resource came back.
+    ///
+    /// A URL is not a promise about content type. Feeding a PDF or an image to
+    /// an HTML parser produces a document of mojibake that looks like text and
+    /// is not, so the caller has to be told what it actually received.
+    pub fn kind(&self) -> ResponseKind {
         let ct = self.content_type().to_ascii_lowercase();
-        ct.contains("text/html") || ct.contains("application/xhtml")
+        let ct = ct.split(';').next().unwrap_or("").trim().to_owned();
+
+        // A declared type is usually right, but not always: servers send
+        // application/octet-stream for everything. The magic bytes settle it.
+        if self.raw_prefix.starts_with(b"%PDF-") {
+            return ResponseKind::Pdf;
+        }
+
+        match ct.as_str() {
+            "application/pdf" => ResponseKind::Pdf,
+            "text/html" | "application/xhtml+xml" => ResponseKind::Html,
+            "application/json" | "text/json" | "application/ld+json" => ResponseKind::Json,
+            "application/xml" | "text/xml" | "application/rss+xml" | "application/atom+xml" => {
+                ResponseKind::Xml
+            }
+            _ if ct.starts_with("text/") => ResponseKind::Text,
+            _ if ct.starts_with("image/") => ResponseKind::Image,
+            _ if ct.starts_with("audio/") || ct.starts_with("video/") => ResponseKind::Media,
+            "" => {
+                // No declaration at all: guess from the bytes.
+                if looks_like_html(&self.raw_prefix) {
+                    ResponseKind::Html
+                } else {
+                    ResponseKind::Other
+                }
+            }
+            _ => ResponseKind::Other,
+        }
+    }
+
+    /// Is this something the HTML pipeline can meaningfully read?
+    pub fn is_readable_as_html(&self) -> bool {
+        matches!(
+            self.kind(),
+            ResponseKind::Html | ResponseKind::Xml | ResponseKind::Text
+        )
     }
 
     pub fn ok(&self) -> bool {
@@ -283,14 +527,15 @@ impl Fetched {
 /// Adapter that lets a page's `fetch`/XHR reach the network under policy.
 pub struct PageNetwork {
     client: HttpClient,
-    /// Origin of the page, used to decide same-origin.
-    page_origin: String,
+    /// The page making the request. Used to decide same-origin and to fill in
+    /// `Referer` and `Origin`, exactly as a browser would.
+    page_url: url::Url,
 }
 
 impl PageNetwork {
     pub fn new(client: HttpClient, page_url: &url::Url) -> Self {
         PageNetwork {
-            page_origin: page_url.origin().ascii_serialization(),
+            page_url: page_url.clone(),
             client,
         }
     }
@@ -302,7 +547,7 @@ impl NetworkProvider for PageNetwork {
         // Same-origin subresource requests are the ones worth serving: they are
         // how a page loads its own data. Cross-origin ones are usually
         // analytics and ads, which cost time and change nothing readable.
-        if parsed.origin().ascii_serialization() != self.page_origin {
+        if parsed.origin() != self.page_url.origin() {
             return Err(format!("cross-origin request blocked: {}", request.url));
         }
         let headers: Vec<(String, String)> = request.headers.clone();
@@ -314,6 +559,7 @@ impl NetworkProvider for PageNetwork {
                 &headers,
                 request.body.as_deref(),
                 ResourceKind::Xhr,
+                Some(&self.page_url),
             )
             .map_err(|e| e.to_string())?;
 

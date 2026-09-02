@@ -176,6 +176,191 @@ impl<N: NetworkProvider + 'static> Page<N> {
         })
     }
 
+    /// Evaluate `expression` and describe the result the way CDP does, keeping
+    /// a handle when the value cannot be serialized.
+    ///
+    /// Returns the JSON of a `Runtime.RemoteObject`, or the error text.
+    pub fn eval_remote(
+        &mut self,
+        expression: &str,
+        by_value: bool,
+        await_promise: bool,
+    ) -> Result<String, String> {
+        let source = format!("(function(){{ return ({expression}); }})()");
+        self.describe_result(&source, by_value, await_promise)
+    }
+
+    /// Run `source`, optionally settling a promise, and describe the outcome.
+    fn describe_result(
+        &mut self,
+        source: &str,
+        by_value: bool,
+        await_promise: bool,
+    ) -> Result<String, String> {
+        if !await_promise {
+            let wrapped = format!(
+                "JSON.stringify(__mar_describe({source}, {by_value})) ?? '{{\"type\":\"undefined\"}}'"
+            );
+            return self.context.with(|ctx| {
+                ctx.eval::<String, _>(wrapped)
+                    .catch(&ctx)
+                    .map_err(|e| format!("{e}"))
+            });
+        }
+
+        // Park the value, then let the loop run until it settles. Timers are
+        // allowed to fire: an awaited value frequently depends on one.
+        let slot: u32 = self.context.with(|ctx| {
+            ctx.eval::<u32, _>(format!("__mar_await({source})"))
+                .catch(&ctx)
+                .map_err(|e| format!("{e}"))
+        })?;
+
+        let settled = self.settle_slot(slot, by_value)?;
+        self.context.with(|ctx| {
+            let _ = ctx.eval::<(), _>(format!("__mar_handle_release({slot})"));
+        });
+        Ok(settled)
+    }
+
+    /// Drive the loop until the parked slot settles, or the page runs out of
+    /// budget. Returns the JSON the client should see.
+    fn settle_slot(&mut self, slot: u32, by_value: bool) -> Result<String, String> {
+        loop {
+            let raw = self.context.with(|ctx| {
+                ctx.eval::<String, _>(format!("__mar_settled({slot}, {by_value})"))
+                    .catch(&ctx)
+                    .map_err(|e| format!("{e}"))
+            })?;
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            match parsed.get("state").and_then(|s| s.as_str()) {
+                Some("fulfilled") => {
+                    return Ok(parsed
+                        .get("result")
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| r#"{"type":"undefined"}"#.into()));
+                }
+                Some("rejected") => {
+                    let description = parsed
+                        .get("result")
+                        .and_then(|r| r.get("description"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("promise rejected")
+                        .to_owned();
+                    return Err(description);
+                }
+                Some("missing") => return Err("awaited value was released".into()),
+                _ => {}
+            }
+
+            if self.out_of_time() {
+                return Err("timed out awaiting a promise".into());
+            }
+            // Nothing settled it, so advance the loop by one step. When there
+            // is nothing left to run, the promise never will settle.
+            if !self.drain_microtasks() && !self.run_one_timer() {
+                return Err("promise never settled".into());
+            }
+        }
+    }
+
+    /// Run the next due timer. Returns false when none is left.
+    fn run_one_timer(&mut self) -> bool {
+        let only_idle = self.state.borrow_mut().timers.next_due().is_none();
+        let Some((callback, _)) = self.state.borrow_mut().timers.pop_due(only_idle) else {
+            return false;
+        };
+        self.invoke(callback);
+        true
+    }
+
+    /// Call a function declaration against a retained handle, with arguments
+    /// that may themselves be handles.
+    ///
+    /// `this_handle` and each `Some(id)` in `arg_handles` name a value the page
+    /// is still holding; `None` entries take the matching literal from
+    /// `arg_values`, which is a JSON array.
+    pub fn call_on_handle(
+        &mut self,
+        this_handle: Option<u32>,
+        declaration: &str,
+        arg_handles: &[Option<u32>],
+        arg_values: &str,
+        by_value: bool,
+        await_promise: bool,
+    ) -> Result<String, String> {
+        let this_expr = match this_handle {
+            Some(id) => format!("__mar_handle_get({id})"),
+            None => "globalThis".to_owned(),
+        };
+        // Build the argument list: a handle resolves through the registry, a
+        // literal comes from the JSON array by position.
+        let args: Vec<String> = arg_handles
+            .iter()
+            .enumerate()
+            .map(|(i, handle)| match handle {
+                Some(id) => format!("__mar_handle_get({id})"),
+                None => format!("__mar_args[{i}]"),
+            })
+            .collect();
+
+        let source = format!(
+            "(function(){{ const __mar_args = {arg_values}; \
+             const __mar_fn = ({declaration}); \
+             return __mar_fn.apply({this_expr}, [{}]); }})()",
+            args.join(", ")
+        );
+        self.describe_result(&source, by_value, await_promise)
+    }
+
+    /// Hand out a handle for a node the DOM layer resolved.
+    pub fn handle_for_node(&mut self, node: NodeId) -> Result<u32, String> {
+        // The node is looked up through the same registry the DOM bindings use,
+        // so the client's handle points at the live node, not a copy.
+        let expression = format!(
+            "__mar_handle_put(__mar_node_by_id({}))",
+            node.as_u32()
+        );
+        self.context.with(|ctx| {
+            ctx.eval::<u32, _>(expression)
+                .catch(&ctx)
+                .map_err(|e| format!("{e}"))
+        })
+    }
+
+    /// Enumerate a handle's own properties, as a JSON array of CDP
+    /// `PropertyDescriptor` objects.
+    pub fn handle_properties(&mut self, id: u32, own_only: bool) -> Result<String, String> {
+        self.context.with(|ctx| {
+            ctx.eval::<String, _>(format!(
+                "JSON.stringify(__mar_handle_properties({id}, {own_only})) ?? '[]'"
+            ))
+            .catch(&ctx)
+            .map_err(|e| format!("{e}"))
+        })
+    }
+
+    /// The arena node a handle points at, if it points at a node at all.
+    pub fn node_of_handle(&mut self, id: u32) -> Option<NodeId> {
+        let raw = self.context.with(|ctx| {
+            ctx.eval::<i64, _>(format!(
+                "(function(){{ const v = __mar_handle_get({id}); \
+                 return (v && typeof v.marNodeId === 'number') ? v.marNodeId : 0; }})()"
+            ))
+            .ok()
+        })?;
+        NodeId::from_u32(u32::try_from(raw).ok()?)
+    }
+
+    /// Forget a handle the client released.
+    pub fn release_handle(&mut self, id: u32) {
+        self.context.with(|ctx| {
+            let _ = ctx.eval::<(), _>(format!("__mar_handle_release({id})"));
+        });
+    }
+
     fn run_inline_scripts(&mut self) {
         // Snapshot the script list first: a script that appends more scripts
         // must not extend the loop it is running inside.

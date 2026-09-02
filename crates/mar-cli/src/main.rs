@@ -30,8 +30,45 @@ struct Cli {
     #[arg(long, global = true, value_name = "HOST")]
     allow_host: Vec<String>,
 
+    /// Which root certificates to verify against.
+    ///
+    /// The default verifies against the public roots and, only if that fails,
+    /// retries against a set that also includes the bundled Russian Trusted
+    /// Root CA. Sites such as gosuslugi.ru and mos.ru cannot be reached
+    /// without it, and the ordering means it can never override a site whose
+    /// standard chain already works.
+    #[arg(long, global = true, value_enum, default_value_t = TrustArg::PublicThenExtra)]
+    trust: TrustArg,
+
+    /// Additional root certificates, as a PEM bundle. Repeatable.
+    #[arg(long, global = true, value_name = "FILE")]
+    ca_bundle: Vec<std::path::PathBuf>,
+
     #[arg(long, global = true, default_value = "warn")]
     log: String,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum TrustArg {
+    /// Public roots, then the bundled extras on a certificate failure.
+    PublicThenExtra,
+    /// Public roots only.
+    PublicOnly,
+    /// Public roots and the bundled extras in one trust set.
+    Combined,
+    /// Verify nothing. Debugging only.
+    None,
+}
+
+impl From<TrustArg> for mar_net::TrustMode {
+    fn from(value: TrustArg) -> Self {
+        match value {
+            TrustArg::PublicThenExtra => mar_net::TrustMode::PublicThenExtra,
+            TrustArg::PublicOnly => mar_net::TrustMode::PublicOnly,
+            TrustArg::Combined => mar_net::TrustMode::Combined,
+            TrustArg::None => mar_net::TrustMode::None,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -72,6 +109,29 @@ enum Command {
         expression: String,
         #[command(flatten)]
         render: RenderArgs,
+    },
+
+    /// Serve a Chrome DevTools Protocol endpoint, so Puppeteer, Playwright and
+    /// chrome-remote-interface can drive this browser unchanged.
+    Cdp {
+        #[arg(long, default_value = "127.0.0.1:9222")]
+        bind: String,
+        /// Require this token, as `?token=` on the WebSocket URL or a bearer
+        /// header on the HTTP endpoints.
+        #[arg(long, env = "MAR_TOKEN")]
+        token: Option<String>,
+        /// Connections accepted at once. Each owns its own pages.
+        #[arg(long, default_value_t = 16)]
+        max_connections: usize,
+        #[command(flatten)]
+        render: RenderArgs,
+    },
+
+    /// Show the root certificates bundled into this binary.
+    Certs {
+        /// Print them as JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Serve the reader over HTTP.
@@ -153,13 +213,47 @@ fn main() {
         deny_hosts: Vec::new(),
     };
 
-    if let Err(e) = run(cli.command, policy) {
+    let mut ca_bundle = Vec::new();
+    for path in &cli.ca_bundle {
+        match mar_net::load_pem_bundle(path) {
+            Ok(certs) => ca_bundle.extend(certs),
+            Err(e) => {
+                eprintln!("error: cannot read {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let trust = Trust {
+        mode: cli.trust.into(),
+        extra_roots: ca_bundle,
+    };
+
+    if let Err(e) = run(cli.command, policy, trust) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 }
 
-fn run(command: Command, policy: Policy) -> anyhow::Result<()> {
+/// Trust settings, gathered from the global flags.
+#[derive(Clone)]
+struct Trust {
+    mode: mar_net::TrustMode,
+    extra_roots: Vec<ureq::tls::Certificate<'static>>,
+}
+
+impl Trust {
+    fn client_config(&self, policy: Policy) -> mar_net::ClientConfig {
+        mar_net::ClientConfig {
+            policy,
+            trust: self.mode,
+            extra_roots: self.extra_roots.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
     match command {
         Command::Read {
             url,
@@ -176,7 +270,7 @@ fn run(command: Command, policy: Policy) -> anyhow::Result<()> {
                 include_links: !no_links,
                 max_chars,
             };
-            let (reading, report) = Renderer::new(policy).read(&url, &options)?;
+            let (reading, report) = Renderer::new(trust.client_config(policy)).read(&url, &options)?;
 
             let mut out = std::io::stdout().lock();
             match format {
@@ -201,7 +295,7 @@ fn run(command: Command, policy: Policy) -> anyhow::Result<()> {
             render,
             report: want_report,
         } => {
-            let rendered = Renderer::new(policy).render(&url, &render.to_options())?;
+            let rendered = Renderer::new(trust.client_config(policy)).render(&url, &render.to_options())?;
             print!("{}", rendered.html);
             if want_report {
                 eprintln!("{}", serde_json::to_string_pretty(&rendered.report)?);
@@ -214,7 +308,7 @@ fn run(command: Command, policy: Policy) -> anyhow::Result<()> {
             expression,
             render,
         } => {
-            let json = Renderer::new(policy).eval(&url, &expression, &render.to_options())?;
+            let json = Renderer::new(trust.client_config(policy)).eval(&url, &expression, &render.to_options())?;
             println!("{json}");
             Ok(())
         }
@@ -223,7 +317,52 @@ fn run(command: Command, policy: Policy) -> anyhow::Result<()> {
             bind,
             workers,
             token,
-        } => server::serve(&bind, workers, token, policy),
+        } => server::serve(&bind, workers, token, trust.client_config(policy)),
+
+        Command::Cdp {
+            bind,
+            token,
+            max_connections,
+            render,
+        } => {
+            let client = mar_net::HttpClient::new(trust.client_config(policy));
+            mar_cdp::serve(
+                mar_cdp::CdpConfig {
+                    bind,
+                    token,
+                    limits: render.to_options().limits,
+                    max_connections,
+                },
+                client,
+            )?;
+            Ok(())
+        }
+
+        Command::Certs { json } => {
+            let bundled = mar_net::bundled_certs();
+            if json {
+                let rows: Vec<_> = bundled
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "name": c.name, "subject": c.subject,
+                            "not_after": c.not_after, "source": c.source,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("Bundled root certificates, used only when the public roots reject a chain:\n");
+                for cert in &bundled {
+                    println!("  {}", cert.subject);
+                    println!("    expires {}", cert.not_after);
+                    println!("    from    {}\n", cert.source);
+                }
+                println!("Trust order: public roots first, these only on a certificate failure.");
+                println!("Change it with --trust public-only | combined | none.");
+            }
+            Ok(())
+        }
     }
 }
 

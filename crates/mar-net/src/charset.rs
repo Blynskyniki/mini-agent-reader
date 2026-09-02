@@ -175,6 +175,35 @@ mod tests {
     }
 
     #[test]
+    fn a_koi8_body_is_decoded_once_not_twice() {
+        // Regression: with the HTTP client's own charset support enabled, the
+        // body arrived already transcoded to UTF-8 and this decoded it a second
+        // time, turning "Библиотека" into "п▒п╦п╠п╩п╦п╬я┌п╣п╨п╟". The client
+        // now hands over raw bytes.
+        let mut raw = b"<html><body>".to_vec();
+        raw.extend_from_slice(&[
+            0xE2, 0xC9, 0xC2, 0xCC, 0xC9, 0xCF, 0xD4, 0xC5, 0xCB, 0xC1,
+        ]); // "Библиотека" in koi8-r
+        let (text, charset) = decode_body(&raw, "text/html; charset=koi8-r");
+        assert_eq!(charset, "koi8-r");
+        assert!(text.contains("Библиотека"), "decoded: {text}");
+
+        // The same bytes already in UTF-8 must not be re-decoded as koi8-r.
+        let utf8 = "<html><body>Библиотека".as_bytes();
+        let (text, _) = decode_body(utf8, "text/html; charset=utf-8");
+        assert!(text.contains("Библиотека"), "decoded: {text}");
+    }
+
+    #[test]
+    fn windows_1251_pages_decode() {
+        let mut raw = br#"<meta charset="windows-1251">"#.to_vec();
+        raw.extend_from_slice(&[0xCC, 0xEE, 0xF1, 0xEA, 0xE2, 0xE0]); // "Москва"
+        let (text, charset) = decode_body(&raw, "text/html");
+        assert_eq!(charset, "windows-1251");
+        assert!(text.contains("Москва"), "decoded: {text}");
+    }
+
+    #[test]
     fn undeclared_utf8_is_detected_and_invalid_bytes_fall_back() {
         assert_eq!(sniff_charset("Привет".as_bytes(), "").name(), "UTF-8");
         assert_eq!(sniff_charset(&[0xCF, 0xF0, 0xE8], "").name(), "windows-1252");

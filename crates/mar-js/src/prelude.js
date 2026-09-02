@@ -1258,6 +1258,160 @@
     whenDefined: () => Promise.resolve(), upgrade() {},
   };
 
+  // -- remote object handles -----------------------------------------------
+
+  // A CDP client refers to a live JS value across separate protocol messages
+  // by an opaque id. Keeping the values in JavaScript rather than pinning them
+  // from Rust means the engine needs no cross-language lifetime tracking, and
+  // releasing a handle is a map delete.
+  const handles = new Map();
+  let nextHandle = 1;
+
+  // Exposed for the CDP layer, which addresses nodes by arena id.
+  globalThis.__mar_node_by_id = function (id) {
+    return native.node_by_id(id);
+  };
+
+  globalThis.__mar_handle_put = function (value) {
+    const id = nextHandle++;
+    handles.set(id, value);
+    return id;
+  };
+
+  globalThis.__mar_handle_get = function (id) {
+    return handles.get(id);
+  };
+
+  /// Park a value, awaiting it first when it is thenable.
+  ///
+  /// CDP's `awaitPromise` means the server settles the promise before
+  /// describing the result. A client's async helpers — the iterator `$$` walks,
+  /// every `await` inside an evaluated function — return promises, so without
+  /// this the client is handed a Promise object and finds nothing in it.
+  globalThis.__mar_await = function (value) {
+    const slot = { state: 'pending', value: undefined };
+    if (value && (typeof value === 'object' || typeof value === 'function')
+        && typeof value.then === 'function') {
+      value.then(
+        (v) => { slot.state = 'fulfilled'; slot.value = v; },
+        (e) => { slot.state = 'rejected'; slot.value = e; },
+      );
+    } else {
+      slot.state = 'fulfilled';
+      slot.value = value;
+    }
+    return __mar_handle_put(slot);
+  };
+
+  /// Read a parked slot: its state, and its value once settled.
+  globalThis.__mar_settled = function (id, byValue) {
+    const slot = handles.get(id);
+    if (!slot) return JSON.stringify({ state: 'missing' });
+    if (slot.state === 'pending') return JSON.stringify({ state: 'pending' });
+    return JSON.stringify({
+      state: slot.state,
+      result: __mar_describe(slot.value, byValue),
+    });
+  };
+
+  /// Enumerate a handle's own properties as CDP PropertyDescriptors.
+  ///
+  /// A client walks an array result this way: it gets one handle for the array
+  /// and then asks for the elements. Returning nothing here is why `$$` and
+  /// `$$eval` come back empty even though the query itself matched.
+  globalThis.__mar_handle_properties = function (id, ownOnly) {
+    const value = handles.get(id);
+    if (value === undefined || value === null) return [];
+    const out = [];
+    const push = (name, v, enumerable) => {
+      out.push({
+        name: String(name),
+        value: __mar_describe(v, false),
+        writable: true,
+        configurable: true,
+        enumerable,
+        isOwn: true,
+      });
+    };
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) push(i, value[i], true);
+      push('length', value.length, false);
+      return out;
+    }
+    if (typeof value === 'object' || typeof value === 'function') {
+      for (const key of Object.getOwnPropertyNames(value)) {
+        // A getter can throw or have side effects; skip anything that is not
+        // a plain data property.
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor || !('value' in descriptor)) continue;
+        push(key, descriptor.value, descriptor.enumerable !== false);
+      }
+    }
+    return out;
+  };
+
+  globalThis.__mar_handle_release = function (id) {
+    handles.delete(id);
+  };
+
+  globalThis.__mar_handle_clear = function () {
+    handles.clear();
+    nextHandle = 1;
+  };
+
+  /// Describe a value the way CDP's RemoteObject does, keeping a handle when
+  /// the value cannot be sent by value.
+  globalThis.__mar_describe = function (value, byValue) {
+    const type = typeof value;
+    if (value === null) return { type: 'object', subtype: 'null', value: null };
+    if (type === 'undefined') return { type: 'undefined' };
+    if (type === 'boolean' || type === 'number' || type === 'string') {
+      return { type, value };
+    }
+    if (type === 'bigint') return { type: 'bigint', value: String(value) };
+    if (type === 'symbol') return { type: 'symbol', description: String(value) };
+    if (type === 'function') {
+      return {
+        type: 'function',
+        className: 'Function',
+        description: value.name ? `function ${value.name}() {}` : 'function () {}',
+        objectId: String(__mar_handle_put(value)),
+      };
+    }
+    if (value instanceof Error) {
+      return {
+        type: 'object', subtype: 'error',
+        className: value.name || 'Error',
+        description: `${value.name}: ${value.message}`,
+      };
+    }
+    if (value instanceof Node) {
+      return {
+        type: 'object', subtype: 'node',
+        className: value.nodeName,
+        description: value.nodeName,
+        objectId: String(__mar_handle_put(value)),
+      };
+    }
+    if (byValue) {
+      // The client asked for the value itself; anything JSON can carry goes
+      // across, and anything it cannot becomes a handle instead.
+      try {
+        return { type: 'object', value: JSON.parse(JSON.stringify(value)) };
+      } catch {
+        /* fall through to a handle */
+      }
+    }
+    const isArray = Array.isArray(value);
+    return {
+      type: 'object',
+      subtype: isArray ? 'array' : undefined,
+      className: isArray ? 'Array' : (value.constructor && value.constructor.name) || 'Object',
+      description: isArray ? `Array(${value.length})` : 'Object',
+      objectId: String(__mar_handle_put(value)),
+    };
+  };
+
   // -- error reporting -----------------------------------------------------
 
   globalThis.onerror = null;

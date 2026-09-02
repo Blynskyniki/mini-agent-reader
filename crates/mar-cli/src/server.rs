@@ -7,7 +7,7 @@
 use crate::pipeline::{RenderOptions, Renderer};
 use mar_extract::MarkdownOptions;
 use mar_js::Limits;
-use mar_net::Policy;
+use mar_net::ClientConfig;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,12 +82,12 @@ pub fn serve(
     bind: &str,
     workers: usize,
     token: Option<String>,
-    policy: Policy,
+    client_config: ClientConfig,
 ) -> anyhow::Result<()> {
     let server = Server::http(bind).map_err(|e| anyhow::anyhow!("cannot bind {bind}: {e}"))?;
     let server = Arc::new(server);
     let shared = Arc::new(Shared {
-        renderer: Renderer::new(policy),
+        renderer: Renderer::new(client_config),
         token,
         served: AtomicU64::new(0),
     });
