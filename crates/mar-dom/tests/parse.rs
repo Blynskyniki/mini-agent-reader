@@ -10,7 +10,10 @@ fn builds_a_tree_and_merges_text() {
     let doc = out.document;
 
     let body = doc.body().expect("body");
-    let div = doc.children(body).find(|&c| doc.data(c).is_element()).unwrap();
+    let div = doc
+        .children(body)
+        .find(|&c| doc.data(c).is_element())
+        .unwrap();
     let el = doc.element(div).unwrap();
     assert_eq!(el.local_name().as_ref(), "div");
     assert_eq!(el.attr(&"id".into()), Some("a"));
@@ -26,7 +29,10 @@ fn builds_a_tree_and_merges_text() {
     // The parser must recover from the unclosed <p>.
     let ps = doc
         .descendants(body)
-        .filter(|&c| doc.element(c).is_some_and(|e| e.local_name().as_ref() == "p"))
+        .filter(|&c| {
+            doc.element(c)
+                .is_some_and(|e| e.local_name().as_ref() == "p")
+        })
         .count();
     assert_eq!(ps, 2);
     assert!(doc.head().is_some());
@@ -74,16 +80,27 @@ fn serialization_round_trips_and_escapes() {
     let doc = &out.document;
     let html = mar_dom::document_html(doc);
 
-    assert!(html.contains(r#"class="a&amp;b""#), "attrs are escaped: {html}");
+    assert!(
+        html.contains(r#"class="a&amp;b""#),
+        "attrs are escaped: {html}"
+    );
     assert!(html.contains("x &lt; y"), "text is escaped: {html}");
-    assert!(html.contains("<br>") && !html.contains("</br>"), "void tags: {html}");
-    assert!(html.contains("if (a<b) {}"), "script content stays raw: {html}");
+    assert!(
+        html.contains("<br>") && !html.contains("</br>"),
+        "void tags: {html}"
+    );
+    assert!(
+        html.contains("if (a<b) {}"),
+        "script content stays raw: {html}"
+    );
 
     // Re-parsing the output must produce the same tree shape.
     let again = mar_dom::parse_html(&html);
     assert_eq!(mar_dom::document_html(&again.document), html);
 
-    let div = mar_dom::query_selector(doc, doc.root(), "div").unwrap().unwrap();
+    let div = mar_dom::query_selector(doc, doc.root(), "div")
+        .unwrap()
+        .unwrap();
     assert!(mar_dom::outer_html(doc, div).starts_with("<div "));
     assert!(mar_dom::inner_html(doc, div).starts_with("<p>"));
 }
@@ -93,7 +110,9 @@ fn fragments_import_into_a_live_document() {
     use mar_dom::{QualName, ns};
     let out = mar_dom::parse_html("<div id=host><span>old</span></div>");
     let mut doc = out.document;
-    let host = mar_dom::query_selector(&doc, doc.root(), "#host").unwrap().unwrap();
+    let host = mar_dom::query_selector(&doc, doc.root(), "#host")
+        .unwrap()
+        .unwrap();
 
     let ctx = QualName::new(None, ns!(html), "div".into());
     let (frag, holder) = mar_dom::parse_fragment_document("<b>x</b><i>y</i>", &ctx);

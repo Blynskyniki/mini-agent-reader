@@ -10,12 +10,12 @@ pub mod browser;
 pub mod domains;
 pub mod protocol;
 
+use base64::Engine;
 use browser::Browser;
 use mar_js::Limits;
 use mar_net::HttpClient;
 use protocol::{Command, Outgoing, version_payload};
 use serde_json::json;
-use base64::Engine;
 use sha1::Digest;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -97,7 +97,11 @@ fn handle_connection(
     let head = read_request_head(&stream)?;
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
-    let mut path = request_line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+    let mut path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_owned();
 
     let headers: Vec<(String, String)> = lines
         .filter_map(|line| {
@@ -113,12 +117,10 @@ fn handle_connection(
     // The token may arrive as a query parameter or an Authorization header:
     // Puppeteer can carry either, depending on how it was configured.
     if let Some(expected) = &config.token {
-        let query_token = path
-            .split_once('?')
-            .and_then(|(_, q)| {
-                q.split('&')
-                    .find_map(|pair| pair.strip_prefix("token=").map(str::to_owned))
-            });
+        let query_token = path.split_once('?').and_then(|(_, q)| {
+            q.split('&')
+                .find_map(|pair| pair.strip_prefix("token=").map(str::to_owned))
+        });
         let header_token = headers
             .iter()
             .find(|(k, _)| k == "authorization")
@@ -167,11 +169,8 @@ fn handle_connection(
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()?;
 
-    let websocket = tungstenite::WebSocket::from_raw_socket(
-        stream,
-        tungstenite::protocol::Role::Server,
-        None,
-    );
+    let websocket =
+        tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
     run_session(websocket, config, client);
     Ok(())
 }

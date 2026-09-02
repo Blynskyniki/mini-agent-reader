@@ -3,8 +3,13 @@
 use mar_js::{Limits, NoNetwork, Page, StaticNetwork};
 
 fn render(html: &str) -> mar_js::PageOutcome {
-    let mut page = Page::new(html, "https://example.com/page", Limits::default(), NoNetwork)
-        .expect("page builds");
+    let mut page = Page::new(
+        html,
+        "https://example.com/page",
+        Limits::default(),
+        NoNetwork,
+    )
+    .expect("page builds");
     page.run()
 }
 
@@ -47,7 +52,11 @@ fn deferred_work_settles_on_the_virtual_clock() {
     );
 
     assert!(out.html.contains("late later"), "html: {}", out.html);
-    assert!(out.virtual_ms >= 3000, "virtual clock advanced: {}", out.virtual_ms);
+    assert!(
+        out.virtual_ms >= 3000,
+        "virtual clock advanced: {}",
+        out.virtual_ms
+    );
     assert!(out.wall_ms < 1000, "but no real waiting: {}ms", out.wall_ms);
     assert!(!out.truncated);
 }
@@ -97,7 +106,11 @@ fn fetch_feeds_the_dom() {
     let out = page.run();
 
     assert!(out.errors.is_empty(), "{:?}", out.errors);
-    assert!(out.html.contains("<h2>From the API</h2>"), "html: {}", out.html);
+    assert!(
+        out.html.contains("<h2>From the API</h2>"),
+        "html: {}",
+        out.html
+    );
     assert_eq!(out.requests, 1);
 }
 
@@ -144,9 +157,16 @@ fn events_dom_apis_and_storage_behave() {
         .and_then(|s| s.split("</div>").next())
         .unwrap_or("");
     // ">" is escaped on serialization, as the HTML spec requires.
-    assert_eq!(log, "clicked:click;clicked:click;attr-&gt;typed;ls:v1;ck:sid=42;");
+    assert_eq!(
+        log,
+        "clicked:click;clicked:click;attr-&gt;typed;ls:v1;ck:sid=42;"
+    );
 
-    assert!(out.html.contains(r#"class="done b""#), "classList: {}", out.html);
+    assert!(
+        out.html.contains(r#"class="done b""#),
+        "classList: {}",
+        out.html
+    );
     assert!(out.html.contains(r#"data-role="primary""#));
     assert!(out.html.contains("display: none"));
     // The value attribute is untouched by typing, matching a real browser.
@@ -164,7 +184,12 @@ fn a_thrown_script_does_not_stop_the_others() {
         </body>"#,
     );
     assert!(out.html.contains("one;three"), "html: {}", out.html);
-    assert_eq!(out.errors.len(), 1, "the throw was recorded: {:?}", out.errors);
+    assert_eq!(
+        out.errors.len(),
+        1,
+        "the throw was recorded: {:?}",
+        out.errors
+    );
     assert_eq!(out.scripts_run, 3);
 }
 
@@ -189,7 +214,11 @@ fn an_infinite_loop_is_stopped_by_the_timer_budget() {
     let out = page.run();
 
     assert!(out.truncated, "the loop was cut short");
-    assert!(out.timer_callbacks <= 51, "budget held: {}", out.timer_callbacks);
+    assert!(
+        out.timer_callbacks <= 51,
+        "budget held: {}",
+        out.timer_callbacks
+    );
     assert!(out.wall_ms < 5000, "and it did not hang: {}ms", out.wall_ms);
 }
 
@@ -213,7 +242,11 @@ fn the_page_reports_console_output() {
           console.error(new Error('bad'));
         </script></body>"#,
     );
-    let lines: Vec<_> = out.console.iter().map(|m| (m.level.as_str(), m.text.as_str())).collect();
+    let lines: Vec<_> = out
+        .console
+        .iter()
+        .map(|m| (m.level.as_str(), m.text.as_str()))
+        .collect();
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert_eq!(lines[0].0, "log");
     assert!(lines[0].1.starts_with("plain 42 {"), "{:?}", lines[0].1);
@@ -232,7 +265,9 @@ fn evaluating_an_expression_returns_json() {
     .unwrap();
     page.run();
     let json = page
-        .eval_json("[...document.querySelectorAll('li')].map(l => ({id: l.dataset.id, t: l.textContent}))")
+        .eval_json(
+            "[...document.querySelectorAll('li')].map(l => ({id: l.dataset.id, t: l.textContent}))",
+        )
         .unwrap();
     assert_eq!(json, r#"[{"id":"1","t":"a"},{"id":"2","t":"b"}]"#);
 }

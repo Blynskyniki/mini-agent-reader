@@ -331,11 +331,7 @@ fn strip_site_suffix(title: &str) -> String {
     title.trim().to_owned()
 }
 
-fn apply_json_ld(
-    meta: &mut Metadata,
-    entry: &serde_json::Value,
-    titles: &mut TitleCandidates,
-) {
+fn apply_json_ld(meta: &mut Metadata, entry: &serde_json::Value, titles: &mut TitleCandidates) {
     let Some(map) = entry.as_object() else { return };
 
     if let Some(ty) = map.get("@type") {

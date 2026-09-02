@@ -78,7 +78,11 @@ impl DomNode {
     }
 
     /// Wrap an optional node id, mapping `None` to JS `null`.
-    pub fn wrap_opt<'js>(ctx: &Ctx<'js>, doc: &SharedDoc, id: Option<NodeId>) -> Result<Value<'js>> {
+    pub fn wrap_opt<'js>(
+        ctx: &Ctx<'js>,
+        doc: &SharedDoc,
+        id: Option<NodeId>,
+    ) -> Result<Value<'js>> {
         match id {
             Some(id) => Ok(DomNode::wrap(ctx, doc, id)?.into_value()),
             None => Ok(Value::new_null(ctx.clone())),
@@ -307,7 +311,10 @@ impl DomNode {
     ) -> Result<Class<'js, DomNode>> {
         let node_id = node.borrow().id;
         if self.doc.borrow().contains(node_id, self.id) {
-            return Err(throw_str(&ctx, "HierarchyRequestError: cyclic insertBefore"));
+            return Err(throw_str(
+                &ctx,
+                "HierarchyRequestError: cyclic insertBefore",
+            ));
         }
         match reference {
             Some(r) => {

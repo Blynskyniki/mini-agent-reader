@@ -181,9 +181,7 @@ mod tests {
         // time, turning "Библиотека" into "п▒п╦п╠п╩п╦п╬я┌п╣п╨п╟". The client
         // now hands over raw bytes.
         let mut raw = b"<html><body>".to_vec();
-        raw.extend_from_slice(&[
-            0xE2, 0xC9, 0xC2, 0xCC, 0xC9, 0xCF, 0xD4, 0xC5, 0xCB, 0xC1,
-        ]); // "Библиотека" in koi8-r
+        raw.extend_from_slice(&[0xE2, 0xC9, 0xC2, 0xCC, 0xC9, 0xCF, 0xD4, 0xC5, 0xCB, 0xC1]); // "Библиотека" in koi8-r
         let (text, charset) = decode_body(&raw, "text/html; charset=koi8-r");
         assert_eq!(charset, "koi8-r");
         assert!(text.contains("Библиотека"), "decoded: {text}");
@@ -206,6 +204,9 @@ mod tests {
     #[test]
     fn undeclared_utf8_is_detected_and_invalid_bytes_fall_back() {
         assert_eq!(sniff_charset("Привет".as_bytes(), "").name(), "UTF-8");
-        assert_eq!(sniff_charset(&[0xCF, 0xF0, 0xE8], "").name(), "windows-1252");
+        assert_eq!(
+            sniff_charset(&[0xCF, 0xF0, 0xE8], "").name(),
+            "windows-1252"
+        );
     }
 }

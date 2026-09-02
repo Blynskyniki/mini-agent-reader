@@ -43,7 +43,10 @@ fn attribute_operators() {
     assert_eq!(names(PAGE, "a[href^='/']"), ["a#a1"]);
     assert_eq!(names(PAGE, "img[src$='.png']"), ["img#im"]);
     assert_eq!(names(PAGE, "[class*='ntr']"), ["p#p1"]);
-    assert!(names(PAGE, "[href='/X']").is_empty(), "value match is case-sensitive");
+    assert!(
+        names(PAGE, "[href='/X']").is_empty(),
+        "value match is case-sensitive"
+    );
 }
 
 #[test]
@@ -82,7 +85,10 @@ fn scoped_queries_and_closest() {
     let a = query_selector(doc, doc.root(), "#a1").unwrap().unwrap();
     let m = Matcher::new("article").unwrap();
     let closest = m.closest(doc, a).unwrap();
-    assert_eq!(doc.element(closest).unwrap().local_name().as_ref(), "article");
+    assert_eq!(
+        doc.element(closest).unwrap().local_name().as_ref(),
+        "article"
+    );
     assert!(Matcher::new("h1").unwrap().closest(doc, a).is_none());
 }
 

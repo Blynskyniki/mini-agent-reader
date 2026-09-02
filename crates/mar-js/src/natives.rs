@@ -14,7 +14,6 @@ use rquickjs::prelude::Func;
 use rquickjs::{Class, Ctx, Function, Object, Persistent, Result, Value};
 use std::rc::Rc;
 
-
 // A closure written inline gets two independent lifetimes for `Ctx<'a>` and the
 // `Value<'b>` it returns, which cannot be unified. These identity functions
 // pin the closure to a single higher-ranked `'js`, which is what the JS engine
@@ -409,15 +408,26 @@ fn install_location(api: &Object<'_>, state: &Shared) -> Result<()> {
             let o = Object::new(ctx.clone())?;
             o.set("href", u.as_str())?;
             o.set("protocol", format!("{}:", u.scheme()))?;
-            o.set("host", u.host_str().map(|h| match u.port() {
-                Some(p) => format!("{h}:{p}"),
-                None => h.to_owned(),
-            }).unwrap_or_default())?;
+            o.set(
+                "host",
+                u.host_str()
+                    .map(|h| match u.port() {
+                        Some(p) => format!("{h}:{p}"),
+                        None => h.to_owned(),
+                    })
+                    .unwrap_or_default(),
+            )?;
             o.set("hostname", u.host_str().unwrap_or_default())?;
             o.set("port", u.port().map(|p| p.to_string()).unwrap_or_default())?;
             o.set("pathname", u.path())?;
-            o.set("search", u.query().map(|q| format!("?{q}")).unwrap_or_default())?;
-            o.set("hash", u.fragment().map(|f| format!("#{f}")).unwrap_or_default())?;
+            o.set(
+                "search",
+                u.query().map(|q| format!("?{q}")).unwrap_or_default(),
+            )?;
+            o.set(
+                "hash",
+                u.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
+            )?;
             o.set("origin", u.origin().ascii_serialization())?;
             Ok(o)
         })),
@@ -453,10 +463,7 @@ fn install_location(api: &Object<'_>, state: &Shared) -> Result<()> {
     )?;
 
     let st = state.clone();
-    api.set(
-        "referrer",
-        Func::from(move || st.borrow().referrer.clone()),
-    )?;
+    api.set("referrer", Func::from(move || st.borrow().referrer.clone()))?;
 
     Ok(())
 }
@@ -715,10 +722,9 @@ pub fn describe(value: &Value<'_>) -> String {
         rquickjs::Type::Undefined => "undefined".into(),
         rquickjs::Type::Null => "null".into(),
         rquickjs::Type::Bool => value.as_bool().unwrap_or(false).to_string(),
-        rquickjs::Type::Int | rquickjs::Type::Float => value
-            .as_number()
-            .map(|n| n.to_string())
-            .unwrap_or_default(),
+        rquickjs::Type::Int | rquickjs::Type::Float => {
+            value.as_number().map(|n| n.to_string()).unwrap_or_default()
+        }
         rquickjs::Type::String => value
             .as_string()
             .and_then(|s| s.to_string().ok())

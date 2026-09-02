@@ -124,10 +124,7 @@ pub fn primary_config(mode: TrustMode, extra: &[Certificate<'static>]) -> TlsCon
 }
 
 /// The configuration retried after a certificate failure, when the mode has one.
-pub fn fallback_config(
-    mode: TrustMode,
-    extra: &[Certificate<'static>],
-) -> Option<TlsConfig> {
+pub fn fallback_config(mode: TrustMode, extra: &[Certificate<'static>]) -> Option<TlsConfig> {
     match mode {
         TrustMode::PublicThenExtra => Some(
             TlsConfig::builder()
@@ -202,7 +199,10 @@ mod tests {
             assert!(is_certificate_error(message), "should match: {message}");
         }
         for message in ["connection refused", "dns error", "timed out"] {
-            assert!(!is_certificate_error(message), "should not match: {message}");
+            assert!(
+                !is_certificate_error(message),
+                "should not match: {message}"
+            );
         }
     }
 

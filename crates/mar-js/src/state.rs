@@ -129,11 +129,7 @@ impl PageState {
         }
         self.console_bytes += text.len();
         let at_ms = self.timers.now_ms();
-        self.console.push(ConsoleMessage {
-            level,
-            text,
-            at_ms,
-        });
+        self.console.push(ConsoleMessage { level, text, at_ms });
     }
 
     pub fn record_error(&mut self, source: impl Into<String>, message: impl Into<String>) {

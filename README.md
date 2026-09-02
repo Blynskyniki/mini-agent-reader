@@ -2,129 +2,166 @@
 
 [![Release](https://img.shields.io/github/v/release/Blynskyniki/mini-agent-reader?label=release&sort=semver)](https://github.com/Blynskyniki/mini-agent-reader/releases/latest)
 [![License: MIT](https://img.shields.io/github/license/Blynskyniki/mini-agent-reader)](LICENSE)
-[![Русский](https://img.shields.io/badge/🇷🇺-Русский-informational)](README.ru.md)
+[![English](https://img.shields.io/badge/lang-English-informational)](README.en.md)
 
-*[Читать на русском](README.ru.md)*
+*[Read this in English](README.en.md)*
 
-A headless browser that runs JavaScript but never draws anything, plus a reader
-that turns the settled page into Markdown.
+Headless-браузер, который выполняет JavaScript, но ничего не рисует. Плюс
+читалка, превращающая осевшую страницу в Markdown.
 
-It exists because agents pay Chromium's full cost — layout, style cascade,
-compositing, GPU process, ~300 MB of resident memory — to obtain text. None of
-that machinery affects the text. Removing it leaves a browser that fits in a
-5 MB binary and renders a client-side page in single-digit milliseconds.
+Он существует потому, что агенты платят полную цену Chromium — вёрстка, каскад
+стилей, композитинг, GPU-процесс, около 300 МБ памяти — ради текста. Ни одна из
+этих частей на текст не влияет. Если их убрать, останется браузер, который
+помещается в 5 МБ и рендерит клиентскую страницу за единицы миллисекунд.
 
 ```
 $ mar read https://example.com/spa-page
-# Deploying without downtime
+# Развёртывание без простоя
 
-Rolling deploys work by never taking the whole fleet out of rotation at once…
+Плавающие деплои работают за счёт того, что весь парк никогда не выводится из
+ротации целиком…
 ```
 
-## What it costs
+## Сколько это стоит
 
-Measured on an M-series Mac, release build, one page per process.
+Замеры на Mac с чипом M-серии, release-сборка, одна страница на процесс.
 
 | | mini-agent-reader | Headless Chromium |
 |---|---|---|
-| Binary | 5 MB | ~150 MB installed |
-| Peak RSS, typical page | 6–7 MB | 250–400 MB |
-| Peak RSS, large page (Wikipedia) | 19 MB | 400 MB+ |
-| Render time, local SPA | 4 ms | 300–800 ms |
-| Cold start | ~2 ms | 150–400 ms |
+| Бинарь | 5 МБ | ~150 МБ после установки |
+| Память, обычная страница | 6–8 МБ | 250–400 МБ |
+| Память, большая страница (Wikipedia) | 19 МБ | 400 МБ и выше |
+| Рендер локальной SPA | 4 мс | 300–800 мс |
+| Холодный старт | ~2 мс | 150–400 мс |
 
-The virtual clock is the reason for the render figure. A page that spreads its
-work over three seconds of `setTimeout` settles in microseconds, because time
-only advances when nothing else is runnable.
+Виртуальные часы — вот причина цифры по рендеру. Страница, которая растягивает
+работу на три секунды таймеров, оседает за микросекунды, потому что время
+двигается только тогда, когда исполнять больше нечего.
 
-## What it is
+## Российские сайты из коробки
 
-Six crates, each usable on its own.
+Госуслуги, mos.ru и ряд других отдают сертификаты, выпущенные Минцифры. Этого
+корня нет ни в одном браузере и ни в одной операционной системе, поэтому такие
+сайты обычным клиентом не открываются вовсе: соединение падает на рукопожатии,
+ещё до всякого HTTP.
 
-- **`mar-dom`** — HTML parsing and an arena DOM. Nodes live in a flat `Vec`
-  addressed by a 32-bit index, with no per-node reference counting. CSS matching
-  is delegated to Servo's `selectors`, so `:has`, `:is` and `:nth-child` work.
-- **`mar-js`** — QuickJS with DOM bindings, a virtual-clock event loop, and a
-  JavaScript prelude that builds the browser environment.
-- **`mar-net`** — HTTP with browser-shaped headers, charset sniffing per the
-  HTML spec, and a policy layer that blocks private address space.
-- **`mar-extract`** — Readability-style article detection, metadata, Markdown.
-- **`mar-cdp`** — a Chrome DevTools Protocol endpoint, so Puppeteer, Playwright
-  and chrome-remote-interface can drive this browser unchanged.
-- **`mar-cli`** — the `mar` binary, the HTTP server and the CDP server.
-
-## Design
-
-**No renderer.** There is no layout, no style cascade, no paint. Every box is
-zero-sized at the origin, `getComputedStyle` returns what the inline style says,
-and `IntersectionObserver` never fires. This is the whole saving, and it is why
-screenshots are out of scope.
-
-**Thin native surface, thick JavaScript prelude.** Rust binds only what needs
-the document, the page state or the network: about thirty functions. `Event`,
-`classList`, `style`, `fetch`, `XMLHttpRequest`, `URL`, `localStorage` and the
-rest are written in JavaScript on top of that. Closing a gap for a site that
-does not render usually means editing `prelude.js`, not the engine.
-
-**A virtual clock.** Timers sit in a heap keyed by due time. When microtasks are
-drained and no network call is outstanding, the clock jumps to the next timer.
-Wall-clock time is never spent waiting. Timers past a horizon never fire, which
-stops a polling page from staying alive forever.
-
-**The engine never opens a socket.** It calls a `NetworkProvider` the host
-installs, so policy lives in one place and tests run offline against canned
-responses.
-
-**Everything is bounded.** JS heap ceiling, stack ceiling, wall-clock budget,
-virtual-time horizon, timer-callback budget, subresource-request budget, console
-byte budget. A page that misbehaves is truncated and reported as truncated.
-
-## Install
-
-Prebuilt binaries for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon) and
-Windows are attached to every [release](https://github.com/Blynskyniki/mini-agent-reader/releases/latest).
-Download the archive for your platform, unpack it, and run `mar`.
-
-Or build from source:
+Оба сертификата встроены в бинарь. Но не в общий список доверия: проверка идёт
+сначала по публичным корням, и только если она провалилась, повторяется по
+расширенному набору. Удостоверяющий центр под контролем государства может
+выпустить сертификат на любой домен, поэтому безусловное доверие к нему
+позволило бы перехватывать любой сайт. Такой порядок означает, что встроенный
+корень способен спасти сайт, который иначе не открылся бы, и никогда не может
+подменить тот, что и так работает.
 
 ```bash
-cargo build --release          # ~30s, no system dependencies beyond a C compiler
+mar certs                    # что встроено и до какого срока
+mar read https://www.gosuslugi.ru/
 ```
 
-## Use
+Порядок меняется флагом `--trust public-only | combined | none`, свои корни
+добавляются через `--ca-bundle <файл>`.
 
-Read a page as Markdown:
+Кодировки тоже учтены: `windows-1251` и `koi8-r` определяются в порядке,
+описанном спецификацией HTML, — по BOM, заголовку, `<meta>`, затем по самим
+байтам.
+
+## Из чего состоит
+
+Шесть крейтов, каждый пригоден отдельно.
+
+- **`mar-dom`** — разбор HTML и DOM в арене. Узлы лежат в плоском `Vec` и
+  адресуются 32-битным индексом, без подсчёта ссылок на каждый узел. Матчинг CSS
+  отдан крейту `selectors` от Servo, поэтому работают `:has`, `:is`, `:nth-child`.
+- **`mar-js`** — QuickJS с биндингами DOM, цикл событий на виртуальных часах и
+  JavaScript-прелюдия, которая достраивает браузерное окружение.
+- **`mar-net`** — HTTP с браузерными заголовками, определение кодировки по
+  спецификации, встроенные корневые сертификаты и политика, закрывающая
+  приватные диапазоны адресов.
+- **`mar-extract`** — выделение статьи в духе Readability, метаданные, Markdown.
+- **`mar-cdp`** — эндпоинт Chrome DevTools Protocol, так что Puppeteer,
+  Playwright и chrome-remote-interface работают без изменений.
+- **`mar-cli`** — бинарь `mar`, HTTP-сервер и CDP-сервер.
+
+## Устройство
+
+**Нет рендерера.** Нет вёрстки, каскада стилей и отрисовки. Любой бокс имеет
+нулевой размер в начале координат, `getComputedStyle` возвращает то, что задано
+инлайновым стилем, а `IntersectionObserver` не срабатывает никогда. Именно на
+этом достигается вся экономия, и именно поэтому скриншоты вне области задач.
+
+**Тонкий нативный слой, толстая JavaScript-прелюдия.** На Rust привязано только
+то, чему нужен документ, состояние страницы или сеть: около тридцати функций.
+`Event`, `classList`, `style`, `fetch`, `XMLHttpRequest`, `URL`, `localStorage` и
+остальное написаны на JavaScript поверх этого. Закрыть пробел для сайта, который
+не отрисовался, обычно значит поправить `prelude.js`, а не движок.
+
+**Виртуальные часы.** Таймеры лежат в куче, упорядоченной по времени
+срабатывания. Когда микрозадачи исчерпаны и нет незавершённых сетевых вызовов,
+часы прыгают к ближайшему таймеру. Реальное время на ожидание не тратится.
+Таймеры за горизонтом не срабатывают вовсе, из-за чего опрашивающая страница не
+живёт вечно.
+
+**Движок сам не открывает сокетов.** Он вызывает `NetworkProvider`, который
+устанавливает хост, поэтому политика живёт в одном месте, а тесты идут офлайн на
+заготовленных ответах.
+
+**Всё ограничено.** Потолок кучи JavaScript, потолок стека, бюджет реального
+времени, горизонт виртуального, бюджет вызовов таймеров, бюджет подзапросов,
+бюджет вывода в консоль. Страница, которая ведёт себя плохо, обрезается, и об
+этом сообщается.
+
+## Установка
+
+Готовые сборки для Linux (x86_64, aarch64), macOS (Intel и Apple Silicon) и
+Windows приложены к каждому [релизу](https://github.com/Blynskyniki/mini-agent-reader/releases/latest).
+Скачайте архив под свою платформу, распакуйте и запускайте `mar`.
+
+Через npm:
+
+```bash
+npm install mini-agent-reader
+```
+
+Из исходников:
+
+```bash
+cargo build --release    # около 30 секунд, из системных зависимостей только компилятор C
+```
+
+## Командная строка
+
+Прочитать страницу как Markdown:
 
 ```bash
 mar read https://example.com/article
 ```
 
-With metadata as YAML front matter, or as one JSON object:
+С метаданными в виде YAML-заголовка или одним объектом JSON:
 
 ```bash
 mar read https://example.com/article --format full
 mar read https://example.com/article --format json
 ```
 
-Skip JavaScript when the page is server-rendered, which is much faster:
+Пропустить JavaScript, если страница отдаётся сервером: так заметно быстрее.
 
 ```bash
 mar read https://example.com/article --no-js
 ```
 
-Get the rendered HTML, with a cost report on stderr:
+Получить отрендеренный HTML вместе с отчётом о затратах на stderr:
 
 ```bash
 mar fetch https://example.com/ --report
 ```
 
-Ask the settled page a question:
+Спросить у осевшей страницы:
 
 ```bash
 mar eval https://example.com/ "[...document.querySelectorAll('h2')].map(h => h.textContent)"
 ```
 
-Serve it:
+## HTTP-сервер
 
 ```bash
 mar serve --bind 127.0.0.1:3000 --workers 4
@@ -137,65 +174,127 @@ POST /eval   {"url": "...", "expression": "..."}
 GET  /health
 ```
 
-Each worker renders one page at a time. Twelve concurrent requests against a
-local page complete in about 40 ms on three workers.
+Каждый воркер рендерит одну страницу за раз. Двенадцать одновременных запросов к
+локальной странице отрабатывают примерно за 40 мс на трёх воркерах.
 
-Or speak Chrome DevTools Protocol, so existing Puppeteer/Playwright code
-points at `mar` unchanged:
+## Chrome DevTools Protocol
 
 ```bash
 mar cdp --bind 127.0.0.1:9222
 ```
 
-## TLS trust
+Существующий код на Puppeteer или Playwright направляется сюда без изменений:
 
-Some sites — `gosuslugi.ru` and `mos.ru` among them — present certificates
-issued by the Russian Ministry of Digital Development, a root no browser or OS
-ships. `mar` bundles it, but only consults it after the public trust store has
-already rejected the chain, so it can rescue a site that would otherwise fail
-and can never override one that already works. `mar certs` lists what is
-bundled; `--trust public-only|combined|none` and `--ca-bundle <file>` change
-the policy.
+```js
+import puppeteer from 'puppeteer-core';
 
-## Safety
+const browser = await puppeteer.connect({
+  browserWSEndpoint: 'ws://127.0.0.1:9222',
+});
+const page = await browser.newPage();
+await page.goto('https://lenta.ru/');
 
-Requests to loopback, private, link-local and other reserved ranges are refused
-by default, `localhost` included, and only `http` and `https` are allowed. A
-rendering service fetches URLs its caller chose and then runs scripts that
-choose more; without this, `http://169.254.169.254/` reads cloud credentials on
-the caller's behalf. Pass `--allow-private` for local development, and
-`--allow-host` to restrict fetching to a set of domains.
+await page.title();
+await page.evaluate(() => document.querySelectorAll('a').length);
+await page.$$eval('h2', els => els.map(e => e.textContent));
+await page.content();
+```
 
-Scripts cannot navigate the host anywhere by themselves. A `location.href`
-assignment is recorded and followed only because a browser would, bounded to
-three hops with loop detection, and cross-origin subresource requests are
-refused.
+Проверено на неизменённом `puppeteer-core`: работают `connect`, `newPage`,
+`goto`, `title`, `evaluate` с аргументами, `$`, `$$`, `$eval`, `$$eval`,
+`elementHandle.evaluate`, `content` и `close`. Реализованы настоящие
+object handles, `Runtime.getProperties` и ожидание промисов, поэтому
+асинхронный код в `evaluate` действительно дожидается результата.
 
-## Limits
+Метод, требующий рендерера (`Page.captureScreenshot`, `Page.printToPDF`),
+возвращает понятную ошибку, а не пустую картинку.
 
-Known and deliberate:
+## JavaScript
 
-- **No screenshots or PDFs.** They need the renderer this project removes.
-- **No TLS fingerprint spoofing.** Headers look like Chrome; the TLS handshake
-  does not. Sites behind an interstitial challenge will still serve one.
-- **No module loader.** A `type="module"` script compiles and runs, but an
-  `import` of another URL fails. Page runtimes that bundle this way log an
-  error and the rest of the page still renders.
-- **No WebSocket, Worker, WebGL, canvas or media.** They construct without
-  throwing and do nothing.
-- **Cross-origin scripts are not fetched.** Third-party bundles are almost
-  always analytics and advertising: slow, and they add nothing to read.
-- **Extraction is heuristic.** A page with no clear article is reported with
-  `low_confidence: true` rather than guessed at.
+```js
+import { read, evaluate, createReader, launch } from 'mini-agent-reader';
 
-## Testing
+// Одна страница, один процесс.
+const article = await read('https://lenta.ru/');
+console.log(article.title, article.length, article.report.total_ms);
+console.log(article.content);          // Markdown
+
+// Спросить у страницы.
+const count = await evaluate('https://example.com/', 'document.links.length');
+
+// Долгоживущий сервер: старт один раз, соединения и cookie переиспользуются.
+const reader = await createReader({ workers: 4 });
+const pages = await Promise.all(urls.map(u => reader.read(u)));
+await reader.close();
+
+// CDP-эндпоинт для Puppeteer.
+const mar = await launch();
+const browser = await puppeteer.connect({ browserWSEndpoint: mar.wsEndpoint });
+```
+
+Типы TypeScript входят в пакет.
+
+## Маскировка под браузер
+
+Запросы выглядят браузерными на уровне HTTP, и это относится и к тем, что делает
+сама страница через `fetch` или `XMLHttpRequest`:
+
+- реальный адрес страницы в `Referer`, а не только её origin;
+- `Origin` на запросах, инициированных скриптом;
+- корректный `Sec-Fetch-Site`: `same-origin`, `same-site` или `cross-site`;
+- `Sec-Fetch-Dest` и `Sec-Fetch-Mode` под тип запроса;
+- полный набор `Sec-CH-UA`, `Accept`, `Accept-Language`;
+- никакого `Content-Length` на GET без тела, чего браузеры не шлют;
+- общие cookie между документом и его подзапросами.
+
+Чего здесь нет: подмены TLS-отпечатка. Рукопожатие делает rustls, и по JA3 или
+JA4 оно отличается от Chrome. Сайты, которые проверяют именно это, увидят
+разницу. Если она нужна, ставьте перед `mar` прокси на базе curl-impersonate.
+
+## Безопасность
+
+Запросы к loopback, приватным, link-local и прочим зарезервированным диапазонам
+по умолчанию отклоняются, включая `localhost`, и разрешены только схемы `http` и
+`https`. Сервис рендеринга ходит по адресам, которые выбрал вызывающий, а потом
+исполняет скрипты, выбирающие новые адреса. Без такой проверки запрос к
+`http://169.254.169.254/` прочитал бы за вызывающего учётные данные облака. Для
+локальной разработки есть `--allow-private`, для ограничения списком доменов —
+`--allow-host`.
+
+Скрипт не может сам увести хост куда угодно. Присваивание `location.href`
+записывается и выполняется только потому, что так поступил бы браузер, не более
+трёх переходов и с обнаружением циклов. Кросс-доменные подзапросы отклоняются.
+
+## Чего нет
+
+Осознанно:
+
+- **Скриншотов и PDF.** Им нужен тот самый рендерер, который здесь убран.
+- **Подмены TLS-отпечатка.** Заголовки как у Chrome, рукопожатие — нет.
+- **Загрузчика модулей.** Скрипт `type="module"` компилируется и исполняется, но
+  `import` другого адреса не разрешается. Рантаймы, собранные так, пишут ошибку,
+  а остальная страница всё равно рендерится.
+- **WebSocket, Worker, WebGL, canvas и медиа.** Конструируются без исключений и
+  ничего не делают.
+- **Кросс-доменные скрипты не загружаются.** Сторонние бандлы почти всегда
+  аналитика и реклама: медленно, и читать там нечего.
+- **Не-HTML не разбирается.** PDF или изображение отклоняются с внятным
+  сообщением, а не выдаются как текст.
+- **Выделение статьи эвристическое.** Страница без явной статьи помечается
+  `low_confidence: true`, а не выдаётся за угаданную.
+
+## Тесты
 
 ```bash
 cargo test
 ```
 
-Thirty-nine tests: DOM structure and serialization round-trips, CSS selector
-semantics, charset sniffing against the spec's precedence order, SSRF policy,
-article extraction, and end-to-end rendering including promises, fetch, the
-virtual clock, error isolation and the runaway-page budget. None touch the
-network.
+Сорок пять тестов: структура DOM и обратимость сериализации, семантика
+CSS-селекторов, определение кодировки в порядке из спецификации (включая
+регрессию на двойное декодирование koi8-r), политика против SSRF, выделение
+статьи и сквозной рендеринг с промисами, `fetch`, виртуальными часами,
+изоляцией ошибок и бюджетом на зациклившуюся страницу. Сеть не используется.
+
+## Лицензия
+
+MIT.

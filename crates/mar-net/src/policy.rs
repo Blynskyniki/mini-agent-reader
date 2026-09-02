@@ -176,7 +176,11 @@ mod tests {
     #[test]
     fn non_http_schemes_are_refused() {
         let p = Policy::default();
-        for url in ["file:///etc/passwd", "ftp://example.com/", "data:text/html,x"] {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/",
+            "data:text/html,x",
+        ] {
             assert!(check(&p, url).is_err(), "should be blocked: {url}");
         }
     }

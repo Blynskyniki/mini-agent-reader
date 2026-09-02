@@ -21,26 +21,97 @@ const CHROME_TAGS: &[&str] = &["nav", "header", "footer", "aside", "menu"];
 
 /// Substrings in `id`/`class` that suggest chrome rather than content.
 const NEGATIVE_HINTS: &[&str] = &[
-    "banner", "combx", "comment", "community", "cover-wrap", "disqus", "extra", "foot", "header",
-    "legend", "menu", "modal", "related", "remark", "replies", "rss", "shoutbox", "sidebar",
-    "skyscraper", "social", "sponsor", "supplemental", "ad-break", "agegate", "pagination",
-    "pager", "popup", "yom-remote", "share", "promo", "newsletter", "subscribe", "cookie",
-    "breadcrumb", "widget", "sitemap", "toolbar", "masthead", "nav-", "-nav", "advert",
+    "banner",
+    "combx",
+    "comment",
+    "community",
+    "cover-wrap",
+    "disqus",
+    "extra",
+    "foot",
+    "header",
+    "legend",
+    "menu",
+    "modal",
+    "related",
+    "remark",
+    "replies",
+    "rss",
+    "shoutbox",
+    "sidebar",
+    "skyscraper",
+    "social",
+    "sponsor",
+    "supplemental",
+    "ad-break",
+    "agegate",
+    "pagination",
+    "pager",
+    "popup",
+    "yom-remote",
+    "share",
+    "promo",
+    "newsletter",
+    "subscribe",
+    "cookie",
+    "breadcrumb",
+    "widget",
+    "sitemap",
+    "toolbar",
+    "masthead",
+    "nav-",
+    "-nav",
+    "advert",
     // Reference and citation lists are long, comma-rich and prose-like, so they
     // out-score the article body unless they are named explicitly.
-    "reference", "reflist", "citation", "footnote", "bibliograph", "endnote", "further-reading",
-    "navbox", "infobox", "metadata", "catlinks", "portal", "mw-editsection", "hatnote",
+    "reference",
+    "reflist",
+    "citation",
+    "footnote",
+    "bibliograph",
+    "endnote",
+    "further-reading",
+    "navbox",
+    "infobox",
+    "metadata",
+    "catlinks",
+    "portal",
+    "mw-editsection",
+    "hatnote",
 ];
 
 /// Substrings that suggest the opposite.
 const POSITIVE_HINTS: &[&str] = &[
-    "article", "body", "content", "entry", "hentry", "h-entry", "main", "page", "pagination",
-    "post", "text", "blog", "story", "column", "prose", "markdown",
+    "article",
+    "body",
+    "content",
+    "entry",
+    "hentry",
+    "h-entry",
+    "main",
+    "page",
+    "pagination",
+    "post",
+    "text",
+    "blog",
+    "story",
+    "column",
+    "prose",
+    "markdown",
 ];
 
 /// Elements that start a scoring candidate.
 const BLOCK_TAGS: &[&str] = &[
-    "p", "td", "pre", "article", "section", "div", "blockquote", "li", "dd", "figure",
+    "p",
+    "td",
+    "pre",
+    "article",
+    "section",
+    "div",
+    "blockquote",
+    "li",
+    "dd",
+    "figure",
 ];
 
 /// A scored candidate for the main content.
@@ -144,13 +215,10 @@ fn strip_noise(doc: &mut Document, root: NodeId) {
                 return true;
             }
             // display:none set inline is the same statement.
-            if el
-                .attr(&LocalName::from("style"))
-                .is_some_and(|s| {
-                    let s = s.replace(' ', "").to_ascii_lowercase();
-                    s.contains("display:none") || s.contains("visibility:hidden")
-                })
-            {
+            if el.attr(&LocalName::from("style")).is_some_and(|s| {
+                let s = s.replace(' ', "").to_ascii_lowercase();
+                s.contains("display:none") || s.contains("visibility:hidden")
+            }) {
                 return true;
             }
             false
@@ -338,8 +406,7 @@ fn score_candidates(doc: &Document, body: NodeId) -> HashMap<NodeId, Candidate> 
 
         let density = link_density(doc, id);
         let text_len = visible_text(doc, id).chars().count();
-        let score =
-            (content_score + tag_score(&tag)) * hint_multiplier(doc, id) * (1.0 - density);
+        let score = (content_score + tag_score(&tag)) * hint_multiplier(doc, id) * (1.0 - density);
 
         out.insert(
             id,
@@ -416,12 +483,14 @@ fn grow_with_siblings(
                 return false;
             }
             if let Some(c) = candidates.get(&sib)
-                && c.score >= threshold && c.link_density < 0.4 {
-                    return true;
-                }
-                // Fall through: a low score can simply mean the section holds
-                // its text in tags that do not seed scores, such as <dl> or
-                // <pre>. The structural test below still applies.
+                && c.score >= threshold
+                && c.link_density < 0.4
+            {
+                return true;
+            }
+            // Fall through: a low score can simply mean the section holds
+            // its text in tags that do not seed scores, such as <dl> or
+            // <pre>. The structural test below still applies.
             let tag = el.local_name().as_ref().to_owned();
             let text = visible_text(doc, sib);
             let len = text.chars().count();
@@ -487,7 +556,10 @@ fn clean_conditionally(doc: &mut Document, root: NodeId) {
                 // Keep empty wrappers that exist to hold media.
                 return !doc.descendants(id).any(|d| {
                     doc.element(d).is_some_and(|e| {
-                        matches!(e.local_name().as_ref(), "img" | "video" | "picture" | "figure")
+                        matches!(
+                            e.local_name().as_ref(),
+                            "img" | "video" | "picture" | "figure"
+                        )
                     })
                 });
             }

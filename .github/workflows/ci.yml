@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The suite is offline by design, so a failure here means a test started
+      # reaching the network rather than that the network is down.
+      - name: Build release
+        run: cargo build --release
+
+  cdp:
+    name: CDP against puppeteer-core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: cargo build --release
+      - run: npm install --no-save puppeteer-core
+
+      - name: Drive the endpoint with a real client
+        run: |
+          ./target/release/mar cdp --bind 127.0.0.1:9222 &
+          for i in $(seq 1 40); do
+            curl -sf http://127.0.0.1:9222/json/version > /dev/null && break
+            sleep 0.25
+          done
+          node .github/scripts/cdp-check.mjs

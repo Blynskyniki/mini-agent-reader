@@ -104,7 +104,13 @@ fn the_article_is_kept_and_the_chrome_is_dropped() {
     assert!(out.content.contains("sustained a reaction"));
     assert!(out.content.contains("Funding for the next phase"));
 
-    for chrome in ["Sign in", "Privacy", "© 2026", "Fusion timeline", "Grid costs"] {
+    for chrome in [
+        "Sign in",
+        "Privacy",
+        "© 2026",
+        "Fusion timeline",
+        "Grid costs",
+    ] {
         assert!(
             !out.content.contains(chrome),
             "chrome leaked into the article: {chrome}\n---\n{}",
@@ -134,9 +140,15 @@ fn structure_survives_the_conversion_to_markdown() {
     );
     assert!(md.contains("*The hall in 2025*"), "caption\n{md}");
     // Links resolve too.
-    assert!(md.contains("[Dana Okafor](https://news.example.com/authors/dana)"), "link\n{md}");
+    assert!(
+        md.contains("[Dana Okafor](https://news.example.com/authors/dana)"),
+        "link\n{md}"
+    );
     // No raw HTML survives.
-    assert!(!md.contains("<p>") && !md.contains("<div"), "html leaked\n{md}");
+    assert!(
+        !md.contains("<p>") && !md.contains("<div"),
+        "html leaked\n{md}"
+    );
 }
 
 #[test]
@@ -161,7 +173,11 @@ fn markdown_options_control_cost() {
         ..options()
     };
     let short = to_markdown(&article.document, article.root, &capped);
-    assert!(short.len() < 400, "truncated to roughly the cap: {}", short.len());
+    assert!(
+        short.len() < 400,
+        "truncated to roughly the cap: {}",
+        short.len()
+    );
 }
 
 #[test]
@@ -173,7 +189,10 @@ fn a_page_with_no_article_falls_back_to_the_body() {
     )
     .document;
     let out = read(&doc, &MarkdownOptions::default());
-    assert!(out.low_confidence, "the caller must be told this is unreliable");
+    assert!(
+        out.low_confidence,
+        "the caller must be told this is unreliable"
+    );
     assert!(out.content.contains("One"));
 }
 
@@ -188,9 +207,21 @@ fn markdown_escapes_what_would_otherwise_be_syntax() {
     )
     .document;
     let out = read(&doc, &MarkdownOptions::default());
-    assert!(out.content.contains(r"5\*3"), "asterisk escaped\n{}", out.content);
-    assert!(out.content.contains(r"\_underscore\_"), "underscore escaped\n{}", out.content);
-    assert!(out.content.contains(r"\[brackets\]"), "brackets escaped\n{}", out.content);
+    assert!(
+        out.content.contains(r"5\*3"),
+        "asterisk escaped\n{}",
+        out.content
+    );
+    assert!(
+        out.content.contains(r"\_underscore\_"),
+        "underscore escaped\n{}",
+        out.content
+    );
+    assert!(
+        out.content.contains(r"\[brackets\]"),
+        "brackets escaped\n{}",
+        out.content
+    );
 }
 
 #[test]

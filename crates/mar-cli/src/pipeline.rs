@@ -93,12 +93,6 @@ impl Renderer {
         }
     }
 
-    /// The client this renderer fetches through, so callers can inspect what
-    /// trust was used.
-    pub fn client(&self) -> &HttpClient {
-        &self.client
-    }
-
     /// Fetch `url`, run its scripts, and hand back the settled document.
     ///
     /// Follows redirects a browser would follow but HTTP does not express:
@@ -143,9 +137,8 @@ impl Renderer {
         let mut document = mar_dom::parse_html(&fetched.body).document;
         let mut hops = 0;
         while hops < MAX_META_REFRESH_HOPS {
-            let base = Url::parse(&fetched.final_url).unwrap_or_else(|_| {
-                Url::parse(url).expect("the client already parsed this URL")
-            });
+            let base = Url::parse(&fetched.final_url)
+                .unwrap_or_else(|_| Url::parse(url).expect("the client already parsed this URL"));
             let Some(target) = meta_refresh_target(&document, &base) else {
                 break;
             };
@@ -178,9 +171,8 @@ impl Renderer {
             ));
         }
 
-        let base = Url::parse(&fetched.final_url).unwrap_or_else(|_| {
-            Url::parse(url).expect("the client already parsed this URL")
-        });
+        let base = Url::parse(&fetched.final_url)
+            .unwrap_or_else(|_| Url::parse(url).expect("the client already parsed this URL"));
 
         let mut report = RenderReport {
             url: url.to_owned(),
@@ -274,7 +266,11 @@ impl Renderer {
     }
 
     /// Fetch, render and extract in one call.
-    pub fn read(&self, url: &str, options: &RenderOptions) -> anyhow::Result<(Reading, RenderReport)> {
+    pub fn read(
+        &self,
+        url: &str,
+        options: &RenderOptions,
+    ) -> anyhow::Result<(Reading, RenderReport)> {
         let rendered = self.render(url, options)?;
         let mut report = rendered.report;
 
@@ -384,7 +380,6 @@ impl Renderer {
     fn client_execute(&self, url: &Url, referer: &Url) -> anyhow::Result<mar_net::Fetched> {
         Ok(self.client.get_script(url.as_str(), referer)?)
     }
-
 }
 
 /// A page may chain refreshes; a couple of hops is generous and bounds the work.

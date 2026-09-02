@@ -129,7 +129,11 @@ fn handle(mut request: Request, shared: &Shared) {
         .unwrap_or("/")
         .trim_end_matches('/')
         .to_owned();
-    let path = if path.is_empty() { "/".to_owned() } else { path };
+    let path = if path.is_empty() {
+        "/".to_owned()
+    } else {
+        path
+    };
 
     if method == "GET" && path == "/health" {
         let served = shared.served.load(Ordering::Relaxed);
@@ -260,9 +264,13 @@ fn respond_error(request: Request, error: &anyhow::Error) {
 }
 
 fn respond_json(request: Request, status: u16, body: &serde_json::Value) {
-    let text = serde_json::to_string(body).unwrap_or_else(|_| r#"{"error":"serialization"}"#.into());
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..])
-        .expect("static header is valid");
+    let text =
+        serde_json::to_string(body).unwrap_or_else(|_| r#"{"error":"serialization"}"#.into());
+    let header = Header::from_bytes(
+        &b"Content-Type"[..],
+        &b"application/json; charset=utf-8"[..],
+    )
+    .expect("static header is valid");
     let response = Response::from_string(text)
         .with_status_code(status)
         .with_header(header);

@@ -377,7 +377,8 @@ impl Document {
 
     /// The `<html>` element, if the tree has one.
     pub fn document_element(&self) -> Option<NodeId> {
-        self.children(self.root).find(|&c| self.data(c).is_element())
+        self.children(self.root)
+            .find(|&c| self.data(c).is_element())
     }
 
     /// The `<body>` element, if the tree has one.

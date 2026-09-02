@@ -71,7 +71,9 @@ pub fn dispatch(browser: &mut Browser, command: &Command) -> Reply {
                 browser
                     .targets
                     .iter()
-                    .map(|t| Outgoing::event("Target.targetCreated", json!({"targetInfo": t.info()})))
+                    .map(|t| {
+                        Outgoing::event("Target.targetCreated", json!({"targetInfo": t.info()}))
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -188,11 +190,13 @@ pub fn dispatch(browser: &mut Browser, command: &Command) -> Reply {
         }
 
         // ---- Page -------------------------------------------------------
-        "Page.enable" | "Page.disable" | "Page.setLifecycleEventsEnabled"
-        | "Page.setInterceptFileChooserDialog" | "Page.setBypassCSP"
-        | "Page.stopLoading" | "Page.bringToFront" => {
-            Reply::just(Outgoing::empty(id, session))
-        }
+        "Page.enable"
+        | "Page.disable"
+        | "Page.setLifecycleEventsEnabled"
+        | "Page.setInterceptFileChooserDialog"
+        | "Page.setBypassCSP"
+        | "Page.stopLoading"
+        | "Page.bringToFront" => Reply::just(Outgoing::empty(id, session)),
 
         "Page.close" => {
             // Same teardown as Target.closeTarget, addressed by session.
@@ -369,8 +373,10 @@ pub fn dispatch(browser: &mut Browser, command: &Command) -> Reply {
             Reply::just(Outgoing::empty(id, session))
         }
 
-        "Runtime.disable" | "Runtime.releaseObjectGroup"
-        | "Runtime.runIfWaitingForDebugger" | "Runtime.addBinding"
+        "Runtime.disable"
+        | "Runtime.releaseObjectGroup"
+        | "Runtime.runIfWaitingForDebugger"
+        | "Runtime.addBinding"
         | "Runtime.setAsyncCallStackDepth" => Reply::just(Outgoing::empty(id, session)),
 
         "Runtime.getProperties" => {
@@ -410,7 +416,11 @@ pub fn dispatch(browser: &mut Browser, command: &Command) -> Reply {
             let Some(index) = session
                 .as_deref()
                 .and_then(|s| browser.index_of_session(s))
-                .or(if browser.targets.len() == 1 { Some(0) } else { None })
+                .or(if browser.targets.len() == 1 {
+                    Some(0)
+                } else {
+                    None
+                })
             else {
                 return Reply::just(Outgoing::error(id, session, "no target for this session"));
             };
@@ -497,7 +507,9 @@ pub fn dispatch(browser: &mut Browser, command: &Command) -> Reply {
             let node_id = command
                 .int_param("nodeId")
                 .ok_or_else(|| "nodeId is required".to_owned())?;
-            let node = target.resolve(node_id).ok_or_else(|| "no such node".to_owned())?;
+            let node = target
+                .resolve(node_id)
+                .ok_or_else(|| "no such node".to_owned())?;
             let doc = target
                 .document
                 .as_ref()
@@ -525,7 +537,9 @@ pub fn dispatch(browser: &mut Browser, command: &Command) -> Reply {
                     .ok_or_else(|| "objectId does not refer to a node".to_owned())?,
                 None => {
                     let node_id = command.int_param("nodeId").unwrap_or(1);
-                    target.resolve(node_id).ok_or_else(|| "no such node".to_owned())?
+                    target
+                        .resolve(node_id)
+                        .ok_or_else(|| "no such node".to_owned())?
                 }
             };
             let node_id = target.handle(node);
@@ -554,11 +568,14 @@ pub fn dispatch(browser: &mut Browser, command: &Command) -> Reply {
         }),
 
         // ---- Network and Emulation --------------------------------------
-        "Network.enable" | "Network.disable" | "Network.clearBrowserCache"
-        | "Network.clearBrowserCookies" | "Network.setCacheDisabled"
-        | "Network.setCookies" | "Network.setCookie" | "Network.emulateNetworkConditions" => {
-            Reply::just(Outgoing::empty(id, session))
-        }
+        "Network.enable"
+        | "Network.disable"
+        | "Network.clearBrowserCache"
+        | "Network.clearBrowserCookies"
+        | "Network.setCacheDisabled"
+        | "Network.setCookies"
+        | "Network.setCookie"
+        | "Network.emulateNetworkConditions" => Reply::just(Outgoing::empty(id, session)),
 
         "Network.setUserAgentOverride" | "Emulation.setUserAgentOverride" => {
             if let Some(ua) = command.str_param("userAgent") {
@@ -681,7 +698,11 @@ fn navigate_to(browser: &mut Browser, command: &Command, url: &str) -> Reply {
         Some(i) => i,
         None if browser.targets.len() == 1 => 0,
         None => {
-            return Reply::just(Outgoing::error(command.id, session, "no target for this session"));
+            return Reply::just(Outgoing::error(
+                command.id,
+                session,
+                "no target for this session",
+            ));
         }
     };
 
@@ -762,7 +783,10 @@ fn navigate_to(browser: &mut Browser, command: &Command, url: &str) -> Reply {
 
     let target = &mut browser.targets[index];
     target.url = fetched.final_url.clone();
-    target.title = outcome.as_ref().map(|o| o.title.clone()).unwrap_or_default();
+    target.title = outcome
+        .as_ref()
+        .map(|o| o.title.clone())
+        .unwrap_or_default();
     target.loader_id = loader_id.clone();
     target.reset_nodes();
 
@@ -917,7 +941,11 @@ fn evaluate(browser: &mut Browser, command: &Command, kind: EvalKind) -> Reply {
         Some(i) => i,
         None if browser.targets.len() == 1 => 0,
         None => {
-            return Reply::just(Outgoing::error(command.id, session, "no target for this session"));
+            return Reply::just(Outgoing::error(
+                command.id,
+                session,
+                "no target for this session",
+            ));
         }
     };
 
@@ -980,8 +1008,8 @@ fn evaluate(browser: &mut Browser, command: &Command, kind: EvalKind) -> Reply {
 
     match result {
         Ok(json) => {
-            let remote: Value = serde_json::from_str(&json)
-                .unwrap_or_else(|_| json!({"type": "undefined"}));
+            let remote: Value =
+                serde_json::from_str(&json).unwrap_or_else(|_| json!({"type": "undefined"}));
             Reply::just(Outgoing::ok(command.id, session, json!({"result": remote})))
         }
         Err(message) => Reply::just(Outgoing::ok(
@@ -1000,18 +1028,6 @@ fn evaluate(browser: &mut Browser, command: &Command, kind: EvalKind) -> Reply {
                 },
             }),
         )),
-    }
-}
-
-/// Wrap a JSON value as a CDP `Runtime.RemoteObject`.
-fn remote_object(value: Value) -> Value {
-    match value {
-        Value::Null => json!({"type": "object", "subtype": "null", "value": null}),
-        Value::Bool(b) => json!({"type": "boolean", "value": b}),
-        Value::Number(n) => json!({"type": "number", "value": n}),
-        Value::String(s) => json!({"type": "string", "value": s}),
-        Value::Array(_) => json!({"type": "object", "subtype": "array", "value": value}),
-        Value::Object(_) => json!({"type": "object", "value": value}),
     }
 }
 

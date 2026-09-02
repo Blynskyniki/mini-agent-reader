@@ -167,9 +167,8 @@ impl<N: NetworkProvider + 'static> Page<N> {
     /// value out of the page rather than its HTML.
     pub fn eval_json(&mut self, expression: &str) -> Result<String, String> {
         self.context.with(|ctx| {
-            let wrapped = format!(
-                "JSON.stringify((function(){{ return ({expression}); }})()) ?? 'null'"
-            );
+            let wrapped =
+                format!("JSON.stringify((function(){{ return ({expression}); }})()) ?? 'null'");
             ctx.eval::<String, _>(wrapped)
                 .catch(&ctx)
                 .map_err(|e| format!("{e}"))
@@ -319,10 +318,7 @@ impl<N: NetworkProvider + 'static> Page<N> {
     pub fn handle_for_node(&mut self, node: NodeId) -> Result<u32, String> {
         // The node is looked up through the same registry the DOM bindings use,
         // so the client's handle points at the live node, not a copy.
-        let expression = format!(
-            "__mar_handle_put(__mar_node_by_id({}))",
-            node.as_u32()
-        );
+        let expression = format!("__mar_handle_put(__mar_node_by_id({}))", node.as_u32());
         self.context.with(|ctx| {
             ctx.eval::<u32, _>(expression)
                 .catch(&ctx)
@@ -451,7 +447,9 @@ impl<N: NetworkProvider + 'static> Page<N> {
                 f.call::<_, ()>(())
             })();
             if let Err(e) = result.catch(&ctx) {
-                state.borrow_mut().record_error("ready events", format!("{e}"));
+                state
+                    .borrow_mut()
+                    .record_error("ready events", format!("{e}"));
             }
         });
     }

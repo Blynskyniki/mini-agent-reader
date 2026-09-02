@@ -1,0 +1,29 @@
+{
+  "name": "mini-agent-reader",
+  "version": "0.1.0",
+  "description": "A headless browser that runs JavaScript without a renderer, plus a reader that returns Markdown. Speaks Chrome DevTools Protocol.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js"
+    }
+  },
+  "bin": {
+    "mar": "./scripts/bin.js"
+  },
+  "files": ["lib", "scripts", "README.md"],
+  "scripts": {
+    "postinstall": "node scripts/install.js",
+    "test": "node --test test/"
+  },
+  "engines": { "node": ">=18" },
+  "keywords": [
+    "headless-browser", "scraping", "markdown", "readability", "cdp",
+    "puppeteer", "agent", "llm", "javascript-rendering"
+  ],
+  "repository": { "type": "git", "url": "git+https://github.com/Blynskyniki/mini-agent-reader.git" },
+  "license": "MIT"
+}

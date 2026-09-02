@@ -270,7 +270,8 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
                 include_links: !no_links,
                 max_chars,
             };
-            let (reading, report) = Renderer::new(trust.client_config(policy)).read(&url, &options)?;
+            let (reading, report) =
+                Renderer::new(trust.client_config(policy)).read(&url, &options)?;
 
             let mut out = std::io::stdout().lock();
             match format {
@@ -295,7 +296,8 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
             render,
             report: want_report,
         } => {
-            let rendered = Renderer::new(trust.client_config(policy)).render(&url, &render.to_options())?;
+            let rendered =
+                Renderer::new(trust.client_config(policy)).render(&url, &render.to_options())?;
             print!("{}", rendered.html);
             if want_report {
                 eprintln!("{}", serde_json::to_string_pretty(&rendered.report)?);
@@ -308,7 +310,11 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
             expression,
             render,
         } => {
-            let json = Renderer::new(trust.client_config(policy)).eval(&url, &expression, &render.to_options())?;
+            let json = Renderer::new(trust.client_config(policy)).eval(
+                &url,
+                &expression,
+                &render.to_options(),
+            )?;
             println!("{json}");
             Ok(())
         }
@@ -352,7 +358,9 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
-                println!("Bundled root certificates, used only when the public roots reject a chain:\n");
+                println!(
+                    "Bundled root certificates, used only when the public roots reject a chain:\n"
+                );
                 for cert in &bundled {
                     println!("  {}", cert.subject);
                     println!("    expires {}", cert.not_after);
@@ -372,7 +380,10 @@ fn front_matter(reading: &mar_extract::Reading) -> String {
     let mut field = |name: &str, value: &Option<String>| {
         if let Some(v) = value {
             // Quote and escape: titles routinely contain colons and quotes.
-            out.push_str(&format!("{name}: \"{}\"\n", v.replace('\\', "\\\\").replace('"', "\\\"")));
+            out.push_str(&format!(
+                "{name}: \"{}\"\n",
+                v.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
         }
     };
     field("title", &reading.metadata.title);

@@ -120,12 +120,7 @@ impl TreeSink for ArenaSink {
         OwnedElemName(name)
     }
 
-    fn create_element(
-        &self,
-        name: QualName,
-        attrs: Vec<Attribute>,
-        flags: ElementFlags,
-    ) -> NodeId {
+    fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> NodeId {
         let mut doc = self.doc.borrow_mut();
         let id = doc.create_element(name, attrs);
         if flags.template {
@@ -278,8 +273,6 @@ pub fn parse_fragment_document(html: &str, context: &QualName) -> (Document, Nod
     .one(html);
     // parse_fragment wraps output in an <html> element under the root.
     let doc = parsed.document;
-    let holder = doc
-        .document_element()
-        .unwrap_or_else(|| doc.root());
+    let holder = doc.document_element().unwrap_or_else(|| doc.root());
     (doc, holder)
 }

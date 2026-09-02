@@ -161,7 +161,10 @@ impl HttpClient {
             ("Accept-Language", self.config.accept_language.clone()),
             ("Accept-Encoding", "gzip, deflate, br".to_owned()),
             ("Upgrade-Insecure-Requests", "1".to_owned()),
-            ("Sec-CH-UA", r#""Chromium";v="140", "Not=A?Brand";v="24""#.to_owned()),
+            (
+                "Sec-CH-UA",
+                r#""Chromium";v="140", "Not=A?Brand";v="24""#.to_owned(),
+            ),
             ("Sec-CH-UA-Mobile", "?0".to_owned()),
             ("Sec-CH-UA-Platform", "\"macOS\"".to_owned()),
         ];
@@ -373,7 +376,6 @@ impl HttpClient {
         })
     }
 }
-
 
 /// The `Sec-Fetch-Site` value for a request made from `referer` to `url`.
 ///

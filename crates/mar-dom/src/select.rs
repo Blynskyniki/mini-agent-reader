@@ -15,8 +15,8 @@ use selectors::context::{
 };
 use selectors::matching::{ElementSelectorFlags, matches_selector};
 use selectors::parser::{
-    NonTSPseudoClass as NonTSPseudoClassTrait, Parser as SelectorParser, PseudoElement as PseudoElementTrait,
-    Selector, SelectorList, SelectorParseErrorKind,
+    NonTSPseudoClass as NonTSPseudoClassTrait, Parser as SelectorParser,
+    PseudoElement as PseudoElementTrait, Selector, SelectorList, SelectorParseErrorKind,
 };
 use selectors::{Element, OpaqueElement};
 use std::fmt;
@@ -221,7 +221,9 @@ impl<'i> SelectorParser<'i> for SelectorParserImpl {
     ) -> Result<NonTSPseudoClass, ParseError<'i, Self::Error>> {
         // Consume the argument list so the rest of the selector keeps parsing.
         while parser.next().is_ok() {}
-        Ok(NonTSPseudoClass::Unsupported(name.as_ref().to_ascii_lowercase()))
+        Ok(NonTSPseudoClass::Unsupported(
+            name.as_ref().to_ascii_lowercase(),
+        ))
     }
 
     fn parse_non_ts_pseudo_class(

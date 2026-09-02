@@ -106,7 +106,10 @@ impl Writer<'_> {
 
     fn resolve(&self, raw: &str) -> String {
         match &self.options.base_url {
-            Some(base) => base.join(raw).map(|u| u.to_string()).unwrap_or_else(|_| raw.to_owned()),
+            Some(base) => base
+                .join(raw)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| raw.to_owned()),
             None => raw.to_owned(),
         }
     }
@@ -232,12 +235,22 @@ impl Writer<'_> {
             // Structural containers contribute nothing themselves.
             "div" | "section" | "article" | "main" | "span" | "body" | "html" | "header"
             | "footer" | "aside" | "nav" | "tbody" | "thead" | "tfoot" | "label" | "small"
-            | "sup" | "sub" | "u" | "mark" | "time" | "abbr" | "cite" | "q" | "video"
-            | "audio" | "source" | "details" | "summary" | "address" | "font" | "center" => {
+            | "sup" | "sub" | "u" | "mark" | "time" | "abbr" | "cite" | "q" | "video" | "audio"
+            | "source" | "details" | "summary" | "address" | "font" | "center" => {
                 let is_block = !matches!(
                     tag.as_str(),
-                    "span" | "small" | "sup" | "sub" | "u" | "mark" | "time" | "abbr" | "cite"
-                        | "q" | "label" | "font"
+                    "span"
+                        | "small"
+                        | "sup"
+                        | "sub"
+                        | "u"
+                        | "mark"
+                        | "time"
+                        | "abbr"
+                        | "cite"
+                        | "q"
+                        | "label"
+                        | "font"
                 );
                 if is_block {
                     self.block_break();
@@ -280,7 +293,10 @@ impl Writer<'_> {
             .and_then(|class| {
                 class
                     .split_ascii_whitespace()
-                    .find_map(|c| c.strip_prefix("language-").or_else(|| c.strip_prefix("lang-")))
+                    .find_map(|c| {
+                        c.strip_prefix("language-")
+                            .or_else(|| c.strip_prefix("lang-"))
+                    })
                     .map(str::to_owned)
             })
             .unwrap_or_default();
@@ -306,7 +322,13 @@ impl Writer<'_> {
         let quoted: String = inner
             .trim_matches('\n')
             .lines()
-            .map(|line| if line.is_empty() { ">".to_owned() } else { format!("> {line}") })
+            .map(|line| {
+                if line.is_empty() {
+                    ">".to_owned()
+                } else {
+                    format!("> {line}")
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         self.push(&quoted);
@@ -532,7 +554,9 @@ fn escape_inline(text: &str) -> String {
 
 fn escape_url(url: &str) -> String {
     // Spaces and parentheses end the URL part of a Markdown link.
-    url.replace(' ', "%20").replace('(', "%28").replace(')', "%29")
+    url.replace(' ', "%20")
+        .replace('(', "%28")
+        .replace(')', "%29")
 }
 
 fn longest_backtick_run(text: &str) -> usize {
