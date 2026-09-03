@@ -105,8 +105,8 @@ without a JIT is genuinely the wrong tool.
 It does get through — the row above is the portal, not the interstitial — but
 the default 15-second budget is not enough, so this one needs
 `--timeout-ms 60000`. Nothing is extracted even then, for a reason further down
-this page: the portal's body arrives as cross-origin ES modules, and neither of
-those is fetched.
+this page: the portal's body arrives as ES modules whose graph is deeper than
+the request budget allows.
 
 Wikipedia is the memory ceiling: a document over a megabyte costs 27.7 MB, still
 half what Chromium spends on an empty tab.
@@ -179,26 +179,44 @@ Six crates, each usable on its own.
 
 ## Design
 
-**No renderer.** There is no layout, no style cascade, no paint. Every box the
-page itself measures is zero-sized at the origin, and `getComputedStyle` returns
-what the inline style says. This is the whole saving, and it is why screenshots
-are out of scope.
+**No renderer.** There is no layout and no paint. Nothing is positioned, nothing
+wraps, nothing is composited. This is the whole saving, and it is why
+screenshots are out of scope.
 
-`IntersectionObserver` does deliver one record per observed target rather than
-never firing: a script that waits for the callback before rendering its content
-cannot survive silence, and the answer it gets — visible — is the one that
-unblocks it. A CDP client that clicks is a separate matter: it measures an
-element before clicking, so it is handed a synthetic rectangle from an imaginary
-grid, unique per element and enough to hit-test against. Those rectangles exist
-only while a client is asking. The page's own scripts still measure zeroes,
-which is what keeps this a browser without a layout engine rather than one with
-a bad one.
+But a page that measures itself and finds zero concludes it has no room and
+renders its collapsed branch, which on real sites is the difference between an
+article and an empty shell. So an element reports a box derived from what the
+CSS actually says: an explicit width in a stylesheet or an inline style, a
+`width` attribute on a picture, otherwise an estimate from the content. The
+cascade behind that is real — rules are matched with the same selector engine
+the DOM uses — which is more than the inline-attribute shortcut this class of
+engine usually takes. The numbers are plausible, not true: nothing here knows
+where anything sits.
+
+`IntersectionObserver` delivers one record per observed target rather than never
+firing, for the same reason: a script that waits for the callback before
+rendering cannot survive silence. A CDP client that clicks is a separate matter
+again — it needs boxes that differ per element so a coordinate maps back to what
+it hit, so while a client is measuring it gets tiles from an imaginary grid
+instead of the page's own numbers. Two rulers, for two different questions.
 
 **Thin native surface, thick JavaScript prelude.** Rust binds only what needs
 the document, the page state or the network: about thirty functions. `Event`,
-`classList`, `style`, `fetch`, `XMLHttpRequest`, `URL`, `localStorage` and the
-rest are written in JavaScript on top of that. Closing a gap for a site that
-does not render usually means editing `prelude.js`, not the engine.
+`classList`, `style`, `fetch`, `XMLHttpRequest`, `URL`, `localStorage`, `Intl`,
+the element interfaces `instanceof` needs, `MessageChannel`, `TreeWalker` and
+the rest are written in JavaScript on top of that — roughly two hundred names.
+Closing a gap for a site that does not render usually means editing
+`prelude.js`, not the engine.
+
+Arguments cross that surface the way the DOM says they do. `setAttribute('x',
+42)` and `el.className = 1` are ordinary code, so a string parameter takes
+`ToString(value)` rather than refusing anything that is not already a string.
+
+**Classic scripts run in sloppy mode**, because that is what a `<script>` is.
+Under strict mode an assignment to an undeclared name is a ReferenceError, and
+that is not a corner case: React's streaming markup bootstraps itself with bare
+`$RC = function(...)` assignments, so a strict engine silently loses every
+suspense boundary on every server-rendered React page.
 
 **Modules are the host's job too.** An `import` is resolved against the
 importing module's URL and fetched through the same seam as every other
@@ -211,15 +229,37 @@ that died immediately looks like one that rendered nothing on purpose.
 **A virtual clock.** Timers sit in a heap keyed by due time. When microtasks are
 drained and no network call is outstanding, the clock jumps to the next timer.
 Wall-clock time is never spent waiting. Timers past a horizon never fire, which
-stops a polling page from staying alive forever.
+stops a polling page from staying alive forever. On a corpus of real sites this
+saves nothing on the median page — the median page is waiting on the network —
+and more than a second on one in eight.
 
 **The engine never opens a socket.** It calls a `NetworkProvider` the host
 installs, so policy lives in one place and tests run offline against canned
 responses.
 
+**Requests overlap, because a browser's do.** `Promise.all([fetch(a), fetch(b)])`
+means two requests in flight, not two in a row, and on a page with a hundred of
+them the difference is most of the wall clock. So `fetch` and asynchronous XHR
+hand the request to the host and return a promise; the settle loop delivers each
+answer as it lands, and a page with a request outstanding is not a settled page.
+A synchronous XHR and an `import` still block, because they block in a browser
+too.
+
+Everything a page announces before running — `<script src>`, `modulepreload`,
+`preload as=script` — is fetched together up front, and each module's own
+imports are scanned out of its source and started before the engine asks for
+them. A hundred subresources cost roughly one round trip's latency instead of a
+hundred.
+
 **Everything is bounded.** JS heap ceiling, stack ceiling, wall-clock budget,
 virtual-time horizon, timer-callback budget, subresource-request budget, console
 byte budget. A page that misbehaves is truncated and reported as truncated.
+
+The wall-clock budget bounds the page and not merely its script loop: fetching
+the page's code, loading its modules, following a navigation it asked for and
+the scripts themselves all come out of the same number. And the interpreter
+honours it — `while (true) {}` is stopped mid-instruction rather than waited
+out, which a budget checked only between callbacks can never do.
 
 ## Install
 
@@ -466,8 +506,8 @@ the caller's behalf. Pass `--allow-private` for local development, and
 
 Scripts cannot navigate the host anywhere by themselves. A `location.href`
 assignment or a `location.reload()` is recorded and followed only because a
-browser would, bounded to three hops with loop detection, and cross-origin
-subresource requests are refused.
+browser would, bounded to three hops with loop detection, and subresource
+requests to known trackers are refused.
 
 `--obey-robots` asks each site's `robots.txt` before fetching a page from it,
 once per host. Documents only: `robots.txt` governs what a crawler may go and
@@ -484,13 +524,24 @@ Known and deliberate:
   to resolve against and is reported as such rather than guessed at.
 - **No WebSocket, Worker, WebGL, canvas or media.** They construct without
   throwing and do nothing.
-- **No layout for the page itself.** An element measures zero, and a page that
-  branches on its own geometry takes the zero branch.
-- **Cross-origin classic scripts are not fetched.** Third-party bundles are
-  almost always analytics and advertising: slow, and they add nothing to read.
-  Cross-origin *modules* are fetched, because an application shipping native
-  modules keeps its bundle on a CDN and the same rule would skip the
-  application along with the tag manager.
+- **No layout.** Nothing is positioned or wrapped. What an element reports for
+  `getBoundingClientRect` and `offsetWidth` is derived from the cascade — an
+  explicit `width` in a stylesheet or an inline style, a `width` attribute on a
+  picture, otherwise an estimate from the content — because a page that
+  measures zero concludes it has no room and renders its collapsed branch. The
+  numbers are plausible, not true: nothing here knows where anything sits.
+- **No locale database.** `Intl` is a shim with English and Russian tables and
+  a neutral fallback for every other language, because QuickJS is built without
+  ICU. Dates and prices come out plausible rather than exact. It is a shim and
+  not an omission for one reason: without any `Intl` at all, a page that formats
+  a single price throws inside its render and paints nothing.
+- **No TLS fingerprint.** The handshake is rustls, not a browser's. A few
+  sites accept the same request from `curl` and refuse it here, and the answer
+  is a fingerprint-impersonating proxy rather than anything in this code.
+- **Trackers are not fetched.** Analytics, ad exchanges and chat widgets are
+  skipped by domain: they cost a request each and change nothing a reader will
+  see. Everything else the page asks for is fetched, wherever it is hosted,
+  because an application's own bundle and API routinely live on other hosts.
 - **Non-HTML is not parsed.** A PDF or an image is refused with a clear
   message rather than served as text.
 - **Extraction is heuristic.** A page with no clear article is reported with
@@ -502,14 +553,16 @@ Known and deliberate:
 cargo test
 ```
 
-Ninety-five tests: DOM structure and serialization round-trips, CSS selector
-semantics, charset sniffing in the spec's precedence order (including a
-regression for double-decoded koi8-r), SSRF policy, `robots.txt` grouping and
-longest-match precedence, the cookie jar the page shares with the client,
-article extraction, a CDP session driven end to end including request
-interception and synthetic input, the MCP protocol framing, and end-to-end
-rendering with promises, `fetch`, the virtual clock, error isolation and the
-runaway-page budget. None touch the network.
+A hundred and twenty tests: DOM structure and serialization round-trips, CSS
+selector semantics, charset sniffing in the spec's precedence order (including a
+regression for double-decoded koi8-r), SSRF policy, which hosts count as the
+same site, `robots.txt` grouping and longest-match precedence, the cookie jar
+the page shares with the client, article extraction, a CDP session driven end to
+end including request interception and synthetic input, the MCP protocol
+framing, and end-to-end rendering with promises, `fetch`, the virtual clock,
+sloppy-mode globals, `Intl`, the element interfaces `instanceof` needs,
+`document.currentScript`, error isolation and the runaway-page budget. None
+touch the network.
 
 ## Licence
 
