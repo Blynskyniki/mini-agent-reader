@@ -16,7 +16,12 @@ selectors = "0.40"
 cssparser = "0.37"
 string_cache = "0.11"
 anyhow = "1"
-rquickjs = { version = "0.12", features = ["macro", "classes", "properties", "array-buffer", "loader"] }
+# `disable-assertions` compiles out QuickJS's internal `assert()`s. One of
+# them fires when the runtime is freed with a JS object still referenced,
+# and a single leaked value anywhere in the engine then aborts the process.
+# For a batch renderer that is the wrong trade: a leak on one page must not
+# take the other five hundred with it.
+rquickjs = { version = "0.12", features = ["macro", "classes", "properties", "array-buffer", "loader", "disable-assertions"] }
 mar-dom = { path = "crates/mar-dom" }
 url = "2"
 serde = { version = "1", features = ["derive"] }

@@ -223,6 +223,48 @@ fn an_infinite_loop_is_stopped_by_the_timer_budget() {
 }
 
 #[test]
+fn a_synchronous_loop_is_stopped_by_the_wall_clock() {
+    // The settle loop checks the budget between callbacks, which is no help
+    // inside one. Without an interrupt handler this page never returns and the
+    // process waits forever — and a page off the open web gets to do that on
+    // purpose.
+    let limits = Limits {
+        wall_ms: 500,
+        ..Limits::default()
+    };
+    let mut page = Page::new(
+        r#"<body><div id="out">before</div><script>
+             document.getElementById('out').textContent = 'ran';
+             while (true) {}
+           </script></body>"#,
+        "https://example.com/page",
+        limits,
+        NoNetwork,
+    )
+    .expect("page builds");
+    let started = std::time::Instant::now();
+    let out = page.run();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the loop is cut off at the budget, not waited out"
+    );
+    let reported = out
+        .errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<String>();
+    assert!(
+        reported.contains("interrupted"),
+        "the page is told why it stopped: {reported}"
+    );
+    assert!(
+        out.html.contains("ran"),
+        "everything before the loop still counts: {}",
+        out.html
+    );
+}
+
+#[test]
 fn navigation_is_reported_not_followed() {
     let out = render(r#"<body><script>location.href = '/next?a=1';</script></body>"#);
     assert_eq!(
@@ -368,6 +410,328 @@ fn render_with(net: StaticNetwork, html: &str) -> mar_js::PageOutcome {
     let mut page =
         Page::new(html, "https://example.com/page", Limits::default(), net).expect("page builds");
     page.run()
+}
+
+#[test]
+fn a_classic_script_runs_in_sloppy_mode() {
+    // React's streaming markup bootstraps itself with bare assignments:
+    // `$RC = function(a, b) {...}` in the first completed boundary, and calls
+    // to `$RC(...)` in every one after it. Strict mode makes the first line a
+    // ReferenceError, and every suspense boundary on the page is then lost.
+    let out = render(
+        r#"<body><div id="out"></div>
+        <script>$RC = function (id, text) { document.getElementById(id).textContent = text; };</script>
+        <script>$RC('out', 'boundary revealed');</script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("boundary revealed"),
+        "an undeclared assignment is a global, as in a browser: {}",
+        out.html
+    );
+}
+
+#[test]
+fn the_running_script_is_document_current_script() {
+    // Bundlers read `document.currentScript.src` to work out where their own
+    // chunks live. webpack throws "Automatic publicPath is not supported"
+    // outright when it comes back null, taking the application with it.
+    let out = render(
+        r#"<body><div id="out"></div>
+        <script src="/assets/bundle.js">
+          document.getElementById('out').textContent =
+            document.currentScript.tagName + ' ' + document.currentScript.src;
+        </script>
+        <script>
+          document.getElementById('out').textContent += ' | after: ' + document.currentScript;
+          setTimeout(() => {
+            document.getElementById('out').textContent += ' | timer: ' + document.currentScript;
+          }, 0);
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("SCRIPT https://example.com/assets/bundle.js"),
+        "the running script knows where it came from: {}",
+        out.html
+    );
+    assert!(
+        out.html.contains("| timer: null"),
+        "nothing is the current script once the scripts have run: {}",
+        out.html
+    );
+}
+
+#[test]
+fn intl_formats_rather_than_throwing() {
+    // QuickJS ships no Intl. A page that formats one price through it throws
+    // inside its render and paints nothing at all.
+    let out = render(
+        r#"<body><div id="out"></div><script>
+          const parts = [
+            new Intl.NumberFormat('en-US').format(1234567.5),
+            new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(9.9),
+            new Intl.DateTimeFormat('en-US').format(new Date(2026, 0, 2)),
+            new Intl.PluralRules('ru').select(3),
+            // Written without `new` everywhere, because this is how a page
+            // asks a browser what time zone it is in.
+            typeof Intl.DateTimeFormat().resolvedOptions().timeZone,
+            (1234.5).toLocaleString('en-US'),
+          ];
+          document.getElementById('out').textContent = parts.join(' | ');
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html
+            .contains("1,234,567.5 | $9.90 | 1/2/2026 | few | string | 1,234.5"),
+        "formatting produces something a reader recognises: {}",
+        out.html
+    );
+}
+
+#[test]
+fn element_interfaces_exist_for_instanceof() {
+    // React's scheduler alone tests HTMLDivElement, HTMLBRElement,
+    // HTMLBodyElement and ShadowRoot. An undefined right-hand operand of
+    // `instanceof` is a TypeError, and one of those inside a render takes the
+    // whole application down.
+    let out = render(
+        r#"<body><div id="out"></div><script>
+          const div = document.createElement('div');
+          const results = [
+            div instanceof HTMLDivElement,
+            div instanceof HTMLElement,
+            div instanceof HTMLBRElement,
+            document.body instanceof HTMLBodyElement,
+            document.createElement('h3') instanceof HTMLHeadingElement,
+            document.createElement('td') instanceof HTMLTableCellElement,
+            div instanceof ShadowRoot,
+            new Image(16, 16) instanceof HTMLImageElement,
+            new Image().tagName === 'IMG',
+            localStorage instanceof Storage,
+          ];
+          document.getElementById('out').textContent = results.join(',');
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html
+            .contains("true,true,false,true,true,true,false,true,true,true"),
+        "each interface answers for its own tag and no other: {}",
+        out.html
+    );
+}
+
+#[test]
+fn a_link_is_also_a_parsed_url() {
+    // `isURLSameOrigin` in axios builds an anchor, assigns href and reads the
+    // pieces back. An element that reflects only `href` returns undefined,
+    // and the next line calls `.charAt(0)` on it.
+    let out = render(
+        r#"<body><div id="out"></div><script>
+          const a = document.createElement('a');
+          a.href = '/deep/path?q=1#frag';
+          document.getElementById('out').textContent =
+            [a.protocol, a.host, a.pathname, a.search, a.hash, a.origin].join(' ');
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html
+            .contains("https: example.com /deep/path ?q=1 #frag https://example.com"),
+        "a link exposes its URL in pieces: {}",
+        out.html
+    );
+}
+
+#[test]
+fn adjacent_insertion_works_by_markup_and_by_node() {
+    // `insertAdjacentHTML` is spelled with the acronym in capitals, which
+    // camelCase renaming on the Rust side does not know. `insertAdjacentElement`
+    // has to move the node it was handed, not a copy of its markup: the caller
+    // keeps the reference and expects that one to be in the tree.
+    let out = render(
+        r#"<body><div id="host"><span id="anchor">x</span></div><div id="out"></div><script>
+          const host = document.getElementById('host');
+          host.insertAdjacentHTML('beforeend', '<b class="markup">B</b>');
+          const made = document.createElement('i');
+          made.textContent = 'I';
+          host.insertAdjacentElement('afterbegin', made);
+          document.getElementById('out').textContent =
+            String(made.parentNode === null) + ' ' + host.firstChild.tagName + ' ' + host.lastChild.tagName;
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains(r#"<b class="markup">B</b>"#),
+        "markup is parsed in place: {}",
+        out.html
+    );
+    assert!(
+        out.html.contains("false I B"),
+        "the node handed in is the node inserted: {}",
+        out.html
+    );
+}
+
+#[test]
+fn text_codecs_and_a_readable_body_round_trip() {
+    // Anything that decodes a payload reaches for these, and a sanitiser
+    // starts by asking for a blank document to parse into.
+    let out = render(
+        r#"<body><div id="out"></div><script>
+          const bytes = new TextEncoder().encode('привет — ok');
+          const back = new TextDecoder().decode(bytes);
+          const doc = document.implementation.createHTMLDocument('t');
+          doc.body.innerHTML = '<p>sanitised</p>';
+          document.getElementById('out').textContent =
+            [back, bytes.length, doc.body.textContent].join(' | ');
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("привет — ok | 19 | sanitised"),
+        "UTF-8 survives the round trip and a detached document parses: {}",
+        out.html
+    );
+}
+
+#[test]
+fn an_iterator_helper_does_not_leak_the_items_it_rejected() {
+    // `Iterator.prototype.find` in this build of QuickJS keeps a reference to
+    // every item the predicate turned down. A leaked object is still live when
+    // the runtime is freed, which aborts the process — so this test is really
+    // checking that the page renders at all, and that the process survives to
+    // report it. astro.build is one real page that does exactly this.
+    let out = render(
+        r#"<body><p><span>a</span><span>b</span></p><div id="out"></div><script>
+          const found = document.querySelectorAll('span').values().find(e => e.textContent === 'b');
+          const plain = [{ a: 1 }, { a: 2 }].values().find(x => x.a === 2);
+          document.getElementById('out').textContent =
+            (found ? found.textContent : 'none') + ' ' + plain.a + ' ' +
+            String([1, 2, 3].values().find(x => x > 5));
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("b 2 undefined"),
+        "find returns the match, and undefined when there is none: {}",
+        out.html
+    );
+}
+
+#[test]
+fn dom_string_arguments_are_coerced_the_way_the_dom_coerces() {
+    // Every DOM method that takes a string takes ToString(value). Refusing a
+    // number was the third most common script error across a 603-site corpus,
+    // and it does not just lose the call — it throws out of the caller.
+    let out = render(
+        r#"<body><div id="d"></div><div id="out"></div><script>
+          const d = document.getElementById('d');
+          d.setAttribute('data-a', true);
+          d.setAttribute('data-b', 42);
+          d.setAttribute('data-c', null);
+          d.className = 1;
+          document.getElementById('out').textContent =
+            [d.getAttribute('data-a'), d.getAttribute('data-b'),
+             d.getAttribute('data-c'), d.className].join(' ');
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("true 42 null 1"),
+        "each value is stringified, not refused: {}",
+        out.html
+    );
+}
+
+#[test]
+fn an_element_measures_what_its_css_says() {
+    // Nothing is laid out. But a page that measures itself and finds zero
+    // concludes it has no room and renders the collapsed branch, so the box
+    // comes from the cascade — including rules in a stylesheet, which is more
+    // than the inline attribute other engines in this class read.
+    let out = render(
+        r#"<html><head><style>
+             .card { width: 320px; height: 180px }
+             @media (min-width: 700px) { .wide { width: 640px } }
+           </style></head><body>
+           <div class="card" id="a">sheet</div>
+           <div id="b" style="width:210px">inline</div>
+           <div class="wide" id="c">media</div>
+           <img id="d" width="300" height="150">
+           <div id="e" style="display:none">hidden</div>
+           <div id="out"></div><script>
+             const w = (id) => Math.round(document.getElementById(id).getBoundingClientRect().width);
+             document.getElementById('out').textContent =
+               [w('a'), w('b'), w('c'), w('d'), w('e'),
+                document.getElementById('a').offsetWidth,
+                getComputedStyle(document.getElementById('a')).height].join(' ');
+           </script></body></html>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("320 210 640 300 0 320 180px"),
+        "the sheet, the inline style, a matching media rule and the width \
+         attribute all count; a hidden element measures zero: {}",
+        out.html
+    );
+}
+
+#[test]
+fn the_names_a_framework_reaches_for_are_there() {
+    // React's scheduler posts its work through a MessageChannel; a sanitiser
+    // walks with a TreeWalker; everything tests with `instanceof`.
+    let out = render(
+        r#"<body><p><span>a</span><b>bee</b></p><div id="out"></div><script>
+          const channel = new MessageChannel();
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          let texts = 0;
+          while (walker.nextNode()) texts++;
+          const rect = new DOMRect(10, 20, 30, 40);
+          document.getElementById('out').textContent = [
+            document.querySelectorAll('span') instanceof NodeList,
+            !!(channel.port1 && channel.port2),
+            texts >= 2,
+            rect.right === 40 && rect.bottom === 60,
+            navigator instanceof Navigator,
+            new DragEvent('drag') instanceof MouseEvent,
+            getSelection() instanceof Selection,
+          ].join(' ');
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("true true true true true true true"),
+        "every name answers for what it should: {}",
+        out.html
+    );
+}
+
+#[test]
+fn a_page_waiting_on_the_network_is_not_a_settled_page() {
+    // `fetch` no longer blocks, so the loop has to know the difference between
+    // "nothing left to do" and "nothing left to do yet". Without that the page
+    // is serialized the moment its last timer fires and the responses are lost.
+    let net = StaticNetwork::new()
+        .route("/one", 200, "application/json", "1")
+        .route("/two", 200, "application/json", "2")
+        .route("/three", 200, "application/json", "3");
+    let out = render_with(
+        net,
+        r#"<body><div id="out">pending</div><script>
+             Promise.all(['/one', '/two', '/three'].map((u) => fetch(u).then((r) => r.text())))
+               .then((all) => { document.getElementById('out').textContent = 'got ' + all.join(''); });
+           </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("got 123"),
+        "all three resolve before the page is declared settled: {}",
+        out.html
+    );
+    assert_eq!(out.requests, 3);
 }
 
 #[test]

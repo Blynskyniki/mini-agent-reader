@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing.workspace = true
 mar-dom.workspace = true
 rquickjs.workspace = true
 url.workspace = true

@@ -219,6 +219,44 @@ fn install_timers(api: &Object<'_>, state: &Shared) -> Result<()> {
     Ok(())
 }
 
+/// Build the object a page's `fetch` sees, from a finished request.
+///
+/// Shared by the blocking path and the delivery of an asynchronous one so the
+/// two can never disagree about what a response looks like.
+pub fn response_object<'js>(
+    ctx: &Ctx<'js>,
+    result: std::result::Result<crate::net::HttpResponse, String>,
+) -> Result<Object<'js>> {
+    let out = Object::new(ctx.clone())?;
+    match result {
+        Ok(r) => {
+            out.set("ok", (200..300).contains(&r.status))?;
+            out.set("status", r.status)?;
+            out.set("statusText", r.status_text)?;
+            out.set("url", r.url)?;
+            let headers = Object::new(ctx.clone())?;
+            for (k, v) in r.headers {
+                headers.set(k.to_ascii_lowercase(), v)?;
+            }
+            out.set("headers", headers)?;
+            out.set("body", r.body)?;
+        }
+        Err(e) => {
+            out.set("ok", false)?;
+            out.set("status", 0)?;
+            out.set("error", e)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Requests a page may have in flight at once.
+///
+/// A browser opens six per host; this is a whole-page number across all hosts,
+/// generous enough that a burst of API calls overlaps and small enough that a
+/// page cannot spawn a thread per item in a thousand-row list.
+const MAX_INFLIGHT: usize = 12;
+
 // ---------------------------------------------------------------------------
 // document
 // ---------------------------------------------------------------------------
@@ -253,6 +291,19 @@ fn install_document(
         "head",
         Func::from(hr_v(move |ctx| {
             let id = d.borrow().head();
+            DomNode::wrap_opt(&ctx, &d, id)
+        })),
+    )?;
+
+    // The script the engine is running right now, which is what
+    // `document.currentScript` has to return: bundlers read its `src` to
+    // locate their own chunks.
+    let d = doc.clone();
+    let st = state.clone();
+    api.set(
+        "current_script",
+        Func::from(hr_v(move |ctx| {
+            let id = st.borrow().current_script;
             DomNode::wrap_opt(&ctx, &d, id)
         })),
     )?;
@@ -558,6 +609,80 @@ fn install_network<N: NetworkProvider + 'static>(
     state: &Shared,
     net: &Rc<N>,
 ) -> Result<()> {
+    // Start a request without waiting for it. Returns the id JS parks its
+    // promise under; the loop delivers the answer through `__mar_deliver`.
+    let st = state.clone();
+    let concurrent = net.concurrent();
+    let blocking = net.clone();
+    api.set(
+        "request_start",
+        Func::from(
+            move |method: String, url: String, headers: Object<'_>, body: Option<String>| -> Result<u32> {
+                let (id, resolved, request, at_cap) = {
+                    let mut s = st.borrow_mut();
+                    let id = s.next_request_id;
+                    s.next_request_id = s.next_request_id.wrapping_add(1).max(1);
+                    let refused = if s.request_count >= s.limits.max_requests {
+                        Some("request budget exhausted")
+                    } else if s.out_of_time() {
+                        Some("the page ran out of time")
+                    } else {
+                        None
+                    };
+                    // At the cap the request is still made, just on this
+                    // thread — which throttles the page without losing the
+                    // call, the way a browser queues past its per-host limit.
+                    let at_cap = s.inflight >= MAX_INFLIGHT;
+                    let Some(resolved) = s.url.join(&url).ok() else {
+                        s.inflight += 1;
+                        let _ = s.responses_tx.send((id, Err(format!("invalid URL: {url}"))));
+                        return Ok(id);
+                    };
+                    if let Some(reason) = refused {
+                        s.inflight += 1;
+                        let _ = s.responses_tx.send((id, Err(reason.to_owned())));
+                        return Ok(id);
+                    }
+                    s.request_count += 1;
+                    s.inflight += 1;
+                    let mut header_pairs = Vec::new();
+                    for (k, v) in headers.props::<String, String>().flatten() {
+                        header_pairs.push((k, v));
+                    }
+                    (
+                        id,
+                        resolved.to_string(),
+                        HttpRequest {
+                            method: method.to_ascii_uppercase(),
+                            url: resolved.to_string(),
+                            headers: header_pairs,
+                            body,
+                        },
+                        at_cap,
+                    )
+                };
+                tracing::debug!(method = %request.method, url = %resolved, "page request (async)");
+                let tx = st.borrow().responses_tx.clone();
+                match (&concurrent, at_cap) {
+                    // Off the main thread: this is what makes a page's own
+                    // requests overlap instead of queueing behind each other.
+                    (Some(net), false) => {
+                        let net = net.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send((id, net.fetch(request)));
+                        });
+                    }
+                    // No concurrent seam, or already at the cap: same answer,
+                    // just fetched here and now.
+                    _ => {
+                        let _ = tx.send((id, blocking.fetch(request)));
+                    }
+                }
+                Ok(id)
+            },
+        ),
+    )?;
+
     let st = state.clone();
     let net = net.clone();
     api.set(
@@ -565,19 +690,23 @@ fn install_network<N: NetworkProvider + 'static>(
         Func::from(hr_request(
             move |ctx, method: String, url: String, headers: Object<'_>, body: Option<String>| {
                 let out = Object::new(ctx.clone())?;
-                let (resolved, over_budget) = {
+                let (resolved, spent) = {
                     let mut s = st.borrow_mut();
                     if s.request_count >= s.limits.max_requests {
-                        (None, true)
+                        (None, Some("request budget exhausted"))
+                    } else if s.out_of_time() {
+                        // The provider blocks, so a page that keeps asking can
+                        // outrun its budget between two timer callbacks.
+                        (None, Some("the page ran out of time"))
                     } else {
                         s.request_count += 1;
-                        (s.url.join(&url).ok(), false)
+                        (s.url.join(&url).ok(), None)
                     }
                 };
-                if over_budget {
+                if let Some(reason) = spent {
                     out.set("ok", false)?;
                     out.set("status", 0)?;
-                    out.set("error", "request budget exhausted")?;
+                    out.set("error", reason)?;
                     return Ok(out);
                 }
                 let Some(resolved) = resolved else {
@@ -592,6 +721,16 @@ fn install_network<N: NetworkProvider + 'static>(
                     header_pairs.push((k, v));
                 }
 
+                // The one place every `fetch` and XHR the page makes passes
+                // through, and therefore the only useful place to watch from
+                // when a page reports its own failures to a server instead of
+                // to the console.
+                tracing::debug!(
+                    method = %method,
+                    url = %resolved,
+                    body = body.as_deref().unwrap_or("").chars().take(2000).collect::<String>(),
+                    "page request",
+                );
                 let response = net.fetch(HttpRequest {
                     method,
                     url: resolved.to_string(),

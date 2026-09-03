@@ -96,6 +96,13 @@ impl<N: NetworkProvider + 'static> Loader for UrlLoader<N> {
             if state.request_count >= limit || self.fetched >= limit {
                 return Err(failed(format!("module budget of {limit} requests spent")));
             }
+            // A graph fetched one blocking request at a time is the easiest way
+            // for a page to run past its wall-clock budget, because the budget
+            // is otherwise only checked between callbacks and this happens in
+            // the middle of one.
+            if state.out_of_time() {
+                return Err(failed("the page ran out of time".to_owned()));
+            }
             state.request_count += 1;
         }
         self.fetched += 1;
@@ -127,6 +134,102 @@ impl<N: NetworkProvider + 'static> Loader for UrlLoader<N> {
             return Err(failed("served as HTML, not JavaScript".to_owned()));
         }
 
+        // The graph one level down, started now rather than when QuickJS gets
+        // round to asking. An import graph is discovered by parsing each module
+        // in turn, so without this a page of a hundred chunks pays a hundred
+        // round trips end to end — which on a news site is most of the render.
+        let base = Url::parse(name).unwrap_or_else(|_| self.page_url.clone());
+        let next: Vec<String> = import_specifiers(&response.body)
+            .into_iter()
+            .filter_map(|spec| base.join(&spec).ok())
+            .map(|u| u.to_string())
+            .collect();
+        if !next.is_empty() {
+            self.net.prefetch(next);
+        }
+
         Module::declare(ctx.clone(), name.to_owned(), response.body)
+    }
+}
+
+/// The URLs a module statically imports, found by reading its source.
+///
+/// Deliberately a scan and not a parse: this only decides what to fetch early.
+/// A specifier missed costs nothing — the loader fetches it the slow way — and
+/// one imagined inside a comment or a string costs a single wasted request. A
+/// real parse would cost more than it saves.
+fn import_specifiers(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while let Some(found) = source[i..].find("import") {
+        let at = i + found;
+        i = at + 6;
+        // A word boundary before, so `reimport` and `x.import` do not count.
+        if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || matches!(bytes[at - 1], b'_' | b'$' | b'.')) {
+            continue;
+        }
+        // Take the first quoted string on the rest of the line, or the next
+        // one after a `from`. Both forms end at the closing quote.
+        let rest = &source[i..source.len().min(i + 512)];
+        let Some(quote_at) = rest.find(['"', '\'', '`']) else {
+            continue;
+        };
+        // Anything but whitespace, an identifier, braces, a star, a comma, a
+        // parenthesis or `from` between `import` and the quote means this is
+        // not an import statement.
+        if rest[..quote_at].contains(|c: char| {
+            !(c.is_alphanumeric() || " \t\r\n{},*()_$".contains(c))
+        }) {
+            continue;
+        }
+        let quote = rest.as_bytes()[quote_at] as char;
+        let after = &rest[quote_at + 1..];
+        let Some(end) = after.find(quote) else { continue };
+        let spec = &after[..end];
+        // Only a URL the loader could resolve: relative or absolute paths.
+        if spec.starts_with('.') || spec.starts_with('/') || spec.starts_with("http") {
+            out.push(spec.to_owned());
+        }
+    }
+    out.truncate(MAX_SPECULATIVE_IMPORTS);
+    out
+}
+
+/// A ceiling on how far ahead one module may reach. A barrel file re-exporting
+/// a thousand things should not fetch a thousand of them speculatively.
+const MAX_SPECULATIVE_IMPORTS: usize = 24;
+
+#[cfg(test)]
+mod tests {
+    use super::import_specifiers;
+
+    #[test]
+    fn specifiers_are_found_in_the_forms_bundlers_emit() {
+        let found = import_specifiers(
+            r#"
+            import a from "./a.js";
+            import {b, c} from '../b/c.js';
+            import * as d from "/abs/d.js";
+            import "./side-effect.js";
+            export {e} from "./e.js";
+            const f = await import("./lazy.js");
+            import lodash from "lodash";
+            const notAnImport = "./decoy.js";
+            "#,
+        );
+        assert!(found.contains(&"./a.js".to_owned()));
+        assert!(found.contains(&"../b/c.js".to_owned()));
+        assert!(found.contains(&"/abs/d.js".to_owned()));
+        assert!(found.contains(&"./side-effect.js".to_owned()));
+        assert!(found.contains(&"./lazy.js".to_owned()));
+        assert!(
+            !found.contains(&"lodash".to_owned()),
+            "a bare specifier has nothing to resolve against"
+        );
+        assert!(
+            !found.contains(&"./decoy.js".to_owned()),
+            "a string that is not an import is not one"
+        );
     }
 }

@@ -212,9 +212,20 @@ fn a_pattern_chooses_which_requests_pause() {
            </script></body>"#,
     );
 
-    // The refusal resolves first: it never left the process.
+    // Both outcomes land; the order between them is not the page's business.
+    // Responses are delivered one at a time with microtasks drained between,
+    // as an event loop does, so which of two instantly-finished requests goes
+    // first is an artefact of the loop, not something a page may rely on.
     let text = evaluate(&mut browser, "document.querySelector('main').textContent");
-    assert_eq!(text, "cdn:refused;api:ok;");
+    let text = text.as_str().unwrap_or_default();
+    assert!(
+        text.contains("api:ok;"),
+        "the intercepted request was fulfilled: {text}"
+    );
+    assert!(
+        text.contains("cdn:refused;"),
+        "the unmatched cross-site request was refused: {text}"
+    );
     let paused = events(&sent, "Fetch.requestPaused");
     assert_eq!(paused.len(), 1, "only the matching request paused");
     assert_eq!(
@@ -418,17 +429,28 @@ fn every_element_gets_a_box_of_its_own() {
 }
 
 #[test]
-fn the_page_itself_still_sees_zero_sized_boxes() {
+fn the_page_and_the_client_measure_different_things() {
+    // Two rulers, on purpose. The page's own scripts get a box derived from
+    // the page's CSS, because a page that measures zero decides it has no room
+    // and renders the collapsed branch. A client clicking by coordinate gets a
+    // tile from the registry instead, which is unique per element and maps
+    // back to it — a property CSS-derived boxes do not have, since two cards
+    // styled alike are the same size.
     let (mut browser, _sent) = session("https://example.com/", Vec::new());
     load(
         &mut browser,
-        r#"<body><p id="p">x</p><script>
+        r#"<html><head><style>#p { width: 240px }</style></head>
+           <body><p id="p">x</p><script>
              window.measured = document.getElementById('p').getBoundingClientRect().width;
              window.rects = document.getElementById('p').getClientRects().length;
-           </script></body>"#,
+           </script></body></html>"#,
     );
-    assert_eq!(evaluate(&mut browser, "window.measured"), 0.0);
-    assert_eq!(evaluate(&mut browser, "window.rects"), 0.0);
+    assert_eq!(
+        evaluate(&mut browser, "window.measured"),
+        240.0,
+        "the page sees what its own stylesheet says"
+    );
+    assert_eq!(evaluate(&mut browser, "window.rects"), 1.0);
 
     // The client asking the same question gets a box it can click.
     assert_ne!(
@@ -437,7 +459,7 @@ fn the_page_itself_still_sees_zero_sized_boxes() {
             "document.getElementById('p').getBoundingClientRect().width"
         ),
         0.0,
-        "the ruler exists in the client's hands only"
+        "the client still gets a tile it can aim at"
     );
 }
 

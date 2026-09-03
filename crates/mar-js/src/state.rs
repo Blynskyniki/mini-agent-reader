@@ -1,7 +1,10 @@
 //! Per-page state shared between Rust and the JS globals.
 
+use crate::net::HttpResponse;
 use crate::timers::TimerQueue;
+use mar_dom::NodeId;
 use std::cell::RefCell;
+use std::time::Instant;
 use std::collections::HashMap;
 use std::rc::Rc;
 use url::Url;
@@ -56,7 +59,7 @@ pub struct Limits {
     pub virtual_horizon_ms: i64,
     /// Total timer callbacks, so a `setInterval` cannot spin forever.
     pub max_timer_callbacks: u64,
-    /// Subresource requests a page may make.
+    /// Subresource requests a page may make, counting module loads.
     pub max_requests: usize,
     /// Bytes of console output retained.
     pub max_console_bytes: usize,
@@ -70,7 +73,7 @@ impl Default for Limits {
             wall_ms: 15_000,
             virtual_horizon_ms: 10_000,
             max_timer_callbacks: 10_000,
-            max_requests: 64,
+            max_requests: 128,
             max_console_bytes: 256 * 1024,
         }
     }
@@ -100,9 +103,31 @@ pub struct PageState {
     pub requested_navigation: Option<String>,
     /// `document.readyState`.
     pub ready_state: &'static str,
+    /// The `<script>` element currently executing, for `document.currentScript`.
+    ///
+    /// Bundlers read it, and its `src`, to work out where their own chunks
+    /// live; webpack's "Automatic publicPath" and Next's chunk loader both
+    /// throw outright when it is null outside a worker.
+    pub current_script: Option<NodeId>,
     /// Subresource requests made so far, against `Limits::max_requests`.
     pub request_count: usize,
+    /// Requests handed to a worker thread and not yet delivered back to JS.
+    ///
+    /// The page is not idle while any of these are outstanding, so the settle
+    /// loop waits on them rather than declaring the page finished — the same
+    /// rule a browser's event loop follows.
+    pub inflight: usize,
+    /// Where a finished request lands, tagged with the id JS is waiting on.
+    pub responses: std::sync::mpsc::Receiver<(u32, Result<HttpResponse, String>)>,
+    /// Handed to each worker thread.
+    pub responses_tx: std::sync::mpsc::Sender<(u32, Result<HttpResponse, String>)>,
+    /// Ids for requests JS is waiting on.
+    pub next_request_id: u32,
     pub limits: Limits,
+    /// When this page started. The wall-clock budget is measured from here,
+    /// and everything that can block — a `fetch`, an `import` — checks it,
+    /// so `wall_ms` bounds the page rather than only its script loop.
+    pub started: Instant,
     /// Viewport reported to scripts. Nothing is laid out at this size; it is
     /// what `innerWidth`, `matchMedia` and `getBoundingClientRect` quote.
     pub viewport: (u32, u32),
@@ -110,6 +135,7 @@ pub struct PageState {
 
 impl PageState {
     pub fn new(url: Url, limits: Limits) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
         PageState {
             url,
             referrer: String::new(),
@@ -124,10 +150,21 @@ impl PageState {
             session_storage: HashMap::new(),
             requested_navigation: None,
             ready_state: "loading",
+            current_script: None,
             request_count: 0,
+            inflight: 0,
+            responses: rx,
+            responses_tx: tx,
+            next_request_id: 1,
             limits,
+            started: Instant::now(),
             viewport: (1280, 800),
         }
+    }
+
+    /// Has this page spent its wall-clock budget?
+    pub fn out_of_time(&self) -> bool {
+        self.started.elapsed().as_millis() as u64 >= self.limits.wall_ms
     }
 
     pub fn log(&mut self, level: LogLevel, text: String) {

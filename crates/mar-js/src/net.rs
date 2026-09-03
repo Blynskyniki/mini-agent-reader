@@ -34,10 +34,38 @@ impl HttpResponse {
 
 /// Fetches a subresource on behalf of a page.
 ///
-/// Blocking by design: the settle loop is single-threaded and drives a virtual
-/// clock, so a blocking call here is simply "time does not advance while the
-/// network works". Hosts that want concurrency run whole pages in parallel.
+/// Blocking: the settle loop is single-threaded and drives a virtual clock, so
+/// a call here is simply "time does not advance while the network works". This
+/// is the path an `import` and a synchronous XHR take, both of which block in
+/// the page as well.
 pub trait NetworkProvider {
+    fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, String>;
+
+    /// Start fetching these URLs now; the page will ask for them shortly.
+    ///
+    /// Fire and forget: a host that cannot prefetch ignores it, and a URL that
+    /// turns out not to be wanted costs one request nobody reads. Correctness
+    /// never depends on this having happened.
+    fn prefetch(&self, _urls: Vec<String>) {}
+
+    /// The same seam, callable from another thread, when the host has one.
+    ///
+    /// A page that issues ten requests expects ten round trips to overlap —
+    /// `Promise.all([fetch(a), fetch(b)])` is two requests in flight, not two
+    /// in a row. Serialising them turns a page with a hundred of them into a
+    /// hundred latencies added up, which on a news site is most of the wall
+    /// clock.
+    ///
+    /// Optional because not every host can: the CDP interceptor keeps
+    /// per-session state that is not `Send`. Returning `None` costs
+    /// correctness nothing — requests are simply issued one at a time.
+    fn concurrent(&self) -> Option<std::sync::Arc<dyn ConcurrentNetwork>> {
+        None
+    }
+}
+
+/// A network seam that may be called from a worker thread.
+pub trait ConcurrentNetwork: Send + Sync + 'static {
     fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, String>;
 }
 

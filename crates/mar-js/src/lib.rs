@@ -14,6 +14,8 @@ pub mod state;
 pub mod timers;
 
 pub use dom::{DomNode, SharedDoc};
-pub use net::{HttpRequest, HttpResponse, NetworkProvider, NoNetwork, StaticNetwork};
+pub use net::{
+    ConcurrentNetwork, HttpRequest, HttpResponse, NetworkProvider, NoNetwork, StaticNetwork,
+};
 pub use page::{Page, PageError, PageOutcome};
 pub use state::{ConsoleMessage, Limits, LogLevel, PageState, ScriptError, default_user_agent};

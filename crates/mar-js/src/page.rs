@@ -8,7 +8,7 @@ use crate::state::{ConsoleMessage, Limits, PageState, ScriptError, Shared, share
 use mar_dom::{Document, LocalName, NodeId};
 use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Persistent, Runtime};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use url::Url;
 
 const PRELUDE: &str = include_str!("prelude.js");
@@ -92,6 +92,14 @@ impl<N: NetworkProvider + 'static> Page<N> {
         // OOM kill, so one bad page cannot take the process with it.
         runtime.set_memory_limit(limits.memory_bytes);
         runtime.set_max_stack_size(limits.stack_bytes);
+        // And a deadline the interpreter itself honours. The settle loop checks
+        // the budget between callbacks, which is no help at all inside one:
+        // `while (true) {}`, a catastrophic regex or a script that walks a
+        // million nodes never returns, and the process waits forever. A page
+        // fetched from the open web gets to do that on purpose, so the engine
+        // has to be able to stop it mid-instruction.
+        let deadline = Instant::now() + Duration::from_millis(limits.wall_ms);
+        runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
         let context = Context::full(&runtime).map_err(|e| PageError::Engine(e.to_string()))?;
 
         let doc = SharedDoc::new(document);
@@ -146,7 +154,7 @@ impl<N: NetworkProvider + 'static> Page<N> {
     }
 
     fn out_of_time(&self) -> bool {
-        self.wall_ms() >= self.state.borrow().limits.wall_ms as u128
+        self.state.borrow().out_of_time()
     }
 
     /// Run every inline `<script>` in document order, then fire the ready
@@ -162,11 +170,24 @@ impl<N: NetworkProvider + 'static> Page<N> {
 
     /// Execute a script source as the page would, recording any exception
     /// instead of propagating it: one broken script must not stop the others.
+    ///
+    /// Sloppy mode, because that is what a classic `<script>` is. Under strict
+    /// mode an assignment to an undeclared name is a ReferenceError, and that
+    /// is not a corner case: React's streaming markup bootstraps itself with
+    /// bare `$RC = function(...)` assignments, so a strict engine loses every
+    /// suspense boundary on every server-rendered React page. `with`, octal
+    /// literals and duplicate parameter names are the same story on older code.
     pub fn eval_script(&mut self, source: &str, origin: &str) {
         let state = self.state.clone();
         let origin_owned = origin.to_owned();
         self.context.with(|ctx| {
-            if let Err(err) = ctx.eval::<(), _>(source).catch(&ctx) {
+            let mut options = rquickjs::context::EvalOptions::default();
+            options.global = true;
+            options.strict = false;
+            // The filename shows up in stack traces, so an error points at the
+            // script that raised it rather than at "eval_script".
+            options.filename = Some(origin_owned.clone());
+            if let Err(err) = ctx.eval_with_options::<(), _>(source, options).catch(&ctx) {
                 state
                     .borrow_mut()
                     .record_error(origin_owned, format!("{err}"));
@@ -412,23 +433,35 @@ impl<N: NetworkProvider + 'static> Page<N> {
                 self.scripts_skipped += 1;
                 continue;
             }
+            // `document.currentScript` is the running script, and a bundler
+            // reads its `src` to find its own chunks. A module is deliberately
+            // excluded: in a browser it is null there, and code that has both
+            // paths picks the `import.meta.url` one when it is.
+            self.state.borrow_mut().current_script = (!script.module).then_some(script.id);
+
+            // A script's name is its URL, because that is what its own
+            // imports resolve against and what an error should point at. The
+            // host leaves `src` in place when it inlines one, so the body knows
+            // where it came from; an inline script is named for its node.
+            let page_url = self.state.borrow().url.clone();
+            let source_url = script
+                .src
+                .as_deref()
+                .and_then(|src| page_url.join(src).ok())
+                .map(|u| u.to_string());
             if script.module {
-                // A module's name is its URL, because that is what its own
-                // imports resolve against. The host leaves `src` in place when
-                // it inlines one, so the body knows where it came from; an
-                // inline module resolves against the document instead.
-                let page_url = self.state.borrow().url.clone();
-                let origin = script
-                    .src
-                    .as_deref()
-                    .and_then(|src| page_url.join(src).ok())
-                    .unwrap_or(page_url)
-                    .to_string();
+                let origin = source_url.unwrap_or_else(|| page_url.to_string());
                 self.eval_module(&script.body, &origin);
             } else {
-                let origin = format!("inline script #{}", script.id.as_u32());
+                let origin = source_url
+                    .unwrap_or_else(|| format!("inline script #{}", script.id.as_u32()));
                 self.eval_script(&script.body, &origin);
             }
+
+            // Null again once the script returns: a callback that runs later
+            // is not "during" any script, and code that caches currentScript
+            // at module scope has already read it.
+            self.state.borrow_mut().current_script = None;
         }
     }
 
@@ -487,6 +520,61 @@ impl<N: NetworkProvider + 'static> Page<N> {
         });
     }
 
+    /// Hand one finished request back to the page.
+    ///
+    /// `block` waits for the next one; without it this only takes what has
+    /// already landed. Returns false when there was nothing to deliver.
+    fn deliver_response(&mut self, block: bool) -> bool {
+        let received = {
+            let state = self.state.borrow();
+            if state.inflight == 0 {
+                return false;
+            }
+            if block {
+                // Bounded: a request that outlives the page's budget is not
+                // worth the page's remaining time.
+                let left = (state.limits.wall_ms as u128)
+                    .saturating_sub(state.started.elapsed().as_millis());
+                state
+                    .responses
+                    .recv_timeout(std::time::Duration::from_millis((left as u64).max(1)))
+                    .ok()
+            } else {
+                state.responses.try_recv().ok()
+            }
+        };
+        let Some((id, result)) = received else {
+            if block {
+                // Timed out waiting: nothing more will arrive in time, so stop
+                // counting on it rather than spinning.
+                self.state.borrow_mut().inflight = 0;
+            }
+            return false;
+        };
+        {
+            let mut state = self.state.borrow_mut();
+            // Saturating: the loop zeroes this when it stops waiting, and a
+            // late arrival must not take the count below the floor.
+            state.inflight = state.inflight.saturating_sub(1);
+        }
+
+        let state = self.state.clone();
+        self.context.with(|ctx| {
+            let deliver: rquickjs::Result<Function> = ctx.globals().get("__mar_deliver");
+            let Ok(deliver) = deliver else { return };
+            let payload = match natives::response_object(&ctx, result) {
+                Ok(o) => o,
+                Err(_) => return,
+            };
+            if let Err(e) = deliver.call::<_, ()>((id, payload)).catch(&ctx) {
+                state
+                    .borrow_mut()
+                    .record_error("response delivery", format!("{e}"));
+            }
+        });
+        true
+    }
+
     /// Drain microtasks and timers until nothing is left to run.
     ///
     /// Returns true if a limit stopped the loop rather than quiescence. The
@@ -504,6 +592,11 @@ impl<N: NetworkProvider + 'static> Page<N> {
                 continue;
             }
 
+            // Then anything the network has already answered.
+            if self.deliver_response(false) {
+                continue;
+            }
+
             let (has_timer, budget_left) = {
                 let mut s = self.state.borrow_mut();
                 let fired = s.timers.fired();
@@ -511,6 +604,12 @@ impl<N: NetworkProvider + 'static> Page<N> {
                 (s.timers.has_pending(), fired < max)
             };
             if !has_timer {
+                // No timers, but the page is waiting on the network: that is
+                // not a settled page, it is a page mid-request. Wait for it,
+                // exactly as an event loop would.
+                if self.deliver_response(true) {
+                    continue;
+                }
                 return false;
             }
             if !budget_left {

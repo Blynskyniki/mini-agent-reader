@@ -11,6 +11,55 @@ use rquickjs::{Class, Ctx, Error, IntoJs, JsLifetime, Result, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// A string argument, coerced the way the DOM coerces.
+///
+/// Every DOM method that takes a string takes `ToString(value)`, so
+/// `setAttribute('hidden', true)`, `el.className = 1` and `textContent = 7` are
+/// all ordinary code. rquickjs converts by type instead and throws
+/// "Error converting from js 'bool' into type 'string'", which does not just
+/// lose the call — it throws out of whatever was running. Across a 603-site
+/// corpus this was the third most common script error.
+pub struct JsString(pub String);
+
+impl<'js> rquickjs::FromJs<'js> for JsString {
+    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        // `undefined` is the one value the DOM does not stringify uniformly:
+        // an omitted argument is "undefined" as a string, which is what
+        // `String(undefined)` gives, so the same rule covers it.
+        Ok(JsString(match value.type_of() {
+            rquickjs::Type::String => value
+                .as_string()
+                .expect("a string value has a string")
+                .to_string()?,
+            _ => value.get::<rquickjs::Coerced<String>>().map(|c| c.0).or_else(
+                |_| -> Result<String> {
+                    let _ = ctx;
+                    Ok(String::new())
+                },
+            )?,
+        }))
+    }
+}
+
+impl std::ops::Deref for JsString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<JsString> for String {
+    fn from(value: JsString) -> String {
+        value.0
+    }
+}
+
+impl From<JsString> for StrTendril {
+    fn from(value: JsString) -> StrTendril {
+        StrTendril::from(value.0)
+    }
+}
+
 /// The page document, shared between Rust and every JS handle.
 #[derive(Clone)]
 pub struct SharedDoc(Rc<RefCell<Document>>);
@@ -400,7 +449,7 @@ impl DomNode {
     }
 
     #[qjs(set, rename = "textContent")]
-    fn set_text_content(&self, value: String) {
+    fn set_text_content(&self, value: JsString) {
         self.doc.borrow_mut().set_text_content(self.id, value);
     }
 
@@ -410,7 +459,7 @@ impl DomNode {
     }
 
     #[qjs(set, rename = "innerText")]
-    fn set_inner_text(&self, value: String) {
+    fn set_inner_text(&self, value: JsString) {
         self.doc.borrow_mut().set_text_content(self.id, value);
     }
 
@@ -424,7 +473,7 @@ impl DomNode {
     }
 
     #[qjs(set, rename = "nodeValue")]
-    fn set_node_value(&self, value: String) {
+    fn set_node_value(&self, value: JsString) {
         let mut doc = self.doc.borrow_mut();
         match &mut doc.node_mut(self.id).data {
             NodeData::Text(t) => *t = StrTendril::from(value),
@@ -439,7 +488,7 @@ impl DomNode {
     }
 
     #[qjs(set, rename = "data")]
-    fn set_data(&self, value: String) {
+    fn set_data(&self, value: JsString) {
         self.set_node_value(value);
     }
 
@@ -449,7 +498,7 @@ impl DomNode {
     }
 
     #[qjs(set, rename = "innerHTML")]
-    fn set_inner_html(&self, html: String) {
+    fn set_inner_html(&self, html: JsString) {
         // Parse into a scratch document first: a malformed fragment then cannot
         // corrupt the live tree, and the tree sink stays single-document.
         let context = self
@@ -476,7 +525,7 @@ impl DomNode {
     }
 
     #[qjs(set, rename = "outerHTML")]
-    fn set_outer_html(&self, html: String) {
+    fn set_outer_html(&self, html: JsString) {
         let (context, parent) = {
             let doc = self.doc.borrow();
             let parent = doc.node(self.id).parent;
@@ -499,7 +548,11 @@ impl DomNode {
         doc.detach(self.id);
     }
 
-    fn insert_adjacent_html(&self, position: String, html: String) {
+    // The DOM spells the acronym in capitals, and camelCase renaming does
+    // not know that. Without the explicit name the method is published as
+    // `insertAdjacentHtml`, which no page has ever called.
+    #[qjs(rename = "insertAdjacentHTML")]
+    fn insert_adjacent_html(&self, position: JsString, html: JsString) {
         let context = self
             .doc
             .borrow()
@@ -552,26 +605,26 @@ impl DomNode {
 
     // ---- attributes ----------------------------------------------------
 
-    fn get_attribute(&self, name: String) -> Option<String> {
+    fn get_attribute(&self, name: JsString) -> Option<String> {
         self.attr(&name.to_ascii_lowercase())
     }
 
-    fn set_attribute(&self, name: String, value: String) {
+    fn set_attribute(&self, name: JsString, value: JsString) {
         self.set_attr_raw(&name.to_ascii_lowercase(), &value);
     }
 
-    fn has_attribute(&self, name: String) -> bool {
+    fn has_attribute(&self, name: JsString) -> bool {
         self.attr(&name.to_ascii_lowercase()).is_some()
     }
 
-    fn remove_attribute(&self, name: String) {
+    fn remove_attribute(&self, name: JsString) {
         let mut doc = self.doc.borrow_mut();
         if let Some(el) = doc.element_mut(self.id) {
             el.remove_attr(&LocalName::from(name.to_ascii_lowercase()));
         }
     }
 
-    fn toggle_attribute(&self, name: String, force: Option<bool>) -> bool {
+    fn toggle_attribute(&self, name: JsString, force: Option<bool>) -> bool {
         let lower = name.to_ascii_lowercase();
         let present = self.attr(&lower).is_some();
         let target = force.unwrap_or(!present);
@@ -600,7 +653,7 @@ impl DomNode {
     }
 
     #[qjs(set, rename = "id")]
-    fn set_id(&self, value: String) {
+    fn set_id(&self, value: JsString) {
         self.set_attr_raw("id", &value);
     }
 
@@ -610,37 +663,37 @@ impl DomNode {
     }
 
     #[qjs(set, rename = "className")]
-    fn set_class_name(&self, value: String) {
+    fn set_class_name(&self, value: JsString) {
         self.set_attr_raw("class", &value);
     }
 
     // ---- queries -------------------------------------------------------
 
-    fn query_selector<'js>(&self, ctx: Ctx<'js>, selector: String) -> Result<Value<'js>> {
+    fn query_selector<'js>(&self, ctx: Ctx<'js>, selector: JsString) -> Result<Value<'js>> {
         let m = Matcher::new(&selector).map_err(|e| throw_str(&ctx, &e.to_string()))?;
         let found = m.query_first(&self.doc.borrow(), self.id);
         DomNode::wrap_opt(&ctx, &self.doc, found)
     }
 
-    fn query_selector_all<'js>(&self, ctx: Ctx<'js>, selector: String) -> Result<Value<'js>> {
+    fn query_selector_all<'js>(&self, ctx: Ctx<'js>, selector: JsString) -> Result<Value<'js>> {
         let m = Matcher::new(&selector).map_err(|e| throw_str(&ctx, &e.to_string()))?;
         let found = m.query_all(&self.doc.borrow(), self.id);
         DomNode::wrap_list(&ctx, &self.doc, found)
     }
 
-    fn matches(&self, ctx: Ctx<'_>, selector: String) -> Result<bool> {
+    fn matches(&self, ctx: Ctx<'_>, selector: JsString) -> Result<bool> {
         let m = Matcher::new(&selector).map_err(|e| throw_str(&ctx, &e.to_string()))?;
         let doc = self.doc.borrow();
         Ok(mar_dom::ElementRef::new(&doc, self.id).is_some_and(|e| m.matches(e)))
     }
 
-    fn closest<'js>(&self, ctx: Ctx<'js>, selector: String) -> Result<Value<'js>> {
+    fn closest<'js>(&self, ctx: Ctx<'js>, selector: JsString) -> Result<Value<'js>> {
         let m = Matcher::new(&selector).map_err(|e| throw_str(&ctx, &e.to_string()))?;
         let found = m.closest(&self.doc.borrow(), self.id);
         DomNode::wrap_opt(&ctx, &self.doc, found)
     }
 
-    fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Value<'js>> {
+    fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: JsString) -> Result<Value<'js>> {
         let doc = self.doc.borrow();
         let wanted = name.to_ascii_lowercase();
         let ids: Vec<_> = doc
@@ -654,7 +707,7 @@ impl DomNode {
         DomNode::wrap_list(&ctx, &self.doc, ids)
     }
 
-    fn get_elements_by_class_name<'js>(&self, ctx: Ctx<'js>, names: String) -> Result<Value<'js>> {
+    fn get_elements_by_class_name<'js>(&self, ctx: Ctx<'js>, names: JsString) -> Result<Value<'js>> {
         let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
         let doc = self.doc.borrow();
         let ids: Vec<_> = doc
