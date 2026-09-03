@@ -686,12 +686,34 @@ fn write_out(path: Option<&std::path::Path>, bytes: &[u8]) -> anyhow::Result<()>
 }
 
 /// The settled page's visible text.
+///
+/// `<script>` and `<style>` hold text that is never shown, and a page whose
+/// bundle was inlined for execution holds a great deal of it — dumping the
+/// document's text without this is mostly minified JavaScript.
 fn visible_text(rendered: &Rendered) -> String {
     let doc = &rendered.document;
     let root = doc.body().unwrap_or_else(|| doc.root());
-    let mut text = doc.text_content(root);
-    text.push('\n');
-    text
+    fn walk(doc: &mar_dom::Document, node: mar_dom::NodeId, out: &mut String) {
+        if let Some(element) = doc.element(node)
+            && matches!(
+                element.local_name().as_ref(),
+                "script" | "style" | "noscript" | "template"
+            )
+        {
+            return;
+        }
+        if let mar_dom::NodeData::Text(text) = doc.data(node) {
+            out.push_str(text);
+        }
+        for child in doc.children(node) {
+            walk(doc, child, out);
+        }
+    }
+
+    let mut out = String::new();
+    walk(doc, root, &mut out);
+    out.push('\n');
+    out
 }
 
 /// Every link, as `text<TAB>href`.

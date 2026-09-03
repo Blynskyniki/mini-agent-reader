@@ -101,19 +101,37 @@ impl Renderer {
     /// without this a caller frequently gets a stub page.
     pub fn render(&self, url: &str, options: &RenderOptions) -> anyhow::Result<Rendered> {
         let started = Instant::now();
+        self.following_navigation(url, options, |target| {
+            let mut rendered = self.render_once(target, options, started)?;
+            rendered.report.url = url.to_owned();
+            let next = rendered.report.requested_navigation.clone();
+            Ok((rendered, next))
+        })
+    }
+
+    /// Run `once` at `url`, then again wherever the page said to go.
+    ///
+    /// Shared by every entry point, because otherwise they disagree about what
+    /// page they are looking at: a challenge or a consent gate serves one thing
+    /// to whoever follows the navigation and another to whoever does not.
+    fn following_navigation<T>(
+        &self,
+        url: &str,
+        options: &RenderOptions,
+        mut once: impl FnMut(&str) -> anyhow::Result<(T, Option<String>)>,
+    ) -> anyhow::Result<T> {
         let mut target = url.to_owned();
         let mut hops = 0usize;
         let mut seen = vec![(target.clone(), self.client.cookie_fingerprint(&target))];
 
         loop {
-            let mut rendered = self.render_once(&target, options, started)?;
-            rendered.report.url = url.to_owned();
+            let (value, requested) = once(&target)?;
 
             if !options.follow_client_navigation || hops >= MAX_NAVIGATION_HOPS {
-                return Ok(rendered);
+                return Ok(value);
             }
-            let Some(next) = rendered.report.requested_navigation.clone() else {
-                return Ok(rendered);
+            let Some(next) = requested else {
+                return Ok(value);
             };
             // A loop between two pages is common when a gate misfires; stop and
             // return what we have rather than bouncing until the hop limit.
@@ -127,7 +145,7 @@ impl Renderer {
                 .iter()
                 .any(|(url, seen_at)| *url == next && *seen_at == fingerprint)
             {
-                return Ok(rendered);
+                return Ok(value);
             }
             seen.push((next.clone(), fingerprint));
             target = next;
@@ -323,24 +341,41 @@ impl Renderer {
         expression: &str,
         options: &RenderOptions,
     ) -> anyhow::Result<String> {
-        let fetched = self.client.get_document(url)?;
-        let base = Url::parse(&fetched.final_url)
-            .or_else(|_| Url::parse(url))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.following_navigation(url, options, |target| {
+            let fetched = self.client.get_document(target)?;
+            let base = Url::parse(&fetched.final_url)
+                .or_else(|_| Url::parse(target))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let mut document = mar_dom::parse_html(&fetched.body).document;
-        if options.javascript && options.external_scripts {
-            self.inline_external_scripts(&mut document, &base, options.max_external_scripts);
-        }
+            let mut document = mar_dom::parse_html(&fetched.body).document;
+            if options.javascript && options.external_scripts {
+                self.inline_external_scripts(&mut document, &base, options.max_external_scripts);
+            }
 
-        let net = PageNetwork::new(self.client.clone(), &base);
-        let mut page = Page::with_document(document, base, options.limits.clone(), net)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if options.javascript {
-            page.run();
-        }
-        page.eval_json(expression)
-            .map_err(|e| anyhow::anyhow!("evaluation failed: {e}"))
+            let net = PageNetwork::new(self.client.clone(), &base);
+            let mut page = Page::with_document(document, base.clone(), options.limits.clone(), net)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            page.state().borrow_mut().cookies = self.client.cookies_for(base.as_str());
+
+            let mut requested = None;
+            if options.javascript {
+                let outcome = page.run();
+                for raw in &outcome.cookie_writes {
+                    self.client.apply_script_cookie(base.as_str(), raw);
+                }
+                requested = outcome.requested_navigation.clone();
+            }
+
+            // A page that is on its way somewhere else has not been asked the
+            // question yet. Evaluate only where it comes to rest.
+            if requested.is_some() {
+                return Ok((String::new(), requested));
+            }
+            let value = page
+                .eval_json(expression)
+                .map_err(|e| anyhow::anyhow!("evaluation failed: {e}"))?;
+            Ok((value, None))
+        })
     }
 
     /// Replace `<script src=...>` with the script's own source.
@@ -349,7 +384,7 @@ impl Renderer {
     /// the decision to load a page's own code is made and bounded. Returns how
     /// many scripts were inlined.
     fn inline_external_scripts(&self, doc: &mut Document, base: &Url, max: usize) -> usize {
-        let targets: Vec<(NodeId, String)> = doc
+        let targets: Vec<(NodeId, String, bool)> = doc
             .descendants(doc.root())
             .filter_map(|id| {
                 let el = doc.element(id)?;
@@ -361,20 +396,27 @@ impl Renderer {
                 if !doc.text_content(id).trim().is_empty() {
                     return None;
                 }
-                Some((id, src.to_owned()))
+                let module = el
+                    .attr(&LocalName::from("type"))
+                    .is_some_and(|t| t.eq_ignore_ascii_case("module"));
+                Some((id, src.to_owned(), module))
             })
             .take(max)
             .collect();
 
         let mut inlined = 0;
-        for (id, src) in targets {
+        for (id, src, module) in targets {
             let Ok(absolute) = base.join(&src) else {
                 continue;
             };
-            // Only the page's own origin. Third-party bundles are almost always
-            // analytics and tag managers: slow to fetch, and they add nothing a
-            // reader wants.
-            if absolute.origin() != base.origin() {
+            // Third-party classic scripts are almost always analytics and tag
+            // managers: slow to fetch, and they add nothing a reader wants.
+            //
+            // A cross-origin *module* is a different animal. An application
+            // shipping native modules keeps its bundle on a CDN, so the same
+            // rule that skips the tag manager also skips the whole
+            // application, and the page renders as an empty shell.
+            if absolute.origin() != base.origin() && !module {
                 continue;
             }
             let Ok(fetched) = self.client_execute(&absolute, base) else {
@@ -383,8 +425,10 @@ impl Renderer {
             if !fetched.ok() || fetched.body.trim().is_empty() {
                 continue;
             }
-            // Swap src for the body so the engine treats it as an inline script.
-            if let Some(el) = doc.element_mut(id) {
+            // The body goes in beside the `src` rather than replacing it: a
+            // module's own imports resolve against its URL, so the engine has
+            // to be able to see where this came from.
+            if !module && let Some(el) = doc.element_mut(id) {
                 el.remove_attr(&LocalName::from("src"));
             }
             let text = doc.create(mar_dom::NodeData::Text(StrTendril::from(fetched.body)));

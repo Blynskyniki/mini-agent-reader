@@ -361,3 +361,123 @@ fn evaluating_an_expression_returns_json() {
         .unwrap();
     assert_eq!(json, r#"[{"id":"1","t":"a"},{"id":"2","t":"b"}]"#);
 }
+
+// -- modules ----------------------------------------------------------------
+
+fn render_with(net: StaticNetwork, html: &str) -> mar_js::PageOutcome {
+    let mut page =
+        Page::new(html, "https://example.com/page", Limits::default(), net).expect("page builds");
+    page.run()
+}
+
+#[test]
+fn an_import_graph_is_fetched_and_run() {
+    let net = StaticNetwork::new()
+        .route(
+            "/lib/greet.js",
+            200,
+            "text/javascript",
+            "import { punct } from './punct.js';\
+             export const greet = (who) => 'hello ' + who + punct;",
+        )
+        .route(
+            "/lib/punct.js",
+            200,
+            "text/javascript",
+            "export const punct = '!';",
+        );
+
+    let out = render_with(
+        net,
+        r#"<body><div id="out">empty</div><script type="module">
+             import { greet } from '/lib/greet.js';
+             document.getElementById('out').textContent = greet('world');
+           </script></body>"#,
+    );
+    assert!(
+        out.html.contains(">hello world!<"),
+        "a module's own imports resolve against its URL: {}",
+        out.html
+    );
+}
+
+#[test]
+fn a_bare_specifier_says_what_is_missing() {
+    let out = render_with(
+        StaticNetwork::new(),
+        r#"<body><script type="module">import _ from 'lodash';</script></body>"#,
+    );
+    let reported = out
+        .errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<String>();
+    assert!(
+        reported.contains("import map"),
+        "a bare specifier is a missing feature, not a 404: {reported}"
+    );
+}
+
+#[test]
+fn a_module_that_throws_on_its_first_line_is_reported() {
+    let out = render_with(
+        StaticNetwork::new(),
+        r#"<body><script type="module">throw new Error('module died');</script></body>"#,
+    );
+    let reported = out
+        .errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<String>();
+    assert!(
+        reported.contains("module died"),
+        "a module body runs inside a promise, and its rejection must not be silent: {reported}"
+    );
+}
+
+#[test]
+fn a_module_served_as_html_is_named_as_such() {
+    let net = StaticNetwork::new().route("/app.js", 200, "text/html", "<!doctype html><h1>404");
+    let out = render_with(
+        net,
+        r#"<body><script type="module">import '/app.js';</script></body>"#,
+    );
+    let reported = out
+        .errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<String>();
+    assert!(
+        reported.contains("HTML"),
+        "a soft 404 should say so rather than produce a wall of syntax errors: {reported}"
+    );
+}
+
+#[test]
+fn the_import_graph_draws_on_the_page_budget() {
+    let net = StaticNetwork::new().route("/step", 200, "text/javascript", "export const x = 1;");
+    let limits = Limits {
+        max_requests: 2,
+        ..Limits::default()
+    };
+    // Each import is a distinct URL, so none of them are deduplicated.
+    let mut page = Page::new(
+        r#"<body><script type="module">
+             import '/step/1'; import '/step/2'; import '/step/3'; import '/step/4';
+           </script></body>"#,
+        "https://example.com/page",
+        limits,
+        net,
+    )
+    .expect("page builds");
+    let out = page.run();
+    let reported = out
+        .errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<String>();
+    assert!(
+        reported.contains("budget"),
+        "a page cannot spend more through imports than through fetch: {reported}"
+    );
+}

@@ -16,7 +16,7 @@ selectors = "0.40"
 cssparser = "0.37"
 string_cache = "0.11"
 anyhow = "1"
-rquickjs = { version = "0.12", features = ["macro", "classes", "properties", "array-buffer"] }
+rquickjs = { version = "0.12", features = ["macro", "classes", "properties", "array-buffer", "loader"] }
 mar-dom = { path = "crates/mar-dom" }
 url = "2"
 serde = { version = "1", features = ["derive"] }

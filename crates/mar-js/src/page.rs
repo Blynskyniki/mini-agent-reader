@@ -95,8 +95,17 @@ impl<N: NetworkProvider + 'static> Page<N> {
         let context = Context::full(&runtime).map_err(|e| PageError::Engine(e.to_string()))?;
 
         let doc = SharedDoc::new(document);
-        let state = shared(PageState::new(url, limits));
+        let state = shared(PageState::new(url.clone(), limits));
         let net = Rc::new(net);
+
+        // An `import` is resolved and fetched by the host, like every other
+        // subresource. QuickJS asks for it synchronously, part-way through the
+        // module that imported it, which is exactly what a blocking provider
+        // and a virtual clock are built for.
+        runtime.set_loader(
+            crate::modules::UrlResolver::new(url.clone()),
+            crate::modules::UrlLoader::new(net.clone(), state.clone(), url.clone()),
+        );
 
         context.with(|ctx| -> Result<(), PageError> {
             // natives::install publishes `Node` first, so the prelude can
@@ -396,17 +405,28 @@ impl<N: NetworkProvider + 'static> Page<N> {
                 self.scripts_skipped += 1;
                 continue;
             }
-            // A script that still has a `src` was not inlined by the host,
+            // A script with a `src` and no body was not inlined by the host,
             // deliberately or otherwise. That is a policy decision made
             // elsewhere, so it is counted, not reported as a page error.
-            if script.src.is_some() || script.body.trim().is_empty() {
+            if script.body.trim().is_empty() {
                 self.scripts_skipped += 1;
                 continue;
             }
-            let origin = format!("inline script #{}", script.id.as_u32());
             if script.module {
+                // A module's name is its URL, because that is what its own
+                // imports resolve against. The host leaves `src` in place when
+                // it inlines one, so the body knows where it came from; an
+                // inline module resolves against the document instead.
+                let page_url = self.state.borrow().url.clone();
+                let origin = script
+                    .src
+                    .as_deref()
+                    .and_then(|src| page_url.join(src).ok())
+                    .unwrap_or(page_url)
+                    .to_string();
                 self.eval_module(&script.body, &origin);
             } else {
+                let origin = format!("inline script #{}", script.id.as_u32());
                 self.eval_script(&script.body, &origin);
             }
         }
@@ -423,15 +443,25 @@ impl<N: NetworkProvider + 'static> Page<N> {
         self.context.with(|ctx| {
             let declared = Module::declare(ctx.clone(), origin_owned.clone(), source).catch(&ctx);
             match declared {
-                Ok(module) => {
-                    // A module returns a promise; rejections surface when the
-                    // settle loop drains pending jobs.
-                    if let Err(e) = module.eval().catch(&ctx) {
+                Ok(module) => match module.eval().catch(&ctx) {
+                    // The body of a module runs inside a promise. A throw on
+                    // its first line rejects that promise instead of raising
+                    // here, so the promise has to be watched or the failure is
+                    // silent — and a dead application module then looks exactly
+                    // like a page that deliberately rendered nothing.
+                    Ok((_, promise)) => {
+                        let watch: Result<rquickjs::Function, _> =
+                            ctx.globals().get("__mar_watch_module");
+                        if let Ok(watch) = watch {
+                            let _ = watch.call::<_, ()>((promise, origin_owned.clone()));
+                        }
+                    }
+                    Err(e) => {
                         state
                             .borrow_mut()
                             .record_error(origin_owned, format!("{e}"));
                     }
-                }
+                },
                 Err(e) => {
                     state
                         .borrow_mut()

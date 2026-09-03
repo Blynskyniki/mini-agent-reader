@@ -200,6 +200,14 @@ the document, the page state or the network: about thirty functions. `Event`,
 rest are written in JavaScript on top of that. Closing a gap for a site that
 does not render usually means editing `prelude.js`, not the engine.
 
+**Modules are the host's job too.** An `import` is resolved against the
+importing module's URL and fetched through the same seam as every other
+subresource, on the same budget. QuickJS asks for it synchronously, part-way
+through the module that imported it, which is exactly what a blocking provider
+and a virtual clock are for. A module's body runs inside a promise, so a throw
+on its first line is watched for rather than lost — otherwise an application
+that died immediately looks like one that rendered nothing on purpose.
+
 **A virtual clock.** Timers sit in a heap keyed by due time. When microtasks are
 drained and no network call is outstanding, the clock jumps to the next timer.
 Wall-clock time is never spent waiting. Timers past a horizon never fire, which
@@ -472,15 +480,17 @@ Known and deliberate:
 - **No screenshots or PDFs.** They need the renderer this project removes.
 - **No TLS fingerprint spoofing.** Headers look like Chrome; the handshake
   does not. `--proxy` is the way around it.
-- **No module loader.** A `type="module"` script compiles and runs, but an
-  `import` of another URL fails. Page runtimes that bundle this way log an
-  error and the rest of the page still renders.
+- **No import maps.** A bare specifier (`import x from 'lodash'`) has nothing
+  to resolve against and is reported as such rather than guessed at.
 - **No WebSocket, Worker, WebGL, canvas or media.** They construct without
   throwing and do nothing.
 - **No layout for the page itself.** An element measures zero, and a page that
   branches on its own geometry takes the zero branch.
-- **Cross-origin scripts are not fetched.** Third-party bundles are almost
-  always analytics and advertising: slow, and they add nothing to read.
+- **Cross-origin classic scripts are not fetched.** Third-party bundles are
+  almost always analytics and advertising: slow, and they add nothing to read.
+  Cross-origin *modules* are fetched, because an application shipping native
+  modules keeps its bundle on a CDN and the same rule would skip the
+  application along with the tag manager.
 - **Non-HTML is not parsed.** A PDF or an image is refused with a clear
   message rather than served as text.
 - **Extraction is heuristic.** A page with no clear article is reported with

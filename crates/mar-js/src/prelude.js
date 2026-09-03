@@ -1829,6 +1829,16 @@
   globalThis.onunhandledrejection = null;
   globalThis.reportError = (e) => native.record_error('reportError', String((e && e.stack) || e));
 
+  // A module's body runs inside a promise, so throwing from it rejects that
+  // promise rather than raising where the host called `eval`. Without this the
+  // failure is silent, and a page whose application module died on its first
+  // line looks exactly like a page that rendered nothing on purpose.
+  globalThis.__mar_watch_module = function (promise, origin) {
+    // `format` puts the message back in front of the frames, which QuickJS
+    // leaves out of `.stack`.
+    Promise.resolve(promise).catch((e) => native.record_error(origin, format([e])));
+  };
+
   // Signal that parsing is done, in the order a browser uses.
   globalThis.__mar_fire_ready = function () {
     try {

@@ -6,6 +6,7 @@
 //! environment, and a settle loop on a virtual clock (`page`).
 
 pub mod dom;
+pub mod modules;
 pub mod natives;
 pub mod net;
 pub mod page;
