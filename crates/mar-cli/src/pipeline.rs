@@ -103,7 +103,7 @@ impl Renderer {
         let started = Instant::now();
         let mut target = url.to_owned();
         let mut hops = 0usize;
-        let mut seen = vec![target.clone()];
+        let mut seen = vec![(target.clone(), self.client.cookie_fingerprint(&target))];
 
         loop {
             let mut rendered = self.render_once(&target, options, started)?;
@@ -117,10 +117,16 @@ impl Renderer {
             };
             // A loop between two pages is common when a gate misfires; stop and
             // return what we have rather than bouncing until the hop limit.
-            if seen.contains(&next) {
+            //
+            // The same URL twice is not automatically a loop, though. A
+            // challenge page computes something, sets a cookie and reloads, and
+            // the second fetch is a different request carrying a different jar.
+            // What makes a repeat pointless is repeating it unchanged.
+            let fingerprint = self.client.cookie_fingerprint(&next);
+            if seen.iter().any(|(url, seen_at)| *url == next && *seen_at == fingerprint) {
                 return Ok(rendered);
             }
-            seen.push(next.clone());
+            seen.push((next.clone(), fingerprint));
             target = next;
             hops += 1;
         }
@@ -216,7 +222,15 @@ impl Renderer {
         let net = PageNetwork::new(self.client.clone(), &base);
         let mut page = Page::with_document(document, base.clone(), options.limits.clone(), net)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A script that reads `document.cookie` expects to find what the server
+        // already set, and one that writes it expects the next request to carry
+        // it. The jar lives in the client, so the page borrows it on the way in
+        // and hands its writes back on the way out.
+        page.state().borrow_mut().cookies = self.client.cookies_for(base.as_str());
         let outcome = page.run();
+        for raw in &outcome.cookie_writes {
+            self.client.apply_script_cookie(base.as_str(), raw);
+        }
         report.render_ms = render_start.elapsed().as_millis();
 
         report.scripts_run = outcome.scripts_run;

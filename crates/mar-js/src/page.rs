@@ -32,6 +32,9 @@ pub struct PageOutcome {
     /// A `location.href = ...` the page asked for but we did not follow.
     pub requested_navigation: Option<String>,
     pub cookies: String,
+    /// `document.cookie = ...` assignments, verbatim and in order, for a host
+    /// that keeps a real cookie jar.
+    pub cookie_writes: Vec<String>,
     /// Scripts that ran, and scripts skipped for lacking a body.
     pub scripts_run: usize,
     pub scripts_skipped: usize,
@@ -564,6 +567,7 @@ impl<N: NetworkProvider + 'static> Page<N> {
             errors: s.errors.clone(),
             requested_navigation: s.requested_navigation.clone(),
             cookies: s.cookies.clone(),
+            cookie_writes: s.cookie_writes.clone(),
             scripts_run: self.scripts_run,
             scripts_skipped: self.scripts_skipped,
             timer_callbacks: s.timers.fired(),

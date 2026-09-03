@@ -87,6 +87,12 @@ pub struct PageState {
     pub errors: Vec<ScriptError>,
     /// `document.cookie`, as a single `k=v; k2=v2` string.
     pub cookies: String,
+    /// Every `document.cookie = ...` a script performed, kept verbatim.
+    ///
+    /// The flattened string above has already lost `path`, `domain` and
+    /// `expires`; a host that owns a real cookie jar needs them, so the raw
+    /// assignment is kept alongside it.
+    pub cookie_writes: Vec<String>,
     pub local_storage: HashMap<String, String>,
     pub session_storage: HashMap<String, String>,
     /// Set when a script assigns `location.href` or calls `location.replace`.
@@ -113,6 +119,7 @@ impl PageState {
             console_bytes: 0,
             errors: Vec::new(),
             cookies: String::new(),
+            cookie_writes: Vec::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
             requested_navigation: None,
@@ -164,6 +171,7 @@ impl PageState {
         if name.is_empty() {
             return;
         }
+        self.cookie_writes.push(raw.to_owned());
         let mut pairs = self.cookie_pairs();
         match pairs.iter_mut().find(|(k, _)| k == name) {
             Some(existing) => existing.1 = value.trim().to_owned(),

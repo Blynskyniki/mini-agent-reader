@@ -137,6 +137,83 @@ impl HttpClient {
         self.requests.load(Ordering::Relaxed)
     }
 
+    /// Every agent that could serve a request, primary first.
+    ///
+    /// Each carries its own jar, and which one a host lands on is decided by
+    /// its certificate chain, so a cookie has to be written to both to survive
+    /// a switch between them.
+    fn agents(&self) -> impl Iterator<Item = &ureq::Agent> {
+        std::iter::once(&self.agent).chain(self.fallback_agent.iter())
+    }
+
+    /// What `document.cookie` should read as on `url`.
+    pub fn cookies_for(&self, url: &str) -> String {
+        let Ok(parsed) = url::Url::parse(url) else {
+            return String::new();
+        };
+        // The jar can only be queried by an exact domain, path and name triple,
+        // so the candidates a browser would match against are enumerated and
+        // the jar decides which of them it actually holds.
+        let domains = domain_candidates(parsed.host_str().unwrap_or_default());
+        let paths = path_candidates(parsed.path());
+
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for agent in self.agents() {
+            let jar = agent.cookie_jar_lock();
+            let names: Vec<String> = jar.iter().map(|c| c.name().to_owned()).collect();
+            for name in names {
+                if pairs.iter().any(|(existing, _)| *existing == name) {
+                    continue;
+                }
+                let found = domains.iter().find_map(|domain| {
+                    paths
+                        .iter()
+                        .find_map(|path| jar.get(domain, path, &name))
+                        .map(|c| c.value().to_owned())
+                });
+                if let Some(value) = found {
+                    pairs.push((name, value));
+                }
+            }
+        }
+
+        pairs
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Apply a `document.cookie = ...` a script performed on `url`.
+    ///
+    /// Kept verbatim rather than as a name and value, so `path`, `domain` and
+    /// `expires` are honoured by the same rules a response's `Set-Cookie` gets.
+    pub fn apply_script_cookie(&self, url: &str, raw: &str) {
+        let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+            return;
+        };
+        for agent in self.agents() {
+            let Ok(cookie) = ureq::Cookie::parse(raw.to_owned(), &uri) else {
+                continue;
+            };
+            let _ = agent.cookie_jar_lock().insert(cookie, &uri);
+        }
+    }
+
+    /// A fingerprint of the cookies that apply to `url`.
+    ///
+    /// Two fetches of one URL are the same fetch unless something changed in
+    /// between; this is how a caller tells those apart.
+    pub fn cookie_fingerprint(&self, url: &str) -> String {
+        let mut pairs: Vec<String> = self
+            .cookies_for(url)
+            .split("; ")
+            .map(|s| s.to_owned())
+            .collect();
+        pairs.sort();
+        pairs.join("; ")
+    }
+
     /// Fetch a top-level document.
     pub fn get_document(&self, url: &str) -> Result<Fetched, NetError> {
         self.execute("GET", url, &[], None, ResourceKind::Document, None)
@@ -406,6 +483,38 @@ fn registrable(host: &str) -> String {
     labels[labels.len() - 2..].join(".").to_ascii_lowercase()
 }
 
+/// A host and every parent a cookie could have been scoped to.
+///
+/// `www.gosuslugi.ru` yields itself and `gosuslugi.ru`, which is what a
+/// `Domain=` attribute one level up produces.
+fn domain_candidates(host: &str) -> Vec<String> {
+    let host = host.trim_start_matches('.').to_ascii_lowercase();
+    let mut out = vec![host.clone()];
+    let labels: Vec<&str> = host.split('.').collect();
+    for cut in 1..labels.len().saturating_sub(1) {
+        out.push(labels[cut..].join("."));
+    }
+    out
+}
+
+/// A path and every prefix directory of it, longest first, as cookie matching
+/// walks upward from the request path to the root.
+fn path_candidates(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = if path.is_empty() { "/" } else { path };
+    loop {
+        out.push(current.to_owned());
+        match current.rfind('/') {
+            Some(0) | None => break,
+            Some(cut) => current = &current[..cut],
+        }
+    }
+    if !out.iter().any(|p| p == "/") {
+        out.push("/".to_owned());
+    }
+    out
+}
+
 /// What kind of resource a response holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseKind {
@@ -572,5 +681,60 @@ impl NetworkProvider for PageNetwork {
             headers: fetched.headers,
             body: fetched.body,
         })
+    }
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::*;
+
+    fn client() -> HttpClient {
+        HttpClient::new(ClientConfig::default())
+    }
+
+    #[test]
+    fn a_script_cookie_is_readable_back_on_the_same_site() {
+        let c = client();
+        c.apply_script_cookie("https://www.gosuslugi.ru/", "jsch=solved; path=/");
+        assert_eq!(c.cookies_for("https://www.gosuslugi.ru/"), "jsch=solved");
+        assert_eq!(
+            c.cookies_for("https://www.gosuslugi.ru/deep/page"),
+            "jsch=solved",
+            "a path=/ cookie applies further down the site"
+        );
+    }
+
+    #[test]
+    fn a_cookie_does_not_leak_to_another_site() {
+        let c = client();
+        c.apply_script_cookie("https://a.example/", "token=secret; path=/");
+        assert_eq!(c.cookies_for("https://b.example/"), "");
+    }
+
+    #[test]
+    fn a_domain_cookie_reaches_a_subdomain() {
+        let c = client();
+        c.apply_script_cookie("https://www.example.com/", "id=7; domain=example.com; path=/");
+        assert_eq!(c.cookies_for("https://api.example.com/"), "id=7");
+    }
+
+    #[test]
+    fn the_fingerprint_changes_when_a_cookie_is_added() {
+        let c = client();
+        let before = c.cookie_fingerprint("https://example.com/");
+        c.apply_script_cookie("https://example.com/", "gate=passed; path=/");
+        assert_ne!(
+            before,
+            c.cookie_fingerprint("https://example.com/"),
+            "this is what tells a reload apart from a redirect loop"
+        );
+    }
+
+    #[test]
+    fn candidates_walk_up_the_host_and_the_path() {
+        assert_eq!(domain_candidates("www.gosuslugi.ru"), ["www.gosuslugi.ru", "gosuslugi.ru"]);
+        assert_eq!(domain_candidates("example.com"), ["example.com"]);
+        assert_eq!(path_candidates("/a/b"), ["/a/b", "/a", "/"]);
+        assert_eq!(path_candidates("/"), ["/"]);
     }
 }

@@ -685,7 +685,10 @@
     ...loc,
     assign: (u) => native.navigate(String(u)),
     replace: (u) => native.navigate(String(u)),
-    reload: () => {},
+    // A reload is a navigation to the same URL. Challenge pages depend on it:
+    // they compute something, set a cookie, and reload to be served the real
+    // page. The host decides whether to follow it, as with any navigation.
+    reload: () => native.navigate(loc.href),
     toString: () => loc.href,
   };
   // Assigning location.href is a navigation request, not a mutation.

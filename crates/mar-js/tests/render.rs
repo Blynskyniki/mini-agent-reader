@@ -234,6 +234,35 @@ fn navigation_is_reported_not_followed() {
 }
 
 #[test]
+fn reload_is_a_navigation_to_the_same_url() {
+    let out = render(r#"<body><script>location.reload();</script></body>"#);
+    assert_eq!(
+        out.requested_navigation.as_deref(),
+        Some("https://example.com/page"),
+        "a challenge page sets a cookie and reloads; the reload has to be visible"
+    );
+}
+
+#[test]
+fn cookie_assignments_are_kept_verbatim() {
+    let out = render(
+        r#"<body><script>
+          document.cookie = 'a=1; path=/; expires=Thu, 01 Jan 2099 00:00:00 GMT';
+          document.cookie = 'b=2';
+        </script></body>"#,
+    );
+    assert_eq!(
+        out.cookie_writes,
+        vec![
+            "a=1; path=/; expires=Thu, 01 Jan 2099 00:00:00 GMT".to_owned(),
+            "b=2".to_owned(),
+        ],
+        "the attributes survive for a host that owns a real jar"
+    );
+    assert_eq!(out.cookies, "a=1; b=2", "while document.cookie stays flat");
+}
+
+#[test]
 fn the_page_reports_console_output() {
     let out = render(
         r#"<body><script>
