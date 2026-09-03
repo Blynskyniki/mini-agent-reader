@@ -90,15 +90,23 @@ runs.
 | lenta.ru | 213 ms | 9 ms | 9.1 MB | 15,982 | 10 |
 | ria.ru | 178 ms | 19 ms | 8.9 MB | 8,317 | 20 |
 | habr.com | 465 ms | 12 ms | 10.4 MB | 1,651 | 7 |
-| gosuslugi.ru | 9.9 s | 9.8 s | 8.3 MB | 82 | 1 |
+| gosuslugi.ru | 36 s | 36 s | 15.5 MB | 0 | 1 |
 | docs.python.org | 1.0 s | 640 ms | 8.6 MB | 12,316 | 12 |
 | Wikipedia, long article | 572 ms | 80 ms | 27.7 MB | 91,550 | 4 |
 | MDN | 1.6 s | 1.3 s | 12.4 MB | 2,002 | 5 |
 
-The gosuslugi.ru row is shown deliberately: it is a heavy single-page
-application that exhausts the wall-clock budget and is cut short. A response
-comes back, but the page yields little readable text. Cases like this are
-flagged `truncated` in the report.
+The gosuslugi.ru row is shown deliberately, and it is not what it looks like.
+The site does not serve the portal at all. It serves a 9 KB interstitial whose
+one script computes a CRC32 proof of work, sets a cookie and reloads, and only
+then is the real page served. That is where the 36 seconds go: they are the
+proof of work, and this is the one page in the table where an interpreter
+without a JIT is genuinely the wrong tool.
+
+It does get through — the row above is the portal, not the interstitial — but
+the default 15-second budget is not enough, so this one needs
+`--timeout-ms 60000`. Nothing is extracted even then, for a reason further down
+this page: the portal's body arrives as cross-origin ES modules, and neither of
+those is fetched.
 
 Wikipedia is the memory ceiling: a document over a megabyte costs 27.7 MB, still
 half what Chromium spends on an empty tab.
@@ -171,10 +179,20 @@ Six crates, each usable on its own.
 
 ## Design
 
-**No renderer.** There is no layout, no style cascade, no paint. Every box is
-zero-sized at the origin, `getComputedStyle` returns what the inline style says,
-and `IntersectionObserver` never fires. This is the whole saving, and it is why
-screenshots are out of scope.
+**No renderer.** There is no layout, no style cascade, no paint. Every box the
+page itself measures is zero-sized at the origin, and `getComputedStyle` returns
+what the inline style says. This is the whole saving, and it is why screenshots
+are out of scope.
+
+`IntersectionObserver` does deliver one record per observed target rather than
+never firing: a script that waits for the callback before rendering its content
+cannot survive silence, and the answer it gets — visible — is the one that
+unblocks it. A CDP client that clicks is a separate matter: it measures an
+element before clicking, so it is handed a synthetic rectangle from an imaginary
+grid, unique per element and enough to hit-test against. Those rectangles exist
+only while a client is asking. The page's own scripts still measure zeroes,
+which is what keeps this a browser without a layout engine rather than one with
+a bad one.
 
 **Thin native surface, thick JavaScript prelude.** Rust binds only what needs
 the document, the page state or the network: about thirty functions. `Event`,
@@ -247,6 +265,57 @@ Ask the settled page a question:
 mar eval https://example.com/ "[...document.querySelectorAll('h2')].map(h => h.textContent)"
 ```
 
+Take something other than the HTML — the visible text, the links, every
+subresource the page refers to, or the response body with nothing done to it:
+
+```bash
+mar fetch https://example.com/ --dump text
+mar fetch https://example.com/ --dump links
+mar fetch https://example.com/ --dump assets     # one JSON object per line
+mar fetch https://example.com/logo.png --dump original -o logo.png
+```
+
+`assets` is read off the settled document rather than off the requests that were
+made, because most of what a page refers to is images, fonts and stylesheets
+this browser never fetches, and what it *would* pull in is the interesting part.
+`original` parses nothing, which makes it the only mode that works on a URL that
+is not a page.
+
+Read many pages at once. The per-page cost of starting a process disappears
+here: the engine starts once and the workers share its connections and cookies.
+
+```bash
+mar scrape https://a.example/ https://b.example/ --concurrency 8
+cat urls.txt | mar scrape - --shape eval --eval "document.title"
+```
+
+One JSON object per line, emitted as pages finish rather than in the order
+given, so a slow page never holds up the ones behind it. A page that failed is a
+line carrying an `error`, not a missing line: diffing the input against the
+output should account for every URL.
+
+## Model Context Protocol
+
+```bash
+mar mcp
+```
+
+Speaks MCP over stdin and stdout, so an agent can read pages without going
+through a shell. Five tools: `read`, `fetch_html`, `evaluate`, `links` and
+`metadata`. There is no screenshot tool and no PDF tool, and each description
+says so, which stops a model reaching for one.
+
+```json
+{
+  "mcpServers": {
+    "mar": { "command": "mar", "args": ["mcp"] }
+  }
+}
+```
+
+The global safety flags are fixed before the first message is read: a client can
+narrow what a page costs, and cannot widen what it is allowed to reach.
+
 ## HTTP server
 
 ```bash
@@ -292,8 +361,34 @@ Verified against unmodified `puppeteer-core`: `connect`, `newPage`, `goto`,
 remote object handles, `Runtime.getProperties`, and honouring `awaitPromise`, so
 asynchronous code inside `evaluate` genuinely waits for its result.
 
-A method that needs the renderer (`Page.captureScreenshot`, `Page.printToPDF`)
-returns a clear error rather than a blank image.
+Requests can be intercepted, which is the point at which this stops being a
+reader and starts being usable for tests: block the third-party bundle, serve a
+fixture instead of the API, fail one request and see what the page does.
+
+```js
+await page.setRequestInterception(true);
+page.on('request', (r) =>
+  r.url().includes('/analytics') ? r.abort()
+  : r.url().includes('/api/') ? r.respond({ status: 200, body: fixture })
+  : r.continue());
+```
+
+The document request is intercepted too, so mocking the page itself works. It
+sits at the seam where the engine hands a request to whatever the host installed
+— the engine never opens a socket — and a pause that is never answered ends at
+the page's existing wall-clock budget rather than hanging it.
+
+`page.click()` and `page.type()` work, which needed more than dispatching an
+event: Puppeteer measures an element and clicks a coordinate, and with no layout
+every centre is the same point. Elements are handed synthetic rectangles from an
+imaginary grid while a client is measuring, and the click is hit-tested against
+those. `Network.getResponseBody`, `Storage.getCookies` and `Storage.setCookies`
+are there as well.
+
+Response-stage interception (`Fetch.continueResponse`, `continueWithAuth`) is
+not, and returns a clear error rather than silently never pausing. So does a
+method that needs the renderer: `Page.captureScreenshot` and `Page.printToPDF`
+say what is missing instead of handing back a blank image.
 
 ## JavaScript
 
@@ -331,11 +426,26 @@ page itself makes through `fetch` or `XMLHttpRequest`:
 - `Sec-Fetch-Dest` and `Sec-Fetch-Mode` matching the request type;
 - the full `Sec-CH-UA`, `Accept` and `Accept-Language` set;
 - no `Content-Length` on a bodyless GET, which browsers never send;
-- one cookie jar shared between the document and its subresources.
+- one cookie jar shared between the document and its subresources, which
+  `document.cookie` reads from and writes to like a browser's.
+
+That last one is what gets past a JavaScript challenge. A page that computes
+something, sets a cookie and calls `location.reload()` is served the real thing
+on the second request — which also means a repeat of a URL counts as a loop only
+when the cookies are unchanged too, because otherwise it is a different request.
 
 What is missing: TLS fingerprint spoofing. The handshake is rustls, and its JA3
 and JA4 differ from Chrome's. Sites that check exactly that will see the
-difference. If you need parity, put a curl-impersonate proxy in front of `mar`.
+difference. If you need parity, put a fingerprint-impersonating proxy in front
+and point `--proxy` at it:
+
+```bash
+mar --proxy socks5://127.0.0.1:1080 read https://example.com/
+```
+
+A proxy that will not parse fails every request rather than quietly going
+direct: silently falling back is how a scrape leaks the address it was trying
+not to use.
 
 ## Safety
 
@@ -347,9 +457,13 @@ the caller's behalf. Pass `--allow-private` for local development, and
 `--allow-host` to restrict fetching to a set of domains.
 
 Scripts cannot navigate the host anywhere by themselves. A `location.href`
-assignment is recorded and followed only because a browser would, bounded to
-three hops with loop detection, and cross-origin subresource requests are
-refused.
+assignment or a `location.reload()` is recorded and followed only because a
+browser would, bounded to three hops with loop detection, and cross-origin
+subresource requests are refused.
+
+`--obey-robots` asks each site's `robots.txt` before fetching a page from it,
+once per host. Documents only: `robots.txt` governs what a crawler may go and
+read, not which stylesheet a page it was already allowed to read pulls in.
 
 ## Limits
 
@@ -357,12 +471,14 @@ Known and deliberate:
 
 - **No screenshots or PDFs.** They need the renderer this project removes.
 - **No TLS fingerprint spoofing.** Headers look like Chrome; the handshake
-  does not.
+  does not. `--proxy` is the way around it.
 - **No module loader.** A `type="module"` script compiles and runs, but an
   `import` of another URL fails. Page runtimes that bundle this way log an
   error and the rest of the page still renders.
 - **No WebSocket, Worker, WebGL, canvas or media.** They construct without
   throwing and do nothing.
+- **No layout for the page itself.** An element measures zero, and a page that
+  branches on its own geometry takes the zero branch.
 - **Cross-origin scripts are not fetched.** Third-party bundles are almost
   always analytics and advertising: slow, and they add nothing to read.
 - **Non-HTML is not parsed.** A PDF or an image is refused with a clear
@@ -376,11 +492,14 @@ Known and deliberate:
 cargo test
 ```
 
-Forty-five tests: DOM structure and serialization round-trips, CSS selector
+Ninety-five tests: DOM structure and serialization round-trips, CSS selector
 semantics, charset sniffing in the spec's precedence order (including a
-regression for double-decoded koi8-r), SSRF policy, article extraction, and
-end-to-end rendering with promises, `fetch`, the virtual clock, error isolation
-and the runaway-page budget. None touch the network.
+regression for double-decoded koi8-r), SSRF policy, `robots.txt` grouping and
+longest-match precedence, the cookie jar the page shares with the client,
+article extraction, a CDP session driven end to end including request
+interception and synthetic input, the MCP protocol framing, and end-to-end
+rendering with promises, `fetch`, the virtual clock, error isolation and the
+runaway-page budget. None touch the network.
 
 ## Licence
 
