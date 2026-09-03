@@ -6,6 +6,7 @@
 
 mod charset;
 mod policy;
+mod robots;
 pub mod tls;
 
 pub use charset::{decode_body, sniff_charset};
@@ -32,6 +33,14 @@ pub struct ClientConfig {
     pub trust: TrustMode,
     /// Extra roots beyond the bundled ones, from a caller-supplied PEM bundle.
     pub extra_roots: Vec<ureq::tls::Certificate<'static>>,
+    /// An HTTP or SOCKS proxy to send everything through.
+    ///
+    /// The handshake here is rustls, whose JA3 and JA4 are not Chrome's. A
+    /// proxy is how that is fixed without changing the TLS stack: put a
+    /// fingerprint-impersonating proxy in front and point this at it.
+    pub proxy: Option<String>,
+    /// Ask each host's `robots.txt` before fetching a document from it.
+    pub obey_robots: bool,
 }
 
 impl Default for ClientConfig {
@@ -45,6 +54,8 @@ impl Default for ClientConfig {
             policy: Policy::default(),
             trust: TrustMode::default(),
             extra_roots: Vec::new(),
+            proxy: None,
+            obey_robots: false,
         }
     }
 }
@@ -61,6 +72,8 @@ pub enum NetError {
         #[source]
         source: url::ParseError,
     },
+    #[error("{0} is disallowed by the site's robots.txt")]
+    Robots(String),
 }
 
 /// A blocking HTTP client with browser-shaped headers.
@@ -78,6 +91,11 @@ pub struct HttpClient {
     /// Hosts already known to need the fallback, so the second and later
     /// requests to one skip the handshake that is going to fail.
     needs_fallback: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Set when the configured proxy would not parse. Every request fails with
+    /// it rather than quietly going direct.
+    proxy_error: Option<String>,
+    /// `robots.txt` per host, fetched at most once each.
+    robots: Arc<std::sync::RwLock<std::collections::HashMap<String, robots::Rules>>>,
 }
 
 impl HttpClient {
@@ -85,6 +103,19 @@ impl HttpClient {
         // The bundled roots plus anything the caller added.
         let mut extra = tls::extra_roots();
         extra.extend(config.extra_roots.iter().cloned());
+
+        // A proxy that will not parse must not degrade into going direct. The
+        // caller asked for egress through somewhere specific, and silently
+        // ignoring that is how a scrape leaks its real address.
+        let mut proxy_error = None;
+        let proxy = match config.proxy.as_deref().map(ureq::Proxy::new) {
+            Some(Ok(p)) => Some(p),
+            Some(Err(e)) => {
+                proxy_error = Some(format!("proxy {:?} is not usable: {e}", config.proxy));
+                None
+            }
+            None => None,
+        };
 
         let build = |tls_config: ureq::tls::TlsConfig| -> ureq::Agent {
             ureq::Agent::config_builder()
@@ -95,6 +126,7 @@ impl HttpClient {
                 .save_redirect_history(true)
                 .user_agent(&config.user_agent)
                 .tls_config(tls_config)
+                .proxy(proxy.clone())
                 .build()
                 .into()
         };
@@ -108,6 +140,8 @@ impl HttpClient {
             config: Arc::new(config),
             requests: Arc::new(AtomicUsize::new(0)),
             needs_fallback: Arc::new(std::sync::RwLock::new(Default::default())),
+            proxy_error,
+            robots: Arc::new(std::sync::RwLock::new(Default::default())),
         }
     }
 
@@ -216,7 +250,56 @@ impl HttpClient {
 
     /// Fetch a top-level document.
     pub fn get_document(&self, url: &str) -> Result<Fetched, NetError> {
+        self.check_robots(url)?;
         self.execute("GET", url, &[], None, ResourceKind::Document, None)
+    }
+
+    /// Refuse a document `robots.txt` puts off limits.
+    ///
+    /// Only documents are checked. `robots.txt` governs what a crawler may go
+    /// and read, not which stylesheet a page it was allowed to read then pulls
+    /// in, and treating subresources as crawl decisions breaks pages that are
+    /// otherwise permitted.
+    fn check_robots(&self, url: &str) -> Result<(), NetError> {
+        if !self.config.obey_robots {
+            return Ok(());
+        }
+        let Ok(parsed) = url::Url::parse(url) else {
+            return Ok(());
+        };
+        let origin = parsed.origin().ascii_serialization();
+
+        if let Ok(cache) = self.robots.read()
+            && let Some(rules) = cache.get(&origin)
+        {
+            return match rules.allows(parsed.path()) {
+                true => Ok(()),
+                false => Err(NetError::Robots(url.to_owned())),
+            };
+        }
+
+        // A site that will not serve its robots.txt has not disallowed
+        // anything, so a failure here is an empty rule set, not a refusal.
+        let body = self
+            .execute(
+                "GET",
+                &format!("{origin}/robots.txt"),
+                &[],
+                None,
+                ResourceKind::Document,
+                None,
+            )
+            .map(|f| f.body)
+            .unwrap_or_default();
+        let rules = robots::Rules::parse(&body, &self.config.user_agent);
+        let allowed = rules.allows(parsed.path());
+        if let Ok(mut cache) = self.robots.write() {
+            cache.insert(origin, rules);
+        }
+        match allowed {
+            true => Ok(()),
+            false => Err(NetError::Robots(url.to_owned())),
+        }
     }
 
     /// Fetch a script the page referenced, so it can be inlined and run.
@@ -296,6 +379,9 @@ impl HttpClient {
         kind: ResourceKind,
         referer: Option<&url::Url>,
     ) -> Result<Fetched, NetError> {
+        if let Some(problem) = &self.proxy_error {
+            return Err(NetError::Transport(problem.clone()));
+        }
         let parsed = url::Url::parse(url).map_err(|source| NetError::Url {
             url: url.to_owned(),
             source,

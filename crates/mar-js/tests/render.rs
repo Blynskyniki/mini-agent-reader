@@ -234,6 +234,39 @@ fn navigation_is_reported_not_followed() {
 }
 
 #[test]
+fn the_environment_does_not_advertise_itself() {
+    let out = render(
+        r#"<body><div id="out"></div><script>
+          const page = function mine(a) { return a + 1 };
+          document.getElementById('out').textContent = JSON.stringify({
+            fetch: String(fetch),
+            listener: String(addEventListener),
+            named: fetch.name,
+            page: String(page),
+            internals: Object.keys(globalThis).filter(k => k.startsWith('__mar')),
+          });
+        </script></body>"#,
+    );
+    let seen = &out.html;
+    assert!(
+        seen.contains(r#"function fetch() { [native code] }"#),
+        "a function written in the prelude still reads as built in: {seen}"
+    );
+    assert!(
+        seen.contains(r#"function addEventListener() { [native code] }"#),
+        "and so does one reached through a property walk: {seen}"
+    );
+    assert!(
+        seen.contains(r#"function mine(a) { return a + 1 }"#),
+        "while the page's own source is left alone: {seen}"
+    );
+    assert!(
+        seen.contains(r#""internals":[]"#),
+        "and the bridge the CDP layer calls is not enumerable: {seen}"
+    );
+}
+
+#[test]
 fn reload_is_a_navigation_to_the_same_url() {
     let out = render(r#"<body><script>location.reload();</script></body>"#);
     assert_eq!(

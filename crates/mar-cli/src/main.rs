@@ -44,6 +44,19 @@ struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     ca_bundle: Vec<std::path::PathBuf>,
 
+    /// Send everything through an HTTP or SOCKS proxy, e.g.
+    /// `http://127.0.0.1:8080` or `socks5://user:pass@host:1080`.
+    ///
+    /// This is also the answer to TLS fingerprinting: the handshake here is
+    /// rustls, whose JA3 and JA4 are not Chrome's, so a site that checks
+    /// exactly that wants a fingerprint-impersonating proxy in front.
+    #[arg(long, global = true, env = "MAR_PROXY", value_name = "URL")]
+    proxy: Option<String>,
+
+    /// Ask each site's robots.txt before fetching a page from it.
+    #[arg(long, global = true, env = "MAR_OBEY_ROBOTS")]
+    obey_robots: bool,
+
     #[arg(long, global = true, default_value = "warn")]
     log: String,
 }
@@ -158,16 +171,19 @@ struct RenderArgs {
     no_external_scripts: bool,
 
     /// Wall-clock budget for the page, in milliseconds.
-    #[arg(long, default_value_t = 15_000)]
+    ///
+    /// Raise it for a page that is genuinely slow rather than stuck: a heavy
+    /// SPA on a slow network, or a proof-of-work bot check.
+    #[arg(long, default_value_t = 15_000, env = "MAR_TIMEOUT_MS")]
     timeout_ms: u64,
 
     /// How far the page's virtual clock may run, in milliseconds. Timers
     /// scheduled beyond this never fire.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = 10_000, env = "MAR_HORIZON_MS")]
     horizon_ms: i64,
 
     /// Memory ceiling for the JavaScript heap, in megabytes.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 64, env = "MAR_MEMORY_MB")]
     memory_mb: usize,
 }
 
@@ -224,36 +240,42 @@ fn main() {
         }
     }
 
-    let trust = Trust {
+    let egress = Egress {
         mode: cli.trust.into(),
         extra_roots: ca_bundle,
+        proxy: cli.proxy.clone(),
+        obey_robots: cli.obey_robots,
     };
 
-    if let Err(e) = run(cli.command, policy, trust) {
+    if let Err(e) = run(cli.command, policy, egress) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 }
 
-/// Trust settings, gathered from the global flags.
+/// How this process reaches the network, gathered from the global flags.
 #[derive(Clone)]
-struct Trust {
+struct Egress {
     mode: mar_net::TrustMode,
     extra_roots: Vec<ureq::tls::Certificate<'static>>,
+    proxy: Option<String>,
+    obey_robots: bool,
 }
 
-impl Trust {
+impl Egress {
     fn client_config(&self, policy: Policy) -> mar_net::ClientConfig {
         mar_net::ClientConfig {
             policy,
             trust: self.mode,
             extra_roots: self.extra_roots.clone(),
+            proxy: self.proxy.clone(),
+            obey_robots: self.obey_robots,
             ..Default::default()
         }
     }
 }
 
-fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
+fn run(command: Command, policy: Policy, egress: Egress) -> anyhow::Result<()> {
     match command {
         Command::Read {
             url,
@@ -271,7 +293,7 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
                 max_chars,
             };
             let (reading, report) =
-                Renderer::new(trust.client_config(policy)).read(&url, &options)?;
+                Renderer::new(egress.client_config(policy)).read(&url, &options)?;
 
             let mut out = std::io::stdout().lock();
             match format {
@@ -297,7 +319,7 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
             report: want_report,
         } => {
             let rendered =
-                Renderer::new(trust.client_config(policy)).render(&url, &render.to_options())?;
+                Renderer::new(egress.client_config(policy)).render(&url, &render.to_options())?;
             print!("{}", rendered.html);
             if want_report {
                 eprintln!("{}", serde_json::to_string_pretty(&rendered.report)?);
@@ -310,7 +332,7 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
             expression,
             render,
         } => {
-            let json = Renderer::new(trust.client_config(policy)).eval(
+            let json = Renderer::new(egress.client_config(policy)).eval(
                 &url,
                 &expression,
                 &render.to_options(),
@@ -323,7 +345,7 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
             bind,
             workers,
             token,
-        } => server::serve(&bind, workers, token, trust.client_config(policy)),
+        } => server::serve(&bind, workers, token, egress.client_config(policy)),
 
         Command::Cdp {
             bind,
@@ -331,7 +353,7 @@ fn run(command: Command, policy: Policy, trust: Trust) -> anyhow::Result<()> {
             max_connections,
             render,
         } => {
-            let client = mar_net::HttpClient::new(trust.client_config(policy));
+            let client = mar_net::HttpClient::new(egress.client_config(policy));
             mar_cdp::serve(
                 mar_cdp::CdpConfig {
                     bind,

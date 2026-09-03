@@ -1439,4 +1439,65 @@
       native.record_error('readystatechange', String((e && e.stack) || e));
     }
   };
+
+  // -- looking built in ----------------------------------------------------
+
+  // Almost everything above is written in JavaScript, and a page can read it:
+  // `Function.prototype.toString` hands back our source where a browser hands
+  // back `[native code]`, and the bridge the CDP layer calls sits on
+  // `globalThis` in plain sight of `Object.keys`. Neither changes what the
+  // page renders, and both say plainly what is running the page.
+  //
+  // This runs last, before any page script, so everything it can reach is
+  // ours. Nothing a page defines later is ever marked.
+  (function disguise() {
+    for (const name of Object.getOwnPropertyNames(globalThis)) {
+      if (name.startsWith('__mar')) {
+        define(globalThis, name, { enumerable: false, writable: true, value: globalThis[name] });
+      }
+    }
+
+    const builtIn = new WeakSet();
+    const seen = new Set();
+    const mark = (value, name, depth) => {
+      if (value == null || depth > 3) return;
+      const kind = typeof value;
+      if (kind !== 'function' && kind !== 'object') return;
+      if (seen.has(value)) return;
+      seen.add(value);
+      if (kind === 'function') {
+        builtIn.add(value);
+        // A browser's built-ins are named after the property that holds them,
+        // and pages read `fn.name`. Ours are mostly anonymous expressions.
+        if (!value.name && name) {
+          define(value, 'name', { value: name });
+        }
+      }
+      for (const key of Object.getOwnPropertyNames(value)) {
+        // Reading a getter can run page-visible code or throw; only plain
+        // values are worth following.
+        const desc = Object.getOwnPropertyDescriptor(value, key);
+        if (!desc || !('value' in desc)) continue;
+        mark(desc.value, key, depth + 1);
+      }
+      if (kind === 'function' && value.prototype) mark(value.prototype, '', depth + 1);
+      const proto = Object.getPrototypeOf(value);
+      if (proto && proto !== Object.prototype) mark(proto, '', depth + 1);
+    };
+
+    for (const root of [globalThis, document, navigator, location, screen, history]) {
+      mark(root, '', 0);
+    }
+
+    const realToString = Function.prototype.toString;
+    const masked = function toString() {
+      if (builtIn.has(this)) {
+        return `function ${this.name || ''}() { [native code] }`;
+      }
+      return realToString.call(this);
+    };
+    builtIn.add(masked);
+    builtIn.add(realToString);
+    method(Function.prototype, 'toString', masked);
+  })();
 })();

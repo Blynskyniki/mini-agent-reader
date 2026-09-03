@@ -22,7 +22,7 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mar-js = { path = "crates/mar-js" }
-ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip", "brotli", "cookies"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip", "brotli", "cookies", "socks-proxy"] }
 encoding_rs = "0.8"
 webpki-roots = "1"
 tracing = "0.1"
