@@ -608,3 +608,22 @@ impl<N: NetworkProvider + 'static> Page<N> {
         }
     }
 }
+
+impl<N: NetworkProvider + 'static> Drop for Page<N> {
+    /// Let go of the JS values Rust is holding before the runtime is freed.
+    ///
+    /// A timer callback sits in the queue as a `Persistent` function, and one
+    /// of those keeps the context alive. The settle loop empties the queue
+    /// when the page is done, but an evaluation afterwards can fill it again
+    /// (a `MutationObserver` delivers on a timer) and nothing empties it a
+    /// second time. The page state is also owned by the native closures inside
+    /// the heap, so field order cannot help: the queue would be dropped after
+    /// the runtime, and QuickJS aborts the process when a runtime is freed
+    /// with objects still alive. Emptying it here, while the runtime can still
+    /// free what it holds, is what makes dropping a page safe on every path.
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.timers.clear();
+        }
+    }
+}

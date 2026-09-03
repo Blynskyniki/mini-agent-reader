@@ -584,3 +584,39 @@ fn methods_that_need_the_renderer_still_refuse() {
     let reply = dispatch(&mut browser, &command("Page.captureScreenshot", json!({})));
     assert!(error_text(&reply.response).contains("no renderer"));
 }
+
+// -- teardown ---------------------------------------------------------------
+
+/// What a client's `page.evaluate` looks like when it sets up an observer.
+const OBSERVING: &str = "(() => { const mo = new MutationObserver(() => {}); \
+     mo.observe(document.body, { childList: true }); return 1 })()";
+
+#[test]
+fn closing_a_page_that_evaluated_an_observer_keeps_the_server_up() {
+    // The evaluation runs after the page settled, so the timer the observer
+    // queues is still queued when the target is closed and the page torn
+    // down. That teardown used to abort the whole process.
+    let (mut browser, _sent) = session("https://example.com/", vec![]);
+    load(&mut browser, "<body><p>hello</p></body>");
+    assert_eq!(evaluate(&mut browser, OBSERVING), json!(1));
+
+    let target_id = browser.targets[0].id.clone();
+    let reply = dispatch(
+        &mut browser,
+        &command("Target.closeTarget", json!({"targetId": target_id})),
+    );
+    assert_eq!(result(&reply.response), json!({"success": true}));
+    assert!(browser.targets.is_empty());
+}
+
+#[test]
+fn a_new_document_and_a_dropped_connection_release_the_page_the_same_way() {
+    let (mut browser, _sent) = session("https://example.com/", vec![]);
+    load(&mut browser, "<body><p>one</p></body>");
+    assert_eq!(evaluate(&mut browser, OBSERVING), json!(1));
+    // A new document replaces the page that was observing.
+    load(&mut browser, "<body><p>two</p></body>");
+    assert_eq!(evaluate(&mut browser, OBSERVING), json!(1));
+    // The connection goes away with the page still open.
+    drop(browser);
+}

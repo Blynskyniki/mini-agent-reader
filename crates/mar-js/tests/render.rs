@@ -481,3 +481,55 @@ fn the_import_graph_draws_on_the_page_budget() {
         "a page cannot spend more through imports than through fetch: {reported}"
     );
 }
+
+#[test]
+fn an_observer_registered_from_an_evaluation_does_not_outlive_the_page() {
+    // MutationObserver delivers on a timer, and a timer is a JS function the
+    // Rust side holds on to. One scheduled after the page settled used to
+    // survive the page's own teardown and take the runtime down with it.
+    let mut page = Page::new(
+        "<body><p>hello</p></body>",
+        "https://example.com/",
+        Limits::default(),
+        StaticNetwork::new(),
+    )
+    .unwrap();
+    page.run();
+    let json = page
+        .eval_json(
+            "(() => { const mo = new MutationObserver(() => {}); \
+             mo.observe(document.body, { childList: true }); return 1 })()",
+        )
+        .unwrap();
+    assert_eq!(json, "1");
+    drop(page);
+}
+
+#[test]
+fn an_awaited_observer_callback_leaves_nothing_behind_either() {
+    // The shape a CDP client produces: a promise settled from the observer's
+    // callback, with an interval still running once it has. Awaiting drives
+    // the loop from inside the evaluation, which queues timers of its own.
+    let mut page = Page::new(
+        "<body><p>hello</p></body>",
+        "https://example.com/",
+        Limits::default(),
+        StaticNetwork::new(),
+    )
+    .unwrap();
+    page.run();
+    let json = page
+        .eval_remote(
+            "new Promise((resolve) => { \
+               new MutationObserver(() => resolve('seen')) \
+                 .observe(document.body, { childList: true }); \
+               setInterval(() => {}, 100); \
+               document.body.appendChild(document.createElement('p')); })",
+            true,
+            true,
+        )
+        .unwrap();
+    let remote: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(remote["value"], "seen", "{json}");
+    drop(page);
+}

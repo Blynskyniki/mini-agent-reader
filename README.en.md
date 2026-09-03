@@ -502,14 +502,16 @@ Known and deliberate:
 cargo test
 ```
 
-Ninety-five tests: DOM structure and serialization round-trips, CSS selector
-semantics, charset sniffing in the spec's precedence order (including a
+A hundred and four tests: DOM structure and serialization round-trips, CSS
+selector semantics, charset sniffing in the spec's precedence order (including a
 regression for double-decoded koi8-r), SSRF policy, `robots.txt` grouping and
 longest-match precedence, the cookie jar the page shares with the client,
 article extraction, a CDP session driven end to end including request
-interception and synthetic input, the MCP protocol framing, and end-to-end
-rendering with promises, `fetch`, the virtual clock, error isolation and the
-runaway-page budget. None touch the network.
+interception, synthetic input and closing a page in which the client had set up
+a `MutationObserver`, the MCP protocol framing, module graph loading, and
+end-to-end rendering with promises, `fetch`, the virtual clock, error isolation,
+the runaway-page budget and the teardown of a page after an expression was
+evaluated in it. None touch the network.
 
 ## Licence
 
