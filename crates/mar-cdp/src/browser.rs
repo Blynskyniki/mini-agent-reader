@@ -7,10 +7,13 @@
 //! internally and is deliberately not `Send`, and a CDP client drives one
 //! browser, so a thread per connection is the natural fit.
 
+use crate::fetch::{Desk, Intercepted};
 use mar_js::{Limits, Page};
-use mar_net::{HttpClient, PageNetwork};
+use mar_net::HttpClient;
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use url::Url;
 
 /// Identifier handed to the client for a target. CDP clients treat these as
@@ -38,7 +41,7 @@ pub struct Target {
     /// Session id once the client has attached. CDP routes by this.
     pub session_id: Option<String>,
     /// The rendered page. Absent until the first navigation.
-    pub page: Option<Page<PageNetwork>>,
+    pub page: Option<Page<Intercepted>>,
     /// The document as it stood after the last navigation, for DOM queries
     /// that do not need a live JS context.
     pub document: Option<mar_dom::Document>,
@@ -130,6 +133,23 @@ impl Target {
         self.node_handles.clear();
         self.next_node_id = 1;
     }
+
+    /// Re-read the document after something ran that could have changed it.
+    /// Node handles survive: the client is holding ids it was just given, and
+    /// only a navigation makes those stale.
+    pub fn refresh(&mut self) {
+        if let Some(page) = self.page.as_mut() {
+            self.document = Some(page.document().snapshot());
+        }
+    }
+
+    /// The frame and loader a request from this page belongs to.
+    pub fn frame(&self) -> crate::fetch::Frame {
+        crate::fetch::Frame {
+            frame_id: self.frame_id.clone(),
+            loader_id: self.loader_id.clone(),
+        }
+    }
 }
 
 pub const DEFAULT_CONTEXT: &str = "MARDEFAULTBROWSERCONTEXT00000000";
@@ -154,6 +174,12 @@ pub struct Browser {
     pub user_agent_override: Option<String>,
     pub extra_headers: Vec<(String, String)>,
     pub viewport: (u32, u32),
+    /// Request interception, and the response bodies it saw go past. Shared
+    /// with every page this connection builds, because that is where requests
+    /// pass through.
+    pub fetch: Rc<RefCell<Desk>>,
+    /// The connection's cookie jar, seeded into each page as it is built.
+    pub cookies: Vec<(String, String)>,
 }
 
 impl Browser {
@@ -169,6 +195,8 @@ impl Browser {
             user_agent_override: None,
             extra_headers: Vec::new(),
             viewport: (1280, 800),
+            fetch: Desk::shared(),
+            cookies: Vec::new(),
         }
     }
 
@@ -215,6 +243,28 @@ impl Browser {
             }
             None => false,
         }
+    }
+
+    /// The cookies the client is asking about.
+    ///
+    /// A live page is the authority while it exists, because scripts write to
+    /// `document.cookie` and a client reading them back expects to see that.
+    pub fn jar(&self) -> Vec<(String, String)> {
+        match self.targets.iter().find_map(|t| t.page.as_ref()) {
+            Some(page) => page.state().borrow().cookie_pairs(),
+            None => self.cookies.clone(),
+        }
+    }
+
+    /// Write the jar back, to the connection and to any page holding a copy.
+    pub fn set_jar(&mut self, pairs: Vec<(String, String)>) {
+        let serialized = crate::cookies::serialize(&pairs);
+        for target in &mut self.targets {
+            if let Some(page) = target.page.as_ref() {
+                page.state().borrow_mut().cookies = serialized.clone();
+            }
+        }
+        self.cookies = pairs;
     }
 
     /// The user agent a page should report, honouring any override.

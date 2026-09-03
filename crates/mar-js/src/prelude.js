@@ -151,9 +151,73 @@
     }
   }
 
+  class UIEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.detail = init.detail ?? 0;
+      this.view = globalThis;
+    }
+  }
+
+  const modifierFlags = (event, init) => {
+    event.ctrlKey = !!init.ctrlKey;
+    event.shiftKey = !!init.shiftKey;
+    event.altKey = !!init.altKey;
+    event.metaKey = !!init.metaKey;
+    event.getModifierState = (k) => !!event[k.toLowerCase() + 'Key'];
+  };
+
+  class MouseEvent extends UIEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.screenX = init.screenX ?? 0;
+      this.screenY = init.screenY ?? 0;
+      this.clientX = init.clientX ?? 0;
+      this.clientY = init.clientY ?? 0;
+      this.pageX = this.clientX;
+      this.pageY = this.clientY;
+      this.x = this.clientX;
+      this.y = this.clientY;
+      this.button = init.button ?? 0;
+      this.buttons = init.buttons ?? 0;
+      this.relatedTarget = init.relatedTarget ?? null;
+      modifierFlags(this, init);
+    }
+  }
+
+  class KeyboardEvent extends UIEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.key = init.key ?? '';
+      this.code = init.code ?? '';
+      this.location = 0;
+      this.repeat = !!init.repeat;
+      this.isComposing = false;
+      this.keyCode = init.keyCode ?? 0;
+      this.charCode = type === 'keypress' ? this.keyCode : 0;
+      this.which = this.keyCode;
+      modifierFlags(this, init);
+    }
+  }
+
+  class InputEvent extends UIEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.data = init.data ?? null;
+      this.inputType = init.inputType ?? 'insertText';
+      this.isComposing = false;
+    }
+  }
+
   globalThis.Event = Event;
   globalThis.CustomEvent = CustomEvent;
   globalThis.MessageEvent = MessageEvent;
+  globalThis.UIEvent = UIEvent;
+  globalThis.MouseEvent = MouseEvent;
+  globalThis.PointerEvent = MouseEvent;
+  globalThis.KeyboardEvent = KeyboardEvent;
+  globalThis.InputEvent = InputEvent;
+  globalThis.FocusEvent = class FocusEvent extends UIEvent {};
   globalThis.ErrorEvent = class ErrorEvent extends Event {};
   globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {};
 
@@ -510,12 +574,19 @@
 
   // No layout engine: every box is zero-sized at the origin. Scripts that
   // branch on visibility take the "not visible" path, which is honest.
+  //
+  // A CDP client that clicks by coordinate needs boxes that differ, and gets
+  // synthetic ones from `spatial` below — but only while it is the one asking.
   const zeroRect = () => ({
     x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0,
     width: 0, height: 0, toJSON() { return { ...this }; },
   });
-  method(NodeProto, 'getBoundingClientRect', zeroRect);
-  method(NodeProto, 'getClientRects', () => []);
+  method(NodeProto, 'getBoundingClientRect', function () {
+    return spatial.rect(this);
+  });
+  method(NodeProto, 'getClientRects', function () {
+    return spatial.enabled ? [spatial.rect(this)] : [];
+  });
   method(NodeProto, 'scrollIntoView', () => {});
   method(NodeProto, 'focus', function () {
     activeElement = this;
@@ -529,9 +600,23 @@
   method(NodeProto, 'submit', function () {
     dispatchEvent.call(this, new Event('submit', { bubbles: true, cancelable: true }));
   });
-  for (const p of ['offsetWidth', 'offsetHeight', 'clientWidth', 'clientHeight',
-                   'scrollWidth', 'scrollHeight', 'scrollTop', 'scrollLeft',
-                   'offsetTop', 'offsetLeft']) {
+  // Sizes follow the same rule as rectangles: zero for the page, and the
+  // synthetic tile for a client that is measuring. A client clips a click
+  // point to the document's own size, so that one has to cover the tiles.
+  const sized = (pick) =>
+    function () {
+      if (!spatial.enabled) return 0;
+      const root = keyOf(this) === keyOf(document) || this.tagName === 'HTML' || this.tagName === 'BODY';
+      const [w, h] = root ? spatial.extent() : [spatial.rect(this).width, spatial.rect(this).height];
+      return pick(w, h);
+    };
+  for (const p of ['offsetWidth', 'clientWidth', 'scrollWidth']) {
+    define(NodeProto, p, { get: sized((w) => w), set: () => {} });
+  }
+  for (const p of ['offsetHeight', 'clientHeight', 'scrollHeight']) {
+    define(NodeProto, p, { get: sized((_, h) => h), set: () => {} });
+  }
+  for (const p of ['scrollTop', 'scrollLeft', 'offsetTop', 'offsetLeft']) {
     define(NodeProto, p, { get: () => 0, set: () => {} });
   }
   define(NodeProto, 'offsetParent', { get: () => null });
@@ -584,9 +669,53 @@
     get() {
       let n = this;
       while (n.parentNode) n = n.parentNode;
-      return n === document.documentElement || n === document;
+      // Two handles for one node are distinct objects, so `===` on the handles
+      // answers "not connected" for everything. Compare arena ids instead.
+      return keyOf(n) === keyOf(document) || keyOf(n) === keyOf(document.documentElement);
     },
   });
+
+  // The DOM interface names, as `instanceof` targets. Nodes come from the
+  // document and none of these can be constructed, but scripts branch on them
+  // constantly and a missing global is a ReferenceError that stops a script
+  // dead. Membership is decided by what a node is, because handles share one
+  // prototype and a prototype chain could not tell them apart.
+  const domInterface = (name, holds) => {
+    const ctor = function () {
+      throw new TypeError(`Illegal constructor: ${name}`);
+    };
+    define(ctor, 'name', { value: name });
+    define(ctor, Symbol.hasInstance, { value: holds });
+    ctor.prototype = NodeProto;
+    globalThis[name] = ctor;
+  };
+  const isType = (type) => (v) => !!v && v.nodeType === type;
+  domInterface('Element', isType(1));
+  domInterface('HTMLElement', isType(1));
+  domInterface('Text', isType(3));
+  domInterface('Comment', isType(8));
+  domInterface('Document', isType(9));
+  domInterface('HTMLDocument', isType(9));
+  domInterface('DocumentFragment', isType(11));
+  // Nothing here parses SVG into SVG-aware nodes, so nothing is one.
+  domInterface('SVGElement', () => false);
+  for (const [name, tag] of Object.entries({
+    HTMLAnchorElement: 'A', HTMLButtonElement: 'BUTTON', HTMLFormElement: 'FORM',
+    HTMLImageElement: 'IMG', HTMLInputElement: 'INPUT', HTMLSelectElement: 'SELECT',
+    HTMLTextAreaElement: 'TEXTAREA', HTMLScriptElement: 'SCRIPT',
+  })) {
+    domInterface(name, (v) => !!v && v.nodeType === 1 && v.tagName === tag);
+  }
+
+  // The nodeType constants, which scripts compare against by name.
+  for (const [name, value] of Object.entries({
+    ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
+    PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
+    DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+  })) {
+    define(Node, name, { value });
+    define(NodeProto, name, { value });
+  }
 
   // -- document ------------------------------------------------------------
 
@@ -857,7 +986,42 @@
       observe() {} unobserve() {} disconnect() {}
       takeRecords() { return []; }
     };
-  globalThis.IntersectionObserver = inertObserver({ root: null, rootMargin: '0px', thresholds: [0] });
+  // An intersection cannot be computed without layout, but an observer that
+  // never calls back is worse than one that answers "not visible": scripts
+  // await that callback, and a CDP client asks whether an element is in the
+  // viewport before it clicks. One record is delivered per observed target,
+  // reporting what this engine does know — an element is visible exactly when
+  // the spatial index has given it a box.
+  globalThis.IntersectionObserver = class IntersectionObserver {
+    constructor(cb) {
+      this._cb = cb;
+      this.root = null;
+      this.rootMargin = '0px';
+      this.thresholds = [0];
+    }
+    observe(target) {
+      setTimeout(() => {
+        const seen = spatial.enabled;
+        const rect = seen ? spatial.rect(target) : zeroRect();
+        try {
+          this._cb([{
+            target,
+            time: native.now(),
+            isIntersecting: seen,
+            intersectionRatio: seen ? 1 : 0,
+            boundingClientRect: rect,
+            intersectionRect: seen ? rect : zeroRect(),
+            rootBounds: null,
+          }], this);
+        } catch (e) {
+          native.record_error('IntersectionObserver', String((e && e.stack) || e));
+        }
+      }, 0);
+    }
+    unobserve() {}
+    disconnect() {}
+    takeRecords() { return []; }
+  };
   globalThis.ResizeObserver = inertObserver();
   globalThis.PerformanceObserver = inertObserver();
 
@@ -1256,6 +1420,207 @@
   globalThis.customElements = {
     define() {}, get: () => undefined,
     whenDefined: () => Promise.resolve(), upgrade() {},
+  };
+
+  // -- a synthetic spatial index -------------------------------------------
+
+  // A CDP client does not click a selector. It reads an element's rectangle,
+  // takes the centre point, and sends those coordinates back as a mouse event.
+  // Without layout every rectangle is the same zero-sized box at the origin, so
+  // every centre is (0, 0) and a click can never say which element it meant.
+  //
+  // So elements are handed tiles from an imaginary grid, one each, on first
+  // request: unique, non-zero, and remembered, so a coordinate maps back to the
+  // element it came from. This is a coordinate registry and nothing more — the
+  // tiles carry no information about where anything really sits on a page, and
+  // they are handed out in the order elements are asked about rather than in
+  // document order.
+  //
+  // Only a client measuring gets one. The page's own scripts keep seeing the
+  // zeros they see everywhere else, so a page that branches on
+  // `rect.width === 0` behaves exactly as it does with no client attached.
+  const spatial = (() => {
+    const TILE_W = 100;
+    const TILE_H = 20;
+    // How many client measurements are in progress. Nothing is measured
+    // outside one, so the page's own scripts never see a box.
+    let asking = 0;
+    let next = 0;
+    const index = new Map();
+    const nodes = new Map();
+    const columns = () => Math.max(1, Math.floor(innerWidth / TILE_W));
+    const tile = (i) => {
+      const left = (i % columns()) * TILE_W;
+      const top = Math.floor(i / columns()) * TILE_H;
+      return {
+        x: left, y: top, left, top,
+        right: left + TILE_W, bottom: top + TILE_H,
+        width: TILE_W, height: TILE_H,
+        toJSON() { return { ...this }; },
+      };
+    };
+    return {
+      get enabled() { return asking > 0; },
+      // Measurement is counted rather than toggled, so one client asking
+      // inside another's question cannot end it early.
+      open() { asking += 1; },
+      close() { asking = Math.max(0, asking - 1); },
+      measuring(f) {
+        asking += 1;
+        try {
+          return f();
+        } finally {
+          asking -= 1;
+        }
+      },
+      rect(node) {
+        if (asking === 0 || !node) return zeroRect();
+        const key = keyOf(node);
+        let i = index.get(key);
+        if (i === undefined) {
+          i = next++;
+          index.set(key, i);
+          nodes.set(i, node);
+        }
+        return tile(i);
+      },
+      at(x, y) {
+        const cols = columns();
+        const col = Math.floor(x / TILE_W);
+        const row = Math.floor(y / TILE_H);
+        if (col < 0 || col >= cols || row < 0) return null;
+        return nodes.get(row * cols + col) ?? null;
+      },
+      // How much of the imaginary viewport is in use. A client clamps a click
+      // point to the layout viewport it was told about and drops it if that
+      // leaves no area, so the reported size has to cover the tiles handed out.
+      extent() {
+        return [columns() * TILE_W, Math.max(1, Math.ceil(next / columns())) * TILE_H];
+      },
+    };
+  })();
+
+  /// Bracket a client's own evaluation, which is the only thing that measures.
+  globalThis.__mar_layout_client = function (on) {
+    if (on) spatial.open();
+    else spatial.close();
+    return spatial.enabled;
+  };
+
+  globalThis.__mar_layout_extent = function () {
+    return spatial.extent();
+  };
+
+  /// The tile assigned to a node, assigning one if this is the first ask.
+  globalThis.__mar_layout_rect = function (id) {
+    const node = native.node_by_id(id);
+    if (!node) return null;
+    const r = spatial.measuring(() => spatial.rect(node));
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  };
+
+  // -- synthetic input -----------------------------------------------------
+
+  const MODIFIER = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
+  const modifierInit = (mask) => ({
+    altKey: !!(mask & MODIFIER.alt),
+    ctrlKey: !!(mask & MODIFIER.ctrl),
+    metaKey: !!(mask & MODIFIER.meta),
+    shiftKey: !!(mask & MODIFIER.shift),
+  });
+
+  /// Dispatch a mouse event at a point, on whichever element owns that tile.
+  ///
+  /// Returns the element's node id, or 0 when the point belongs to no element.
+  globalThis.__mar_input_mouse = function (type, x, y, button, clickCount, modifiers) {
+    const target = spatial.at(x, y);
+    if (!target) return 0;
+    const buttons = { left: 1, right: 2, middle: 4 };
+    const init = {
+      bubbles: true, cancelable: true, composed: true,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      detail: clickCount || 0,
+      button: button === 'right' ? 2 : button === 'middle' ? 1 : 0,
+      buttons: buttons[button] ?? 0,
+      ...modifierInit(modifiers),
+    };
+    const fire = (name) =>
+      dispatchEvent.call(target, new MouseEvent(name, init));
+
+    if (type === 'mouseMoved') {
+      fire('mousemove');
+    } else if (type === 'mousePressed') {
+      if (typeof target.focus === 'function') target.focus();
+      fire('mousedown');
+    } else if (type === 'mouseReleased') {
+      fire('mouseup');
+      if (init.button === 0) {
+        // A browser runs the element's activation behaviour before the click
+        // event reaches any listener, so a handler reading `checked` sees the
+        // new state. Following a link is not part of it: there is nothing to
+        // navigate to from here.
+        if (target.tagName === 'INPUT') {
+          const kind = (target.getAttribute('type') || '').toLowerCase();
+          if (kind === 'checkbox') target.checked = !target.checked;
+          else if (kind === 'radio') target.checked = true;
+        }
+        fire('click');
+      }
+    } else if (type === 'mouseWheel') {
+      fire('wheel');
+    }
+    return target.marNodeId ?? 0;
+  };
+
+  /// Dispatch a key event at the focused element, editing it when it takes text.
+  globalThis.__mar_input_key = function (type, key, code, text, modifiers) {
+    const target = document.activeElement;
+    if (!target) return 0;
+    const init = {
+      bubbles: true, cancelable: true, composed: true,
+      key: String(key || ''), code: String(code || ''),
+      keyCode: (key && key.length === 1 ? key.toUpperCase() : '').charCodeAt(0) || 0,
+      ...modifierInit(modifiers),
+    };
+    const editable = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
+
+    const insert = () => {
+      if (!editable) return;
+      let value = String(target.value ?? '');
+      if (init.key === 'Backspace') value = value.slice(0, -1);
+      else if (init.key === 'Enter') {
+        if (target.tagName !== 'TEXTAREA') {
+          // Enter in a single-line field submits the form. Nothing navigates
+          // here, but the page's own submit handler is what a caller wanted.
+          dispatchEvent.call(target, new Event('change', { bubbles: true }));
+          const form = target.closest('form');
+          if (form) {
+            dispatchEvent.call(form, new Event('submit', { bubbles: true, cancelable: true }));
+          }
+          return;
+        }
+        value += '\n';
+      } else if (text) value += String(text);
+      else return;
+      target.value = value;
+      dispatchEvent.call(target, new InputEvent('input', { bubbles: true, data: text || null }));
+    };
+
+    if (type === 'keyDown' || type === 'rawKeyDown') {
+      const proceed = dispatchEvent.call(target, new KeyboardEvent('keydown', init));
+      if (!proceed) return target.marNodeId ?? 0;
+      if (text) dispatchEvent.call(target, new KeyboardEvent('keypress', init));
+      insert();
+    } else if (type === 'char') {
+      dispatchEvent.call(target, new KeyboardEvent('keypress', init));
+      insert();
+    } else if (type === 'insertText') {
+      // Text put in without pretending any key was pressed.
+      insert();
+    } else if (type === 'keyUp') {
+      dispatchEvent.call(target, new KeyboardEvent('keyup', init));
+    }
+    return target.marNodeId ?? 0;
   };
 
   // -- remote object handles -----------------------------------------------
