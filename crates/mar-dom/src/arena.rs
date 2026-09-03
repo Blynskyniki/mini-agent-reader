@@ -251,6 +251,19 @@ impl Document {
 
     // ---- tree mutation -------------------------------------------------
 
+    /// Would putting `child` under `parent` make a node contain itself?
+    ///
+    /// The general answer is "is `child` an inclusive ancestor of `parent`",
+    /// which costs a walk to the root. A node with no children cannot be an
+    /// ancestor of anything, and that is every node the parser appends, so the
+    /// walk is skipped for the common case.
+    fn would_cycle(&self, parent: NodeId, child: NodeId) -> bool {
+        if child == parent {
+            return true;
+        }
+        self.node(child).first_child.is_some() && self.contains(child, parent)
+    }
+
     /// Detach `id` from its current parent. Safe to call on a detached node.
     pub fn detach(&mut self, id: NodeId) {
         let (parent, prev, next) = {
@@ -275,8 +288,16 @@ impl Document {
     }
 
     /// Append `child` as the last child of `parent`, detaching it first.
+    ///
+    /// Refuses to make a node contain itself. The DOM throws for this and the
+    /// JS layer does too, but the invariant belongs here: a tree spliced into a
+    /// ring makes every later walk — `descendants`, `ancestors`, a selector
+    /// query, serialization — run forever, in native code that no budget or
+    /// interrupt can stop.
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
-        debug_assert_ne!(parent, child, "cannot append a node to itself");
+        if self.would_cycle(parent, child) {
+            return;
+        }
         self.detach(child);
         let last = self.node(parent).last_child;
         match last {
@@ -291,11 +312,30 @@ impl Document {
     }
 
     /// Insert `new_node` immediately before `sibling`.
+    ///
+    /// See [`Document::append`] for why the cycle checks are here.
     pub fn insert_before(&mut self, sibling: NodeId, new_node: NodeId) {
         let Some(parent) = self.node(sibling).parent else {
             return;
         };
+        if self.would_cycle(parent, new_node) {
+            return;
+        }
+        // Moving a node to just before itself is a no-op, but only if the
+        // reference is taken before the node is removed. The DOM spec does
+        // this by advancing the reference to the next sibling first; without
+        // it, the node ends up as its own next sibling and the child list is
+        // a ring.
+        let reference = if new_node == sibling {
+            self.node(sibling).next_sibling
+        } else {
+            Some(sibling)
+        };
         self.detach(new_node);
+        let Some(sibling) = reference else {
+            self.append(parent, new_node);
+            return;
+        };
         let prev = self.node(sibling).prev_sibling;
         match prev {
             Some(p) => self.node_mut(p).next_sibling = Some(new_node),

@@ -136,3 +136,53 @@ fn fragments_import_into_a_live_document() {
     doc.set_text_content(host, "gone");
     assert_eq!(mar_dom::inner_html(&doc, clone), "<b>x</b><i>y</i>");
 }
+
+#[test]
+fn a_node_cannot_be_made_to_contain_itself() {
+    // A tree spliced into a ring is not a wrong answer, it is a hang: every
+    // later walk — a selector query, serialization, `descendants` — runs
+    // forever, in native code no budget or interrupt can stop. Real pages do
+    // this: wikipedia.org reorders its language links with
+    // `parent.insertBefore(node, node)`.
+    let parsed = mar_dom::parse_html("<div id=p><span id=a>A</span><span id=b>B</span></div>");
+    let mut doc = parsed.document;
+    let root = doc.root();
+    let ids: Vec<_> = doc.descendants(root).collect();
+    let find = |doc: &mar_dom::Document, want: &str| {
+        ids.iter()
+            .copied()
+            .find(|&id| {
+                doc.element(id)
+                    .and_then(|e| e.attr(&mar_dom::LocalName::from("id")))
+                    == Some(want)
+            })
+            .expect("node is in the document")
+    };
+    let p = find(&doc, "p");
+    let a = find(&doc, "a");
+
+    // Before itself: a no-op, and the node stays where it was.
+    doc.insert_before(a, a);
+    assert_eq!(doc.children(p).count(), 2, "the child list is intact");
+    assert_eq!(doc.children(p).next(), Some(a), "and in the same order");
+    assert_eq!(doc.node(a).parent, Some(p));
+
+    // Under its own descendant: refused, both ways round.
+    doc.append(a, p);
+    assert_eq!(doc.node(p).parent, Some(root_child(&doc, root)));
+    doc.insert_before(a, p);
+    assert_eq!(doc.children(p).count(), 2);
+
+    // And the walk still terminates, which is the whole point.
+    assert_eq!(doc.descendants(root).count(), ids.len());
+}
+
+/// The element `root`'s subtree hangs from, for asserting a node did not move.
+fn root_child(doc: &mar_dom::Document, root: mar_dom::NodeId) -> mar_dom::NodeId {
+    doc.descendants(root)
+        .find(|&id| {
+            doc.element(id)
+                .is_some_and(|e| e.local_name().as_ref() == "body")
+        })
+        .expect("the parser builds a body")
+}
