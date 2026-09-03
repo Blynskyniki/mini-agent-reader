@@ -457,7 +457,7 @@ fn run(command: Command, policy: Policy, egress: Egress) -> anyhow::Result<()> {
             Ok(())
         }
 
-        Command::Mcp { render } => mcp::serve(trust.client_config(policy), render.to_options()),
+        Command::Mcp { render } => mcp::serve(egress.client_config(policy), render.to_options()),
 
         Command::Serve {
             bind,
