@@ -7,10 +7,12 @@
 mod charset;
 mod policy;
 mod robots;
+pub mod site;
 pub mod tls;
 
 pub use charset::{decode_body, sniff_charset};
 pub use policy::{Policy, PolicyError, ResourceKind};
+pub use site::{is_tracker, registrable_domain, same_site};
 pub use tls::{BundledCert, TrustMode, bundled_certs, load_pem_bundle};
 
 use mar_js::{HttpRequest, HttpResponse, NetworkProvider};
@@ -103,6 +105,18 @@ pub struct HttpClient {
     proxy_error: Option<String>,
     /// `robots.txt` per host, fetched at most once each.
     robots: Arc<std::sync::RwLock<std::collections::HashMap<String, robots::Rules>>>,
+    /// Responses fetched ahead of the page asking for them.
+    ///
+    /// A page's subresources are discovered all at once and then wanted one at
+    /// a time: the script loop asks for the next bundle only after the last one
+    /// arrived, and the module loader blocks in the middle of evaluating the
+    /// module that imported it. Serialised, that is most of the wall clock on a
+    /// page with a hundred of them. Fetching them together up front and serving
+    /// from here turns the wait into one round trip instead of a hundred.
+    ///
+    /// An entry is taken, not copied: nothing is served twice, so this can
+    /// never turn into a cache with its own staleness rules.
+    prefetched: Arc<std::sync::Mutex<std::collections::HashMap<String, Fetched>>>,
 }
 
 impl HttpClient {
@@ -134,6 +148,12 @@ impl HttpClient {
                 .user_agent(&config.user_agent)
                 .tls_config(tls_config)
                 .proxy(proxy.clone())
+                // A 403 or a 503 is where the interesting bodies live: a bot
+                // check, a consent gate, a "you are not welcome" page. Treating
+                // the status as a transport error throws that body away, and
+                // the caller is then told the response had no content type,
+                // which is both wrong and unactionable.
+                .http_status_as_error(false)
                 .build()
                 .into()
         };
@@ -149,7 +169,70 @@ impl HttpClient {
             needs_fallback: Arc::new(std::sync::RwLock::new(Default::default())),
             proxy_error,
             robots: Arc::new(std::sync::RwLock::new(Default::default())),
+            prefetched: Arc::new(std::sync::Mutex::new(Default::default())),
         }
+    }
+
+    /// Fetch `urls` in parallel and hold them for whoever asks next.
+    ///
+    /// Returns how many arrived. Order does not matter: the caller reads them
+    /// back by URL, in whatever order the page turns out to want them.
+    pub fn prefetch(
+        &self,
+        urls: &[String],
+        kind: ResourceKind,
+        referer: &url::Url,
+        concurrency: usize,
+        deadline: std::time::Instant,
+    ) -> usize {
+        let pending: Vec<&String> = {
+            let held = self.prefetched.lock().expect("prefetch lock");
+            urls.iter().filter(|u| !held.contains_key(*u)).collect()
+        };
+        if pending.is_empty() {
+            return 0;
+        }
+        // The client outlives the page, and in a batch it outlives six hundred
+        // of them. A response nobody asked for would otherwise be held for the
+        // whole run, so the table is emptied whenever it grows past what one
+        // page could plausibly still want.
+        if let Ok(mut held) = self.prefetched.lock() {
+            let bytes: usize = held.values().map(|f| f.body.len()).sum();
+            if bytes > MAX_PREFETCH_BYTES {
+                held.clear();
+            }
+        }
+        let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let workers = concurrency.clamp(1, pending.len());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(url) = pending.get(i) else { return };
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        let Ok(fetched) =
+                            self.execute("GET", url, &[], None, kind, Some(referer))
+                        else {
+                            continue;
+                        };
+                        if let Ok(mut held) = self.prefetched.lock() {
+                            held.insert((*url).clone(), fetched);
+                            done.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        done.load(Ordering::Relaxed)
+    }
+
+    /// Take a prefetched response, if one is waiting for this URL.
+    fn take_prefetched(&self, url: &str) -> Option<Fetched> {
+        self.prefetched.lock().ok()?.remove(url)
     }
 
     /// Does this client carry a second trust set to fall back on?
@@ -394,6 +477,15 @@ impl HttpClient {
             source,
         })?;
         self.config.policy.check(&parsed)?;
+        // Already in hand from a parallel prefetch. Still counted: the request
+        // was made, just earlier and alongside its siblings.
+        if method.eq_ignore_ascii_case("GET")
+            && body.is_none()
+            && let Some(fetched) = self.take_prefetched(parsed.as_str())
+        {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            return Ok(fetched);
+        }
         self.requests.fetch_add(1, Ordering::Relaxed);
 
         // ureq 3 exposes typed per-method builders; going through the http
@@ -476,21 +568,6 @@ impl HttpClient {
 
         let mut response = match outcome {
             Ok(r) => r,
-            // A 4xx/5xx is a real response and the body often matters, so it is
-            // returned rather than treated as a transport failure.
-            Err(ureq::Error::StatusCode(code)) => {
-                return Ok(Fetched {
-                    status: code,
-                    status_text: String::new(),
-                    final_url: parsed.to_string(),
-                    headers: Vec::new(),
-                    body: String::new(),
-                    charset: "utf-8".into(),
-                    truncated: false,
-                    raw_prefix: Vec::new(),
-                    raw: None,
-                });
-            }
             Err(e) => return Err(NetError::Transport(e.to_string())),
         };
 
@@ -733,7 +810,16 @@ impl Fetched {
     }
 }
 
+/// How much unclaimed prefetched body the client will hold. One page's worth of
+/// bundles, generously: past that, whatever is in there was not wanted.
+const MAX_PREFETCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Threads a speculative module-graph prefetch may use. Small: it runs
+/// alongside the page's own work, not instead of it.
+const PREFETCH_WORKERS: usize = 6;
+
 /// Adapter that lets a page's `fetch`/XHR reach the network under policy.
+#[derive(Clone)]
 pub struct PageNetwork {
     client: HttpClient,
     /// The page making the request. Used to decide same-origin and to fill in
@@ -751,13 +837,41 @@ impl PageNetwork {
 }
 
 impl NetworkProvider for PageNetwork {
+    /// This seam is thread-safe: the client is an `Arc` of a connection pool
+    /// and a cookie jar, both shared already. So the page's own requests can
+    /// overlap, which is the difference between a hundred latencies added up
+    /// and a hundred latencies overlapped.
+    fn concurrent(&self) -> Option<Arc<dyn mar_js::ConcurrentNetwork>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    /// Warm the client's prefetch table on a thread of its own, so the engine
+    /// that asked does not wait for it.
+    fn prefetch(&self, urls: Vec<String>) {
+        let client = self.client.clone();
+        let referer = self.page_url.clone();
+        std::thread::spawn(move || {
+            client.prefetch(
+                &urls,
+                ResourceKind::Script,
+                &referer,
+                PREFETCH_WORKERS,
+                std::time::Instant::now() + std::time::Duration::from_secs(15),
+            );
+        });
+    }
+
     fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, String> {
         let parsed = url::Url::parse(&request.url).map_err(|e| e.to_string())?;
-        // Same-origin subresource requests are the ones worth serving: they are
-        // how a page loads its own data. Cross-origin ones are usually
-        // analytics and ads, which cost time and change nothing readable.
-        if parsed.origin() != self.page_url.origin() {
-            return Err(format!("cross-origin request blocked: {}", request.url));
+        // A browser sends this request. The reason to refuse any of them is
+        // that the answer cannot change what a reader sees, and that is a
+        // property of who is being asked, not of whether the origin matches:
+        // an application on `app.example.com` reads its data from
+        // `api.example.com`, and refusing that leaves the page blank.
+        let host = parsed.host_str().unwrap_or_default();
+        let page_host = self.page_url.host_str().unwrap_or_default();
+        if !crate::site::same_site(host, page_host) && crate::site::is_tracker(host) {
+            return Err(format!("tracker request skipped: {}", request.url));
         }
         let headers: Vec<(String, String)> = request.headers.clone();
         let fetched = self
@@ -779,6 +893,12 @@ impl NetworkProvider for PageNetwork {
             headers: fetched.headers,
             body: fetched.body,
         })
+    }
+}
+
+impl mar_js::ConcurrentNetwork for PageNetwork {
+    fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, String> {
+        NetworkProvider::fetch(self, request)
     }
 }
 

@@ -3,9 +3,9 @@
 use mar_dom::{Document, LocalName, NodeId, StrTendril};
 use mar_extract::{MarkdownOptions, Reading};
 use mar_js::{Limits, Page};
-use mar_net::{ClientConfig, HttpClient, PageNetwork};
+use mar_net::{ClientConfig, HttpClient, PageNetwork, ResourceKind};
 use serde::Serialize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use url::Url;
 
 /// How to handle one page.
@@ -72,6 +72,10 @@ pub struct RenderReport {
     /// Set when the response looks like a refusal rather than a page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// True when the article was taken from the server's markup because the
+    /// page's own scripts left less behind than they replaced.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub scripts_emptied_the_page: bool,
 }
 
 /// A rendered page plus what it cost.
@@ -80,6 +84,13 @@ pub struct Rendered {
     pub report: RenderReport,
     /// HTML after scripts ran.
     pub html: String,
+    /// The document as the server sent it, before any script touched it.
+    ///
+    /// Kept because a client render can produce *less* than the markup it
+    /// replaced: a server-rendered page whose hydration half-fails ends up
+    /// emptier than the HTML that arrived, and a reader should never come away
+    /// with less than the server was willing to give it.
+    pub source_html: String,
 }
 
 pub struct Renderer {
@@ -123,11 +134,17 @@ impl Renderer {
         let mut target = url.to_owned();
         let mut hops = 0usize;
         let mut seen = vec![(target.clone(), self.client.cookie_fingerprint(&target))];
+        // Every hop is a whole page, so without this the budget multiplies by
+        // the hop limit and `--timeout-ms 15000` means a minute.
+        let deadline = Instant::now() + Duration::from_millis(options.limits.wall_ms);
 
         loop {
             let (value, requested) = once(&target)?;
 
-            if !options.follow_client_navigation || hops >= MAX_NAVIGATION_HOPS {
+            if !options.follow_client_navigation
+                || hops >= MAX_NAVIGATION_HOPS
+                || Instant::now() >= deadline
+            {
                 return Ok(value);
             }
             let Some(next) = requested else {
@@ -184,6 +201,19 @@ impl Renderer {
         // A URL is not a promise about content type. Handing a PDF or an image
         // to the HTML parser yields a document of mojibake that reads like text
         // and is not, so say plainly what arrived instead.
+        // A refusal first: a bot check answers 403 with sixty bytes and no
+        // content type, and reporting that as "this is not HTML" sends the
+        // caller looking for a converter instead of at the wall in front of
+        // them.
+        if let Some(reason) = Self::describe_block(fetched.status, fetched.body.len())
+            && !fetched.is_readable_as_html()
+        {
+            return Err(anyhow::anyhow!(
+                "{} returned {}",
+                fetched.final_url,
+                reason
+            ));
+        }
         if !fetched.is_readable_as_html() {
             return Err(anyhow::anyhow!(
                 "{} is {}, not HTML ({}). This tool reads HTML pages; \
@@ -222,6 +252,7 @@ impl Renderer {
             requested_navigation: None,
             truncated: false,
             blocked: None,
+            scripts_emptied_the_page: false,
         };
 
         if !options.javascript {
@@ -230,18 +261,52 @@ impl Renderer {
             return Ok(Rendered {
                 document,
                 report,
+                source_html: fetched.body,
                 html,
             });
         }
 
         let render_start = Instant::now();
+        // The page's budget covers fetching its code as well as running it.
+        // Without that, a page with thirty scripts on a slow CDN spends the
+        // whole timeout downloading and is killed before a line of it runs,
+        // and the caller gets nothing instead of a partial render.
+        let budget = Duration::from_millis(options.limits.wall_ms);
+        let fetch_deadline = started + budget.mul_f32(SCRIPT_FETCH_SHARE);
         if options.external_scripts {
-            report.scripts_inlined =
-                self.inline_external_scripts(&mut document, &base, options.max_external_scripts);
+            // Everything the page has already told us it will want, fetched at
+            // once. The scripts are needed in document order and the modules
+            // one at a time from inside the engine, but neither of those is a
+            // reason to *ask* for them one at a time.
+            let wanted = self.subresources_to_prefetch(&document, &base);
+            if !wanted.is_empty() {
+                self.client.prefetch(
+                    &wanted,
+                    ResourceKind::Script,
+                    &base,
+                    PREFETCH_CONCURRENCY,
+                    fetch_deadline,
+                );
+            }
+            report.scripts_inlined = self.inline_external_scripts(
+                &mut document,
+                &base,
+                options.max_external_scripts,
+                fetch_deadline,
+            );
         }
 
+        // Whatever is left of the budget is what the scripts get.
+        let limits = Limits {
+            wall_ms: options
+                .limits
+                .wall_ms
+                .saturating_sub(started.elapsed().as_millis() as u64)
+                .max(MIN_SCRIPT_MS),
+            ..options.limits.clone()
+        };
         let net = PageNetwork::new(self.client.clone(), &base);
-        let mut page = Page::with_document(document, base.clone(), options.limits.clone(), net)
+        let mut page = Page::with_document(document, base.clone(), limits, net)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         // A script that reads `document.cookie` expects to find what the server
         // already set, and one that writes it expects the next request to carry
@@ -280,6 +345,7 @@ impl Renderer {
         Ok(Rendered {
             document,
             report,
+            source_html: fetched.body,
             html: outcome.html,
         })
     }
@@ -316,6 +382,21 @@ impl Renderer {
             markdown.base_url = Url::parse(&report.final_url).ok();
         }
         let mut reading = mar_extract::read(&rendered.document, &markdown);
+
+        // A settled page with nothing in it is usually a client render that
+        // failed part way: React hydrates, throws somewhere inside, and leaves
+        // a root emptier than the server-rendered markup it replaced. The
+        // markup that arrived is still there to read, so read that instead.
+        // Only when the settled page came out near-empty, so the normal path
+        // pays nothing.
+        if options.javascript && reading.length < EMPTY_ARTICLE_CHARS {
+            let original = mar_dom::parse_html(&rendered.source_html).document;
+            let from_source = mar_extract::read(&original, &markdown);
+            if from_source.length > reading.length {
+                reading = from_source;
+                report.scripts_emptied_the_page = true;
+            }
+        }
         report.extract_ms = extract_start.elapsed().as_millis();
         report.total_ms += report.extract_ms;
 
@@ -341,6 +422,7 @@ impl Renderer {
         expression: &str,
         options: &RenderOptions,
     ) -> anyhow::Result<String> {
+        let started = Instant::now();
         self.following_navigation(url, options, |target| {
             let fetched = self.client.get_document(target)?;
             let base = Url::parse(&fetched.final_url)
@@ -349,11 +431,26 @@ impl Renderer {
 
             let mut document = mar_dom::parse_html(&fetched.body).document;
             if options.javascript && options.external_scripts {
-                self.inline_external_scripts(&mut document, &base, options.max_external_scripts);
+                self.inline_external_scripts(
+                    &mut document,
+                    &base,
+                    options.max_external_scripts,
+                    started
+                        + Duration::from_millis(options.limits.wall_ms)
+                            .mul_f32(SCRIPT_FETCH_SHARE),
+                );
             }
 
             let net = PageNetwork::new(self.client.clone(), &base);
-            let mut page = Page::with_document(document, base.clone(), options.limits.clone(), net)
+            let limits = Limits {
+                wall_ms: options
+                    .limits
+                    .wall_ms
+                    .saturating_sub(started.elapsed().as_millis() as u64)
+                    .max(MIN_SCRIPT_MS),
+                ..options.limits.clone()
+            };
+            let mut page = Page::with_document(document, base.clone(), limits, net)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             page.state().borrow_mut().cookies = self.client.cookies_for(base.as_str());
 
@@ -383,7 +480,13 @@ impl Renderer {
     /// The engine deliberately does not fetch anything itself, so this is where
     /// the decision to load a page's own code is made and bounded. Returns how
     /// many scripts were inlined.
-    fn inline_external_scripts(&self, doc: &mut Document, base: &Url, max: usize) -> usize {
+    fn inline_external_scripts(
+        &self,
+        doc: &mut Document,
+        base: &Url,
+        max: usize,
+        deadline: Instant,
+    ) -> usize {
         let targets: Vec<(NodeId, String, bool)> = doc
             .descendants(doc.root())
             .filter_map(|id| {
@@ -405,18 +508,23 @@ impl Renderer {
             .collect();
 
         let mut inlined = 0;
-        for (id, src, module) in targets {
+        for (id, src, _module) in targets {
+            // Out of time: the scripts already in hand still run, which is
+            // most of the page's own code because the page lists it first.
+            if Instant::now() >= deadline {
+                break;
+            }
             let Ok(absolute) = base.join(&src) else {
                 continue;
             };
-            // Third-party classic scripts are almost always analytics and tag
-            // managers: slow to fetch, and they add nothing a reader wants.
-            //
-            // A cross-origin *module* is a different animal. An application
-            // shipping native modules keeps its bundle on a CDN, so the same
-            // rule that skips the tag manager also skips the whole
-            // application, and the page renders as an empty shell.
-            if absolute.origin() != base.origin() && !module {
+            // What is worth fetching is the application's own code, wherever it
+            // is hosted, and what is not is somebody's measurement. Those are
+            // different questions, and the origin answers neither: a bundle on
+            // `static.example.com` and a tag manager on the page's own origin
+            // both come out on the wrong side of an origin rule.
+            let host = absolute.host_str().unwrap_or_default();
+            let page_host = base.host_str().unwrap_or_default();
+            if !mar_net::same_site(host, page_host) && mar_net::is_tracker(host) {
                 continue;
             }
             let Ok(fetched) = self.client_execute(&absolute, base) else {
@@ -425,12 +533,10 @@ impl Renderer {
             if !fetched.ok() || fetched.body.trim().is_empty() {
                 continue;
             }
-            // The body goes in beside the `src` rather than replacing it: a
-            // module's own imports resolve against its URL, so the engine has
-            // to be able to see where this came from.
-            if !module && let Some(el) = doc.element_mut(id) {
-                el.remove_attr(&LocalName::from("src"));
-            }
+            // The body goes in beside the `src` rather than replacing it. A
+            // module's own imports resolve against its URL, and a bundler reads
+            // `document.currentScript.src` to work out where its own chunks
+            // live; both need the script to remember where it came from.
             let text = doc.create(mar_dom::NodeData::Text(StrTendril::from(fetched.body)));
             doc.append(id, text);
             inlined += 1;
@@ -441,7 +547,73 @@ impl Renderer {
     fn client_execute(&self, url: &Url, referer: &Url) -> anyhow::Result<mar_net::Fetched> {
         Ok(self.client.get_script(url.as_str(), referer)?)
     }
+
+    /// Every subresource URL the document names before a line of it has run.
+    ///
+    /// `<script src>` is the page's own code. `modulepreload` is a bundler
+    /// telling us the whole module graph in advance — Vite and Next both emit
+    /// one per chunk — which is exactly the list the engine would otherwise
+    /// discover one blocking import at a time.
+    fn subresources_to_prefetch(&self, doc: &Document, base: &Url) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in doc.descendants(doc.root()) {
+            let Some(el) = doc.element(id) else { continue };
+            let url = match el.local_name().as_ref() {
+                "script" => el.attr(&LocalName::from("src")),
+                "link" => {
+                    let rel = el.attr(&LocalName::from("rel")).unwrap_or_default();
+                    let as_script = el
+                        .attr(&LocalName::from("as"))
+                        .is_some_and(|a| a.eq_ignore_ascii_case("script"));
+                    let wanted = rel.eq_ignore_ascii_case("modulepreload")
+                        || (rel.eq_ignore_ascii_case("preload") && as_script);
+                    wanted.then(|| el.attr(&LocalName::from("href"))).flatten()
+                }
+                _ => None,
+            };
+            let Some(url) = url else { continue };
+            let Ok(absolute) = base.join(url) else { continue };
+            let host = absolute.host_str().unwrap_or_default();
+            if !mar_net::same_site(host, base.host_str().unwrap_or_default())
+                && mar_net::is_tracker(host)
+            {
+                continue;
+            }
+            let absolute = absolute.to_string();
+            if seen.insert(absolute.clone()) {
+                out.push(absolute);
+            }
+            if out.len() >= MAX_PREFETCH {
+                break;
+            }
+        }
+        out
+    }
 }
+
+/// Subresource fetches in flight at once. Chosen to be well under what a
+/// browser opens to one origin in total, since these all go to a handful of
+/// hosts and the point is to overlap latency, not to flood anyone.
+const PREFETCH_CONCURRENCY: usize = 8;
+
+/// A ceiling on the prefetch list. A page listing more chunks than this is
+/// going to be cut off by the budget long before the list runs out.
+const MAX_PREFETCH: usize = 96;
+
+/// How much of a page's budget may go on fetching its scripts before the rest
+/// has to be left unfetched. Half: enough for a dozen bundles on a normal
+/// connection, and it guarantees the other half to actually running them.
+const SCRIPT_FETCH_SHARE: f32 = 0.5;
+
+/// Below this many characters an article is not an article, and the markup the
+/// server sent is worth a second look. Generous on purpose: the cost of the
+/// check is one extra parse on a page that produced nothing anyway.
+const EMPTY_ARTICLE_CHARS: usize = 500;
+
+/// A floor for the script phase, for a page whose fetch overran the budget
+/// anyway. Long enough for an inline script to render a server-built page.
+const MIN_SCRIPT_MS: u64 = 500;
 
 /// A page may chain refreshes; a couple of hops is generous and bounds the work.
 const MAX_META_REFRESH_HOPS: usize = 3;
