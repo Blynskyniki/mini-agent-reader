@@ -41,6 +41,12 @@ pub struct ClientConfig {
     pub proxy: Option<String>,
     /// Ask each host's `robots.txt` before fetching a document from it.
     pub obey_robots: bool,
+    /// Keep the undecoded body alongside the decoded one.
+    ///
+    /// Off by default: it doubles what a response costs in memory, and only a
+    /// caller that wants the bytes back verbatim — an image, a JSON API, a
+    /// script — has any use for them.
+    pub keep_raw: bool,
 }
 
 impl Default for ClientConfig {
@@ -56,6 +62,7 @@ impl Default for ClientConfig {
             extra_roots: Vec::new(),
             proxy: None,
             obey_robots: false,
+            keep_raw: false,
         }
     }
 }
@@ -481,6 +488,7 @@ impl HttpClient {
                     charset: "utf-8".into(),
                     truncated: false,
                     raw_prefix: Vec::new(),
+                    raw: None,
                 });
             }
             Err(e) => return Err(NetError::Transport(e.to_string())),
@@ -525,6 +533,7 @@ impl HttpClient {
         // Keep a small window of the original bytes: the decoded text cannot
         // be used to recognise a binary format.
         let raw_prefix = raw[..raw.len().min(1024)].to_vec();
+        let kept = self.config.keep_raw.then(|| raw.to_vec());
         let (body, charset) = decode_body(raw, &content_type);
 
         Ok(Fetched {
@@ -536,6 +545,7 @@ impl HttpClient {
             charset,
             truncated,
             raw_prefix,
+            raw: kept,
         })
     }
 }
@@ -653,6 +663,8 @@ pub struct Fetched {
     pub truncated: bool,
     /// First bytes of the undecoded body, for sniffing the real type.
     raw_prefix: Vec<u8>,
+    /// The whole undecoded body, when the client was asked to keep it.
+    pub raw: Option<Vec<u8>>,
 }
 
 impl Fetched {
@@ -800,7 +812,10 @@ mod cookie_tests {
     #[test]
     fn a_domain_cookie_reaches_a_subdomain() {
         let c = client();
-        c.apply_script_cookie("https://www.example.com/", "id=7; domain=example.com; path=/");
+        c.apply_script_cookie(
+            "https://www.example.com/",
+            "id=7; domain=example.com; path=/",
+        );
         assert_eq!(c.cookies_for("https://api.example.com/"), "id=7");
     }
 
@@ -818,7 +833,10 @@ mod cookie_tests {
 
     #[test]
     fn candidates_walk_up_the_host_and_the_path() {
-        assert_eq!(domain_candidates("www.gosuslugi.ru"), ["www.gosuslugi.ru", "gosuslugi.ru"]);
+        assert_eq!(
+            domain_candidates("www.gosuslugi.ru"),
+            ["www.gosuslugi.ru", "gosuslugi.ru"]
+        );
         assert_eq!(domain_candidates("example.com"), ["example.com"]);
         assert_eq!(path_candidates("/a/b"), ["/a/b", "/a", "/"]);
         assert_eq!(path_candidates("/"), ["/"]);

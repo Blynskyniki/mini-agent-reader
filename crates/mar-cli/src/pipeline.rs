@@ -123,7 +123,10 @@ impl Renderer {
             // the second fetch is a different request carrying a different jar.
             // What makes a repeat pointless is repeating it unchanged.
             let fingerprint = self.client.cookie_fingerprint(&next);
-            if seen.iter().any(|(url, seen_at)| *url == next && *seen_at == fingerprint) {
+            if seen
+                .iter()
+                .any(|(url, seen_at)| *url == next && *seen_at == fingerprint)
+            {
                 return Ok(rendered);
             }
             seen.push((next.clone(), fingerprint));

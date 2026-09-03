@@ -4,10 +4,11 @@ mod pipeline;
 mod server;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use mar_dom::LocalName;
 use mar_extract::MarkdownOptions;
 use mar_js::Limits;
 use mar_net::Policy;
-use pipeline::{RenderOptions, Renderer};
+use pipeline::{RenderOptions, Rendered, Renderer};
 use std::io::Write;
 use std::time::Duration;
 
@@ -110,9 +111,42 @@ enum Command {
         url: String,
         #[command(flatten)]
         render: RenderArgs,
+        /// What to print.
+        #[arg(long, value_enum, default_value_t = Dump::Html)]
+        dump: Dump,
+        /// Write to this file instead of standard output.
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<std::path::PathBuf>,
         /// Print the timing and cost report to stderr.
         #[arg(long)]
         report: bool,
+    },
+
+    /// Read many pages at once, one JSON object per line.
+    ///
+    /// The per-page cost of starting a process disappears here: the engine
+    /// starts once and every worker reuses its connections and cookie jar.
+    Scrape {
+        /// URLs to read. `-` reads them from standard input, one per line.
+        #[arg(required = true, value_name = "URL")]
+        urls: Vec<String>,
+        #[command(flatten)]
+        render: RenderArgs,
+        /// Pages rendered at once. Each worker holds one page in memory.
+        #[arg(long, short = 'c', default_value_t = 8)]
+        concurrency: usize,
+        /// What to produce for each page.
+        #[arg(long, value_enum, default_value_t = ScrapeShape::Read)]
+        shape: ScrapeShape,
+        /// With `--shape eval`, the expression to evaluate on every page.
+        #[arg(long, value_name = "JS")]
+        eval: Option<String>,
+        /// Cap each page's Markdown at this many characters.
+        #[arg(long)]
+        max_chars: Option<usize>,
+        /// Do not report progress on stderr.
+        #[arg(long, short)]
+        quiet: bool,
     },
 
     /// Render a page, then evaluate an expression in it and print the JSON.
@@ -185,6 +219,35 @@ struct RenderArgs {
     /// Memory ceiling for the JavaScript heap, in megabytes.
     #[arg(long, default_value_t = 64, env = "MAR_MEMORY_MB")]
     memory_mb: usize,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Dump {
+    /// The document after scripts ran.
+    Html,
+    /// Its visible text.
+    Text,
+    /// Every link, as `text<TAB>href`, resolved absolute.
+    Links,
+    /// Every subresource the settled page refers to, one JSON object per line.
+    Assets,
+    /// The response body byte for byte, with no parsing at all.
+    ///
+    /// The only mode that works on something that is not a page: an image, a
+    /// JSON API, a script. Nothing is decoded, so redirect it to a file.
+    Original,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum ScrapeShape {
+    /// The article as Markdown, with its metadata.
+    Read,
+    /// The document after scripts ran.
+    Html,
+    /// The result of `--eval` on each page.
+    Eval,
+    /// Every link on the page.
+    Links,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -316,15 +379,59 @@ fn run(command: Command, policy: Policy, egress: Egress) -> anyhow::Result<()> {
         Command::Fetch {
             url,
             render,
+            dump,
+            output,
             report: want_report,
         } => {
+            // `original` is the one mode that never parses anything, so it is
+            // also the only one that works on a URL that is not a page.
+            if dump == Dump::Original {
+                let mut config = egress.client_config(policy);
+                config.keep_raw = true;
+                let fetched = mar_net::HttpClient::new(config).get_document(&url)?;
+                let bytes = fetched.raw.unwrap_or_else(|| fetched.body.into_bytes());
+                return write_out(output.as_deref(), &bytes);
+            }
+
             let rendered =
                 Renderer::new(egress.client_config(policy)).render(&url, &render.to_options())?;
-            print!("{}", rendered.html);
+            let text = match dump {
+                Dump::Html => rendered.html.clone(),
+                Dump::Text => visible_text(&rendered),
+                Dump::Links => links_of(&rendered),
+                Dump::Assets => assets_of(&rendered),
+                Dump::Original => unreachable!("handled above"),
+            };
+            write_out(output.as_deref(), text.as_bytes())?;
             if want_report {
                 eprintln!("{}", serde_json::to_string_pretty(&rendered.report)?);
             }
             Ok(())
+        }
+
+        Command::Scrape {
+            urls,
+            render,
+            concurrency,
+            shape,
+            eval,
+            max_chars,
+            quiet,
+        } => {
+            let mut options = render.to_options();
+            options.markdown = MarkdownOptions {
+                max_chars,
+                ..MarkdownOptions::default()
+            };
+            scrape(
+                collect_urls(urls)?,
+                Renderer::new(egress.client_config(policy)),
+                options,
+                concurrency.max(1),
+                shape,
+                eval.as_deref(),
+                quiet,
+            )
         }
 
         Command::Eval {
@@ -419,6 +526,241 @@ fn front_matter(reading: &mar_extract::Reading) -> String {
         out.push_str("low_confidence: true\n");
     }
     out.push_str("---\n\n");
+    out
+}
+
+/// The URL list, with `-` meaning "read them from standard input".
+fn collect_urls(args: Vec<String>) -> anyhow::Result<Vec<String>> {
+    if args.iter().all(|u| u != "-") {
+        return Ok(args);
+    }
+    let mut out = Vec::new();
+    for arg in args {
+        if arg != "-" {
+            out.push(arg);
+            continue;
+        }
+        for line in std::io::read_to_string(std::io::stdin())?.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                out.push(line.to_owned());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read many pages in parallel, one JSON object per line.
+///
+/// Lines come out as pages finish rather than in the order they were given, so
+/// a slow page never holds up the ones behind it. Each line carries its URL.
+fn scrape(
+    urls: Vec<String>,
+    renderer: Renderer,
+    options: RenderOptions,
+    concurrency: usize,
+    shape: ScrapeShape,
+    eval: Option<&str>,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let total = urls.len();
+    let queue = Mutex::new(urls.into_iter());
+    let done = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    // One lock for stdout: a line must not be interleaved with another's.
+    let out = Mutex::new(std::io::stdout());
+    let started = std::time::Instant::now();
+
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency.min(total.max(1)) {
+            scope.spawn(|| {
+                loop {
+                    let Some(url) = queue.lock().expect("queue lock").next() else {
+                        return;
+                    };
+                    let record = scrape_one(&renderer, &url, &options, shape, eval);
+                    if record.get("error").is_some() {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let line = record.to_string();
+                    if let Ok(mut out) = out.lock() {
+                        let _ = writeln!(out, "{line}");
+                        let _ = out.flush();
+                    }
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !quiet {
+                        eprint!("\r{n}/{total} pages");
+                    }
+                }
+            });
+        }
+    });
+
+    if !quiet {
+        let failed = failed.load(Ordering::Relaxed);
+        let ms = started.elapsed().as_millis().max(1);
+        eprintln!(
+            "\r{total} pages in {ms} ms, {:.0}/s, {failed} failed",
+            total as f64 * 1000.0 / ms as f64
+        );
+    }
+    Ok(())
+}
+
+/// One page's line. A failure is a record with an `error`, not a dropped line:
+/// a caller diffing input against output should find every URL it asked for.
+fn scrape_one(
+    renderer: &Renderer,
+    url: &str,
+    options: &RenderOptions,
+    shape: ScrapeShape,
+    eval: Option<&str>,
+) -> serde_json::Value {
+    let outcome = match shape {
+        ScrapeShape::Read => renderer.read(url, options).map(|(reading, report)| {
+            serde_json::json!({
+                "title": reading.metadata.title,
+                "content": reading.content,
+                "length": reading.length,
+                "low_confidence": reading.low_confidence,
+                "report": report,
+            })
+        }),
+        ScrapeShape::Eval => match eval {
+            Some(expression) => renderer.eval(url, expression, options).map(|json| {
+                let value: serde_json::Value =
+                    serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                serde_json::json!({ "value": value })
+            }),
+            None => Err(anyhow::anyhow!("--shape eval needs --eval <expression>")),
+        },
+        ScrapeShape::Html => renderer.render(url, options).map(
+            |rendered| serde_json::json!({ "html": rendered.html, "report": rendered.report }),
+        ),
+        ScrapeShape::Links => renderer.render(url, options).map(|rendered| {
+            let links: Vec<serde_json::Value> = links_of(&rendered)
+                .lines()
+                .filter_map(|line| line.split_once('\t'))
+                .map(|(text, href)| serde_json::json!({ "text": text, "href": href }))
+                .collect();
+            serde_json::json!({ "links": links, "report": rendered.report })
+        }),
+    };
+
+    match outcome {
+        Ok(mut value) => {
+            value["url"] = serde_json::Value::String(url.to_owned());
+            value
+        }
+        Err(e) => serde_json::json!({ "url": url, "error": format!("{e:#}") }),
+    }
+}
+
+/// Write to a file, or to standard output when there is none.
+///
+/// Bytes rather than text: `--dump original` hands back whatever the server
+/// sent, and that is frequently not UTF-8 and frequently not a page.
+fn write_out(path: Option<&std::path::Path>, bytes: &[u8]) -> anyhow::Result<()> {
+    match path {
+        Some(path) => Ok(std::fs::write(path, bytes)?),
+        None => {
+            let mut out = std::io::stdout().lock();
+            out.write_all(bytes)?;
+            Ok(out.flush()?)
+        }
+    }
+}
+
+/// The settled page's visible text.
+fn visible_text(rendered: &Rendered) -> String {
+    let doc = &rendered.document;
+    let root = doc.body().unwrap_or_else(|| doc.root());
+    let mut text = doc.text_content(root);
+    text.push('\n');
+    text
+}
+
+/// Every link, as `text<TAB>href`.
+///
+/// Tab separated because a title may contain anything else, and this is meant
+/// to be piped into `cut` as much as read.
+fn links_of(rendered: &Rendered) -> String {
+    let doc = &rendered.document;
+    let base = url::Url::parse(&rendered.report.final_url).ok();
+    let mut out = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in mar_dom::query_selector_all(doc, doc.root(), "a[href]").unwrap_or_default() {
+        let Some(href) = doc
+            .element(node)
+            .and_then(|e| e.attr(&LocalName::from("href")))
+        else {
+            continue;
+        };
+        let resolved = match &base {
+            Some(base) => base.join(href).map(|u| u.to_string()).unwrap_or_default(),
+            None => href.to_owned(),
+        };
+        if resolved.is_empty() || !seen.insert(resolved.clone()) {
+            continue;
+        }
+        let text = doc.text_content(node);
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        out.push_str(&format!("{text}\t{resolved}\n"));
+    }
+    out
+}
+
+/// Every subresource the settled page refers to, one JSON object per line.
+///
+/// Read off the document rather than off the requests we made: most of these
+/// are images, fonts and stylesheets this browser never fetches, and knowing
+/// what a page would pull in is the point.
+fn assets_of(rendered: &Rendered) -> String {
+    // Attribute per element, in the order a browser would discover them.
+    const SOURCES: [(&str, &str, &str); 7] = [
+        ("script[src]", "src", "script"),
+        ("link[href]", "href", "link"),
+        ("img[src]", "src", "image"),
+        ("source[src]", "src", "media"),
+        ("video[src]", "src", "media"),
+        ("audio[src]", "src", "media"),
+        ("iframe[src]", "src", "frame"),
+    ];
+
+    let doc = &rendered.document;
+    let base = url::Url::parse(&rendered.report.final_url).ok();
+    let mut out = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for (selector, attribute, kind) in SOURCES {
+        for node in mar_dom::query_selector_all(doc, doc.root(), selector).unwrap_or_default() {
+            let Some(element) = doc.element(node) else {
+                continue;
+            };
+            let Some(value) = element.attr(&LocalName::from(attribute)) else {
+                continue;
+            };
+            let resolved = match &base {
+                Some(base) => base.join(value).map(|u| u.to_string()).unwrap_or_default(),
+                None => value.to_owned(),
+            };
+            if resolved.is_empty() || !seen.insert(resolved.clone()) {
+                continue;
+            }
+            // `rel` distinguishes a stylesheet from a preload or an icon, and
+            // that is the whole reason a link is worth listing separately.
+            let rel = element.attr(&LocalName::from("rel")).unwrap_or_default();
+            let record = serde_json::json!({
+                "url": resolved,
+                "kind": kind,
+                "rel": (!rel.is_empty()).then_some(rel),
+            });
+            out.push_str(&record.to_string());
+            out.push('\n');
+        }
+    }
     out
 }
 

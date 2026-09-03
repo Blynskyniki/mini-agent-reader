@@ -140,7 +140,10 @@ Disallow: /nope
     #[test]
     fn a_group_naming_us_replaces_the_wildcard_group() {
         let rules = Rules::parse(BODY, "Mozilla/5.0 mar/1.0");
-        assert!(rules.allows("/private"), "the wildcard group no longer applies");
+        assert!(
+            rules.allows("/private"),
+            "the wildcard group no longer applies"
+        );
         assert!(!rules.allows("/nope"));
     }
 
