@@ -543,6 +543,49 @@
     });
   }
 
+  // Event handlers written into the markup.
+  //
+  // `onclick="doThing()"` is a handler, not just an attribute, and a page that
+  // wires its buttons that way is otherwise inert: `fireOn` looks for the
+  // property, and until it exists nothing connects the two. The source is
+  // compiled on first read and kept, because a handler is one function object
+  // across reads — a page that removes the listener it just read must get the
+  // same one back.
+  const compiled = new Map();
+  for (const prop of [
+    'onclick', 'ondblclick', 'onchange', 'oninput', 'onsubmit', 'onreset',
+    'onload', 'onerror', 'onfocus', 'onblur',
+    'onkeydown', 'onkeyup', 'onkeypress',
+    'onmousedown', 'onmouseup', 'onmouseover', 'onmouseout', 'onmousemove',
+    'oncontextmenu', 'onscroll', 'ontouchstart', 'ontouchend',
+  ]) {
+    define(NodeProto, prop, {
+      get() {
+        const key = keyOf(this) + ':' + prop;
+        if (compiled.has(key)) return compiled.get(key);
+        const source = this.getAttribute(prop);
+        if (source == null) return null;
+        let handler = null;
+        try {
+          // A browser runs the attribute with the element as `this` and the
+          // event in scope, and swallows a syntax error rather than failing
+          // the whole document.
+          const body = new Function('event', source);
+          handler = function (event) {
+            return body.call(this, event);
+          };
+        } catch (e) {
+          native.record_error(prop, String((e && e.message) || e));
+        }
+        compiled.set(key, handler);
+        return handler;
+      },
+      set(v) {
+        compiled.set(keyOf(this) + ':' + prop, typeof v === 'function' ? v : null);
+      },
+    });
+  }
+
   // Boolean attributes.
   for (const prop of ['disabled', 'checked', 'readOnly', 'required', 'hidden', 'selected']) {
     const attr = dashed(prop);

@@ -94,8 +94,16 @@ pub fn extent(target: &mut Target) -> Option<(u32, u32)> {
 
 pub fn dispatch_mouse(target: &mut Target, command: &Command) -> Result<Value, String> {
     let kind = command.str_param("type").unwrap_or("mouseMoved");
-    let x = command.params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-    let y = command.params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    let x = command
+        .params
+        .get("x")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let y = command
+        .params
+        .get("y")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let button = command.str_param("button").unwrap_or("none");
     let clicks = command.int_param("clickCount").unwrap_or(0);
     let modifiers = command.int_param("modifiers").unwrap_or(0);
@@ -163,7 +171,10 @@ pub fn insert_text(target: &mut Target, command: &Command) -> Result<Value, Stri
     let text = command.str_param("text").unwrap_or("");
     call(
         target,
-        &format!("__mar_input_key(\"insertText\", \"\", \"\", {}, 0)", quoted(text)),
+        &format!(
+            "__mar_input_key(\"insertText\", \"\", \"\", {}, 0)",
+            quoted(text)
+        ),
     )?;
     target.refresh();
     Ok(json!({}))

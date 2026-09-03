@@ -275,11 +275,7 @@ impl Desk {
             return Outgoing::error(id, session, "no request is paused");
         };
         if paused.interception_id != wanted {
-            return Outgoing::error(
-                id,
-                session,
-                format!("no paused request with id '{wanted}'"),
-            );
+            return Outgoing::error(id, session, format!("no paused request with id '{wanted}'"));
         }
 
         let verdict = match command.method.as_str() {
@@ -492,7 +488,12 @@ fn pump(
 
         let reply = desk.borrow_mut().resolve(&command);
         channel.borrow_mut().send(&reply);
-        if let Some(verdict) = desk.borrow_mut().paused.as_mut().and_then(|p| p.verdict.take()) {
+        if let Some(verdict) = desk
+            .borrow_mut()
+            .paused
+            .as_mut()
+            .and_then(|p| p.verdict.take())
+        {
             return verdict;
         }
     }
@@ -668,7 +669,10 @@ mod tests {
         assert!(glob_matches("a?c", "abc"));
         assert!(!glob_matches("a?c", "ac"));
         // A trailing star may match nothing at all.
-        assert!(glob_matches("https://example.com/*", "https://example.com/"));
+        assert!(glob_matches(
+            "https://example.com/*",
+            "https://example.com/"
+        ));
     }
 
     #[test]

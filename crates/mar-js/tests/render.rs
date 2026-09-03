@@ -234,6 +234,34 @@ fn navigation_is_reported_not_followed() {
 }
 
 #[test]
+fn a_handler_written_into_the_markup_runs() {
+    let out = render(
+        r#"<body>
+             <button id="b" onclick="document.getElementById('out').textContent = 'fired'">go</button>
+             <div id="out">none</div>
+             <script>
+               document.getElementById('b').dispatchEvent(new Event('click', { bubbles: true }));
+             </script>
+           </body>"#,
+    );
+    assert!(
+        out.html.contains(">fired<"),
+        "an onclick attribute is a handler, not just an attribute: {}",
+        out.html
+    );
+}
+
+#[test]
+fn a_broken_handler_attribute_does_not_take_the_page_down() {
+    let out = render(
+        r#"<body><div id="out">still here</div>
+             <button onclick="this is not javascript">x</button>
+           </body>"#,
+    );
+    assert!(out.html.contains("still here"));
+}
+
+#[test]
 fn the_environment_does_not_advertise_itself() {
     let out = render(
         r#"<body><div id="out"></div><script>

@@ -376,7 +376,11 @@ impl PauseChannel for Connection {
 }
 
 /// Drive one CDP session to its end.
-fn run_session(websocket: tungstenite::WebSocket<TcpStream>, config: &CdpConfig, client: HttpClient) {
+fn run_session(
+    websocket: tungstenite::WebSocket<TcpStream>,
+    config: &CdpConfig,
+    client: HttpClient,
+) {
     let salt = format!("{:p}", &websocket);
     let mut browser = Browser::new(client, config.limits.clone(), salt);
     // Chrome always has a page open; a client that calls `pages()` before

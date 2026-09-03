@@ -53,10 +53,13 @@ fn session(url: &str, answers: Vec<Command>) -> (Browser, Rc<RefCell<Vec<Value>>
     browser.targets[0].url = url.to_owned();
 
     let sent = Rc::new(RefCell::new(Vec::new()));
-    browser.fetch.borrow_mut().attach(Rc::new(RefCell::new(Scripted {
-        answers: answers.into(),
-        sent: sent.clone(),
-    })));
+    browser
+        .fetch
+        .borrow_mut()
+        .attach(Rc::new(RefCell::new(Scripted {
+            answers: answers.into(),
+            sent: sent.clone(),
+        })));
     (browser, sent)
 }
 
@@ -75,7 +78,10 @@ fn error_text(reply: &Outgoing) -> String {
 }
 
 fn load(browser: &mut Browser, html: &str) {
-    let reply = dispatch(browser, &command("Page.setDocumentContent", json!({"html": html})));
+    let reply = dispatch(
+        browser,
+        &command("Page.setDocumentContent", json!({"html": html})),
+    );
     result(&reply.response);
 }
 
@@ -136,7 +142,10 @@ fn a_fulfilled_request_never_reaches_the_network() {
     enable_interception(&mut browser, "*");
     load(&mut browser, FETCHING_PAGE);
 
-    assert_eq!(evaluate(&mut browser, "document.querySelector('main').textContent"), "mocked");
+    assert_eq!(
+        evaluate(&mut browser, "document.querySelector('main').textContent"),
+        "mocked"
+    );
     let paused = events(&sent, "Fetch.requestPaused");
     assert_eq!(paused.len(), 1, "one request was announced");
     assert_eq!(
@@ -230,7 +239,11 @@ fn commands_that_arrive_during_a_pause_are_put_aside() {
     load(&mut browser, FETCHING_PAGE);
 
     let deferred = &browser.fetch.borrow().deferred;
-    assert_eq!(deferred.len(), 1, "the evaluate waits for the page to settle");
+    assert_eq!(
+        deferred.len(),
+        1,
+        "the evaluate waits for the page to settle"
+    );
     assert_eq!(deferred[0].method, "Runtime.evaluate");
 }
 
@@ -239,7 +252,10 @@ fn a_verdict_for_a_request_that_is_not_paused_is_refused() {
     let (mut browser, _sent) = session("https://example.com/", Vec::new());
     let reply = dispatch(
         &mut browser,
-        &command("Fetch.continueRequest", json!({"requestId": "interception-9"})),
+        &command(
+            "Fetch.continueRequest",
+            json!({"requestId": "interception-9"}),
+        ),
     );
     assert_eq!(error_text(&reply.response), "no request is paused");
 }
@@ -273,14 +289,20 @@ fn a_response_body_is_kept_for_the_client_to_read() {
     // The client learns the request id from the events, as it would in Chrome.
     let announced = events(&sent, "Network.requestWillBeSent");
     assert_eq!(announced.len(), 1);
-    let request_id = announced[0]["params"]["requestId"].as_str().unwrap().to_owned();
+    let request_id = announced[0]["params"]["requestId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_eq!(events(&sent, "Network.loadingFinished").len(), 1);
 
     let reply = dispatch(
         &mut browser,
         &command("Network.getResponseBody", json!({"requestId": request_id})),
     );
-    assert_eq!(result(&reply.response), json!({"body": "mocked", "base64Encoded": false}));
+    assert_eq!(
+        result(&reply.response),
+        json!({"body": "mocked", "base64Encoded": false})
+    );
 
     let missing = dispatch(
         &mut browser,
@@ -316,16 +338,18 @@ const CLICKABLE: &str = r#"<body>
 
 /// The node id a client would hold for `selector`.
 fn query(browser: &mut Browser, selector: &str) -> i64 {
-    let reply = dispatch(
-        browser,
-        &command("DOM.getDocument", json!({})),
-    );
+    let reply = dispatch(browser, &command("DOM.getDocument", json!({})));
     result(&reply.response);
     let reply = dispatch(
         browser,
-        &command("DOM.querySelector", json!({"nodeId": 1, "selector": selector})),
+        &command(
+            "DOM.querySelector",
+            json!({"nodeId": 1, "selector": selector}),
+        ),
     );
-    result(&reply.response)["nodeId"].as_i64().expect("a node id")
+    result(&reply.response)["nodeId"]
+        .as_i64()
+        .expect("a node id")
 }
 
 /// The centre of a node's box, the way a client works it out.
@@ -424,13 +448,20 @@ fn the_layout_viewport_covers_the_boxes_handed_out() {
     let reply = dispatch(&mut browser, &command("Page.getLayoutMetrics", json!({})));
     let metrics = result(&reply.response);
     let (w, h) = (
-        metrics["cssLayoutViewport"]["clientWidth"].as_f64().unwrap(),
-        metrics["cssLayoutViewport"]["clientHeight"].as_f64().unwrap(),
+        metrics["cssLayoutViewport"]["clientWidth"]
+            .as_f64()
+            .unwrap(),
+        metrics["cssLayoutViewport"]["clientHeight"]
+            .as_f64()
+            .unwrap(),
     );
 
     let one = query(&mut browser, "#one");
     let (x, y) = centre(&mut browser, one);
-    assert!(x < w && y < h, "a click point a client computes is inside it");
+    assert!(
+        x < w && y < h,
+        "a click point a client computes is inside it"
+    );
 }
 
 #[test]
@@ -439,7 +470,10 @@ fn typing_reaches_the_focused_element() {
     load(&mut browser, CLICKABLE);
 
     let field = query(&mut browser, "#field");
-    let reply = dispatch(&mut browser, &command("DOM.focus", json!({"nodeId": field})));
+    let reply = dispatch(
+        &mut browser,
+        &command("DOM.focus", json!({"nodeId": field})),
+    );
     result(&reply.response);
 
     for key in ["h", "i"] {
@@ -457,12 +491,18 @@ fn typing_reaches_the_focused_element() {
     for key in ["Backspace", "Enter"] {
         let reply = dispatch(
             &mut browser,
-            &command("Input.dispatchKeyEvent", json!({"type": "keyDown", "key": key})),
+            &command(
+                "Input.dispatchKeyEvent",
+                json!({"type": "keyDown", "key": key}),
+            ),
         );
         result(&reply.response);
     }
 
-    assert_eq!(evaluate(&mut browser, "document.getElementById('field').value"), "h");
+    assert_eq!(
+        evaluate(&mut browser, "document.getElementById('field').value"),
+        "h"
+    );
     assert_eq!(
         evaluate(&mut browser, "document.getElementById('log').textContent"),
         // Enter in a single-line field submits, as it does in a browser.
@@ -502,7 +542,10 @@ fn cookies_round_trip_through_the_storage_domain() {
         &mut browser,
         r#"<body><script>document.cookie = 'theme=dark';</script></body>"#,
     );
-    assert_eq!(evaluate(&mut browser, "document.cookie"), "sid=42; theme=dark");
+    assert_eq!(
+        evaluate(&mut browser, "document.cookie"),
+        "sid=42; theme=dark"
+    );
 
     let reply = dispatch(&mut browser, &command("Storage.getCookies", json!({})));
     let cookies = result(&reply.response);
@@ -512,13 +555,20 @@ fn cookies_round_trip_through_the_storage_domain() {
         .iter()
         .map(|c| c["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["sid", "theme"], "including what the page set itself");
+    assert_eq!(
+        names,
+        ["sid", "theme"],
+        "including what the page set itself"
+    );
     assert_eq!(cookies["cookies"][0]["domain"], "example.com");
     assert_eq!(cookies["cookies"][0]["value"], "42");
 
     let reply = dispatch(
         &mut browser,
-        &command("Storage.deleteCookies", json!({"cookies": [{"name": "sid"}]})),
+        &command(
+            "Storage.deleteCookies",
+            json!({"cookies": [{"name": "sid"}]}),
+        ),
     );
     result(&reply.response);
     assert_eq!(evaluate(&mut browser, "document.cookie"), "theme=dark");
