@@ -1,5 +1,6 @@
 //! `mar` — read a page the way an agent wants it.
 
+mod mcp;
 mod pipeline;
 mod server;
 
@@ -179,6 +180,14 @@ enum Command {
         /// Print them as JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Speak the Model Context Protocol on stdin and stdout, so an MCP client
+    /// can read pages with it. The render flags here set the defaults; a tool
+    /// call may override them per page.
+    Mcp {
+        #[command(flatten)]
+        render: RenderArgs,
     },
 
     /// Serve the reader over HTTP.
@@ -447,6 +456,8 @@ fn run(command: Command, policy: Policy, egress: Egress) -> anyhow::Result<()> {
             println!("{json}");
             Ok(())
         }
+
+        Command::Mcp { render } => mcp::serve(trust.client_config(policy), render.to_options()),
 
         Command::Serve {
             bind,
