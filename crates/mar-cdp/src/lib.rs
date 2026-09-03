@@ -7,20 +7,28 @@
 //! client drives a single browser anyway.
 
 pub mod browser;
+pub mod cookies;
 pub mod domains;
+pub mod fetch;
+pub mod input;
 pub mod protocol;
 
 use base64::Engine;
 use browser::Browser;
+use fetch::PauseChannel;
 use mar_js::Limits;
 use mar_net::HttpClient;
 use protocol::{Command, Outgoing, version_payload};
 use serde_json::json;
 use sha1::Digest;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tungstenite::Message;
 
 #[derive(Debug, Clone)]
@@ -262,26 +270,59 @@ fn write_http(
     stream.flush()
 }
 
-/// Drive one CDP session to its end.
-fn run_session<S: Read + Write>(
-    mut websocket: tungstenite::WebSocket<S>,
-    config: &CdpConfig,
-    client: HttpClient,
-) {
-    let salt = format!("{:p}", &websocket);
-    let mut browser = Browser::new(client, config.limits.clone(), salt);
-    // Chrome always has a page open; a client that calls `pages()` before
-    // creating one expects to find it.
-    let first = browser.create_target(None);
-    let _ = first;
+/// How long a paused request waits between checks for an answer. A read that
+/// blocks forever cannot notice the page's budget running out.
+const PAUSE_POLL: Duration = Duration::from_millis(20);
 
-    loop {
-        let message = match websocket.read() {
+/// The connection, as both the dispatch loop and a paused request see it.
+///
+/// A paused request has to be answered while the page that made it is still
+/// rendering, and the render is happening inside dispatch. So the socket is
+/// shared: the loop reads it between commands, and interception reads it while
+/// a request waits.
+struct Connection {
+    websocket: tungstenite::WebSocket<TcpStream>,
+    dead: bool,
+}
+
+impl Connection {
+    fn write(&mut self, message: &Outgoing) -> bool {
+        let text = serde_json::to_string(message)
+            .unwrap_or_else(|_| r#"{"error":{"code":-32603,"message":"serialization"}}"#.into());
+        match self.websocket.send(Message::Text(text.into())) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("websocket write failed: {e}");
+                self.dead = true;
+                false
+            }
+        }
+    }
+
+    /// The next command, waiting up to `timeout` for one. `Ok(None)` means the
+    /// wait expired; `Err(())` means the connection is finished.
+    fn read(&mut self, timeout: Option<Duration>) -> Result<Option<Command>, ()> {
+        // tungstenite keeps its own partial-frame buffer, so a read that times
+        // out mid-frame is safe to retry; it resumes where it stopped.
+        let _ = self.websocket.get_ref().set_read_timeout(timeout);
+        let message = match self.websocket.read() {
             Ok(m) => m,
-            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                self.dead = true;
+                return Err(());
+            }
             Err(e) => {
                 tracing::debug!("websocket read failed: {e}");
-                break;
+                self.dead = true;
+                return Err(());
             }
         };
 
@@ -289,48 +330,90 @@ fn run_session<S: Read + Write>(
             Message::Text(text) => text.to_string(),
             Message::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(_) => return Ok(None),
             },
             Message::Ping(payload) => {
-                let _ = websocket.send(Message::Pong(payload));
-                continue;
+                let _ = self.websocket.send(Message::Pong(payload));
+                return Ok(None);
             }
-            Message::Close(_) => break,
-            _ => continue,
+            Message::Close(_) => {
+                self.dead = true;
+                return Err(());
+            }
+            _ => return Ok(None),
         };
 
-        let command: Command = match serde_json::from_str(&text) {
-            Ok(c) => c,
+        match serde_json::from_str::<Command>(&text) {
+            Ok(command) => Ok(Some(command)),
             Err(e) => {
                 // A malformed frame gets an error rather than a dropped
                 // connection: clients recover from the former.
-                let _ = send(
-                    &mut websocket,
-                    &Outgoing::error(0, None, format!("invalid message: {e}")),
-                );
-                continue;
-            }
-        };
-
-        tracing::debug!(method = %command.method, params = %command.params, "cdp command");
-        let reply = domains::dispatch(&mut browser, &command);
-
-        if send(&mut websocket, &reply.response).is_err() {
-            break;
-        }
-        for event in &reply.events {
-            if send(&mut websocket, event).is_err() {
-                return;
+                self.write(&Outgoing::error(0, None, format!("invalid message: {e}")));
+                Ok(None)
             }
         }
     }
 }
 
-fn send<S: Read + Write>(
-    websocket: &mut tungstenite::WebSocket<S>,
-    message: &Outgoing,
-) -> Result<(), tungstenite::Error> {
-    let text = serde_json::to_string(message)
-        .unwrap_or_else(|_| r#"{"error":{"code":-32603,"message":"serialization"}}"#.into());
-    websocket.send(Message::Text(text.into()))
+impl PauseChannel for Connection {
+    fn send(&mut self, message: &Outgoing) {
+        self.write(message);
+    }
+
+    fn next_command(&mut self, deadline: Instant) -> Option<Command> {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            match self.read(Some(left.min(PAUSE_POLL))) {
+                Ok(Some(command)) => return Some(command),
+                Ok(None) => continue,
+                Err(()) => return None,
+            }
+        }
+    }
+}
+
+/// Drive one CDP session to its end.
+fn run_session(websocket: tungstenite::WebSocket<TcpStream>, config: &CdpConfig, client: HttpClient) {
+    let salt = format!("{:p}", &websocket);
+    let mut browser = Browser::new(client, config.limits.clone(), salt);
+    // Chrome always has a page open; a client that calls `pages()` before
+    // creating one expects to find it.
+    browser.create_target(None);
+
+    let connection = Rc::new(RefCell::new(Connection {
+        websocket,
+        dead: false,
+    }));
+    browser.fetch.borrow_mut().attach(connection.clone());
+
+    loop {
+        let command = match connection.borrow_mut().read(None) {
+            Ok(Some(command)) => command,
+            Ok(None) => continue,
+            Err(()) => break,
+        };
+
+        // Commands put aside while a request was paused run after the one that
+        // paused it, in the order the client sent them.
+        let mut queue = VecDeque::from([command]);
+        while let Some(command) = queue.pop_front() {
+            tracing::debug!(method = %command.method, params = %command.params, "cdp command");
+            let reply = domains::dispatch(&mut browser, &command);
+
+            {
+                let mut socket = connection.borrow_mut();
+                socket.write(&reply.response);
+                for event in &reply.events {
+                    socket.write(event);
+                }
+                if socket.dead {
+                    return;
+                }
+            }
+            queue.extend(browser.fetch.borrow_mut().deferred.drain(..));
+        }
+    }
 }
