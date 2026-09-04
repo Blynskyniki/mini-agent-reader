@@ -1006,3 +1006,40 @@ fn a_call_as_a_for_in_target_parses_and_throws_only_when_assigned() {
         out.html
     );
 }
+
+#[test]
+fn a_worker_runs_on_this_thread_and_answers() {
+    // A bot check hashes in a worker and posts the result back; a page keeps
+    // its search index in one. Both need the reply, on a later turn.
+    let net = StaticNetwork::new()
+        .route("/helper.js", 200, "text/javascript", "function twice(n) { return n * 2; }")
+        .route(
+            "/worker.js",
+            200,
+            "text/javascript",
+            "importScripts('/helper.js'); onmessage = (e) => postMessage({ n: twice(e.data), win: typeof window });",
+        );
+    let out = render_with(
+        net,
+        r#"<body><div id="out"></div><script>
+          const facts = [];
+          const blob = new Blob(['self.onmessage = (e) => { let h = 0; for (let i = 0; i < e.data; i++) h = (h * 31 + i) >>> 0; postMessage(h); }']);
+          const w = new Worker(URL.createObjectURL(blob));
+          w.onmessage = (e) => { facts.push('blob:' + e.data); done(); };
+          w.postMessage(100);
+          const w2 = new Worker('/worker.js');
+          w2.addEventListener('message', (e) => { facts.push('url:' + e.data.n + ':' + e.data.win); done(); });
+          w2.postMessage(21);
+          const w3 = new Worker(URL.createObjectURL(new Blob(['onmessage = () => { throw new Error("boom"); }'])));
+          w3.onerror = (e) => { facts.push('error:' + e.message); done(); };
+          w3.postMessage(0);
+          function done() { if (facts.length === 3) document.getElementById('out').textContent = facts.sort().join('|'); }
+        </script></body>"#,
+    );
+    assert!(
+        out.html
+            .contains("blob:58926130|error:boom|url:42:undefined"),
+        "workers compute, import scripts, hide window, and report errors: {}",
+        out.html
+    );
+}

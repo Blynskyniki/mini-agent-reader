@@ -1348,6 +1348,38 @@
   // to construct one.
   const Element = domInterface('Element', isType(1));
   const HTMLElement = domInterface('HTMLElement', isType(1), Element.prototype);
+  // `class X extends HTMLElement` reaches this through `super()`. During an
+  // upgrade the element already exists and is handed back; `new X()` from
+  // page code creates one named for the definition.
+  const htmlElementCtor = function HTMLElement() {
+    const pending = globalThis.__mar_element_under_construction?.();
+    if (pending) {
+      // The class's methods must be reachable from `this` before the
+      // class's own constructor body runs: Lit calls one on its first line.
+      if (new.target && new.target.prototype) Object.setPrototypeOf(pending, new.target.prototype);
+      return pending;
+    }
+    const ctor = new.target;
+    const name = ctor && globalThis.customElements?.getName?.(ctor);
+    if (name) {
+      const el = native.create_element(name);
+      Object.setPrototypeOf(el, ctor.prototype);
+      return el;
+    }
+    throw new TypeError('Illegal constructor: HTMLElement');
+  };
+  htmlElementCtor.prototype = HTMLElement.prototype;
+  HTMLElement.prototype.constructor = htmlElementCtor;
+  define(htmlElementCtor, 'name', { value: 'HTMLElement' });
+  // Any element is an HTMLElement; a subclass — a custom element's class —
+  // answers for its own prototype chain and nothing more.
+  define(htmlElementCtor, Symbol.hasInstance, {
+    value: function (v) {
+      if (this === htmlElementCtor) return isType(1)(v);
+      return Function.prototype[Symbol.hasInstance].call(this, v);
+    },
+  });
+  globalThis.HTMLElement = htmlElementCtor;
   // `new Text('x')` and `new DocumentFragment()` are ordinary code, so these
   // three construct; the rest of the DOM's interfaces throw as they should.
   const constructible = (name, make, holds, parent) => {
@@ -1556,7 +1588,12 @@
   define(document, 'documentURI', { get: () => location.href });
   define(document, 'location', { get: () => location, set: (v) => native.navigate(String(v)) });
 
-  method(DocumentProto, 'createElement', (n) => native.create_element(n));
+  method(DocumentProto, 'createElement', (n) => {
+    const el = native.create_element(n);
+    const definition = globalThis.customElements?.get?.(String(n).toLowerCase());
+    if (definition && globalThis.__mar_upgrade_within) globalThis.__mar_upgrade_within(el);
+    return el;
+  });
   method(DocumentProto, 'createElementNS', (_ns, n) => native.create_element(n));
   method(DocumentProto, 'createTextNode', (t) => native.create_text_node(String(t)));
   method(DocumentProto, 'createComment', (t) => native.create_comment(String(t)));
@@ -2156,10 +2193,188 @@
     constructor(url) { this.url = url; this.readyState = 2; }
     close() {} addEventListener() {} removeEventListener() {}
   };
-  globalThis.Worker = class Worker {
-    constructor(url) { native.record_error('Worker', 'Worker is not supported: ' + url); }
-    postMessage() {} terminate() {}
-    addEventListener() {} removeEventListener() {}
+  // A Worker, on this thread. There is one interpreter and one event loop
+  // here, so the worker's script runs in the same context as the page,
+  // inside a scope that shadows what a worker cannot see — `window`,
+  // `document` — and supplies what it has instead: `self`, `postMessage`,
+  // `importScripts`. Messages cross in both directions on the next turn of
+  // the loop, as they would between threads. A bot check that hashes in a
+  // worker and posts the answer back gets its answer; a page that keeps its
+  // application in one gets its application.
+  const objectUrls = new Map();
+  let nextObjectUrl = 1;
+  globalThis.__mar_object_url = {
+    create(object) {
+      const url = `blob:${location.origin}/mar-${nextObjectUrl++}`;
+      objectUrls.set(url, object);
+      return url;
+    },
+    revoke(url) { objectUrls.delete(String(url)); },
+    get(url) { return objectUrls.get(String(url)); },
+  };
+  const workerSource = (url) => {
+    const text = String(url);
+    if (text.startsWith('blob:')) {
+      const blob = objectUrls.get(text);
+      if (!blob) throw new Error(`blob URL not found: ${text}`);
+      return typeof blob._t === 'string' ? blob._t : String(blob);
+    }
+    if (text.startsWith('data:')) {
+      const comma = text.indexOf(',');
+      const meta = text.slice(5, comma);
+      const payload = text.slice(comma + 1);
+      return /;base64$/i.test(meta) ? globalThis.atob(payload) : decodeURIComponent(payload);
+    }
+    const absolute = new URL(text, location.href).href;
+    const raw = doRequest('GET', absolute, { Accept: '*/*' }, null);
+    if (!raw || !raw.ok) throw new Error(`worker script ${absolute}: ${raw && (raw.error || raw.status)}`);
+    return raw.body ?? '';
+  };
+  const workerListeners = (holder) => ({
+    add(type, fn) { (holder[type] ||= []).push(fn); },
+    remove(type, fn) { if (holder[type]) holder[type] = holder[type].filter((f) => f !== fn); },
+    fire(target, type, event, inline, onError) {
+      event.target = target;
+      const failed = onError || ((e) => native.record_error('worker:' + type, describeError(e)));
+      for (const fn of (holder[type] || []).slice()) {
+        try { (fn.handleEvent || fn).call(target, event); } catch (e) { failed(e); }
+      }
+      if (typeof inline === 'function') {
+        try { inline.call(target, event); } catch (e) { failed(e); }
+      }
+    },
+  });
+  // The names a script declares at its top level, so that what one
+  // `importScripts` defined the next script can see: a function's
+  // declarations are its own, and each script runs as a function here.
+  const DECLARED = /\b(?:function\*?\s+|(?:var|let|const|class)\s+)([A-Za-z_$][\w$]*)/g;
+  const exportsOf = (source) => {
+    const names = new Set();
+    for (const m of source.matchAll(DECLARED)) names.add(m[1]);
+    return [...names]
+      .map((n) => `try { __mar_scope[${JSON.stringify(n)}] = ${n}; } catch (e) {}`)
+      .join('\n');
+  };
+  class WorkerGlobalScope {}
+  class DedicatedWorkerGlobalScope extends WorkerGlobalScope {}
+  globalThis.WorkerGlobalScope = WorkerGlobalScope;
+  globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
+  globalThis.WorkerNavigator = class WorkerNavigator {};
+  globalThis.WorkerLocation = class WorkerLocation {};
+  globalThis.Worker = class Worker extends globalThis.EventTarget {
+    constructor(url, options = {}) {
+      super();
+      const worker = this;
+      const outside = workerListeners({});
+      const inside = workerListeners({});
+      let alive = true;
+      let ready = false;
+      const queued = [];
+      const scope = Object.create(DedicatedWorkerGlobalScope.prototype);
+      const scriptUrl = (() => { try { return new URL(String(url), location.href).href; } catch { return String(url); } })();
+      const errorOut = (e) => {
+        const event = new globalThis.ErrorEvent('error', {});
+        event.message = e instanceof Error ? e.message : String(e);
+        event.error = e;
+        event.filename = scriptUrl;
+        setTimeout(() => outside.fire(worker, 'error', event, worker.onerror), 0);
+      };
+      const toMain = (data) => {
+        if (!alive) return;
+        setTimeout(() => {
+          if (!alive) return;
+          outside.fire(worker, 'message', new MessageEvent('message', { data }), worker.onmessage);
+        }, 0);
+      };
+      const toWorker = (data) => {
+        if (!alive) return;
+        if (!ready) { queued.push(data); return; }
+        setTimeout(() => {
+          if (!alive) return;
+          inside.fire(scope, 'message', new MessageEvent('message', { data }), scope.onmessage, (e) => {
+            native.record_error('Worker ' + scriptUrl, describeError(e));
+            errorOut(e);
+          });
+        }, 0);
+      };
+      const evaluate = (source, name) => {
+        // `with` makes the scope's names win over the page's, and lets a
+        // bare `onmessage = ...` land on the scope rather than on nothing.
+        const run = new Function('__mar_scope',
+          `with (__mar_scope) {\n${source}\n;${exportsOf(source)}\n}\n//# sourceURL=${name}`);
+        run.call(scope, scope);
+      };
+      Object.assign(scope, {
+        self: scope, globalThis: scope, window: undefined, document: undefined,
+        frames: undefined, parent: undefined, top: undefined, frameElement: undefined,
+        onmessage: null, onerror: null, onmessageerror: null,
+        name: String(options.name ?? ''),
+        location: Object.assign(Object.create(globalThis.WorkerLocation.prototype), {
+          href: scriptUrl, origin: location.origin, protocol: location.protocol,
+          host: location.host, hostname: location.hostname, port: location.port,
+          pathname: (() => { try { return new URL(scriptUrl).pathname; } catch { return '/'; } })(),
+          search: '', hash: '', toString: () => scriptUrl,
+        }),
+        navigator: Object.assign(Object.create(globalThis.WorkerNavigator.prototype), navigator),
+        postMessage: (data) => toMain(data),
+        close: () => { alive = false; },
+        importScripts: (...urls) => {
+          for (const u of urls) {
+            const absolute = new URL(String(u), scriptUrl).href;
+            evaluate(workerSource(absolute), absolute);
+          }
+        },
+        addEventListener: (type, fn) => inside.add(String(type), fn),
+        removeEventListener: (type, fn) => inside.remove(String(type), fn),
+        dispatchEvent: (event) => { inside.fire(scope, event.type, event, scope['on' + event.type]); return true; },
+        WorkerGlobalScope, DedicatedWorkerGlobalScope,
+      });
+      define(this, 'onmessage', { value: null, writable: true });
+      define(this, 'onerror', { value: null, writable: true });
+      define(this, 'onmessageerror', { value: null, writable: true });
+      define(this, '_outside', { value: outside });
+      define(this, '_send', { value: toWorker });
+      define(this, '_stop', { value: () => { alive = false; } });
+      // The script runs on the next turn, as a real worker starts after the
+      // constructor returns; messages posted before then are kept in order.
+      setTimeout(() => {
+        if (!alive) return;
+        try {
+          const source = workerSource(url);
+          if (String(options.type).toLowerCase() === 'module') {
+            // No scope trick for a module; it sees the page's globals plus
+            // a `self` that is the scope, which is what most of them touch.
+            const previousSelf = globalThis.self;
+            globalThis.self = scope;
+            try { runModuleSource(source, scriptUrl); } finally { globalThis.self = previousSelf; }
+          } else {
+            evaluate(source, scriptUrl);
+          }
+          ready = true;
+          for (const data of queued.splice(0)) toWorker(data);
+        } catch (e) {
+          native.record_error('Worker ' + scriptUrl, describeError(e));
+          errorOut(e);
+        }
+      }, 0);
+    }
+    postMessage(data) { this._send(data); }
+    terminate() { this._stop(); }
+    addEventListener(type, fn) { this._outside.add(String(type), fn); }
+    removeEventListener(type, fn) { this._outside.remove(String(type), fn); }
+    dispatchEvent(event) { this._outside.fire(this, event.type, event, this['on' + event.type]); return true; }
+  };
+  globalThis.SharedWorker = class SharedWorker {
+    constructor(url, options) {
+      const worker = new globalThis.Worker(url, typeof options === 'string' ? { name: options } : options);
+      this.port = {
+        postMessage: (d) => worker.postMessage(d), start() {}, close() { worker.terminate(); },
+        addEventListener: (t, f) => worker.addEventListener(t, f),
+        removeEventListener: (t, f) => worker.removeEventListener(t, f),
+        set onmessage(fn) { worker.onmessage = fn; }, get onmessage() { return worker.onmessage; },
+      };
+      this.onerror = null;
+    }
   };
 
   // -- URL and URLSearchParams ---------------------------------------------
@@ -2240,8 +2455,8 @@
     }
     // Object URLs have no backing store here, but code that creates and
     // revokes them should not throw.
-    static createObjectURL() { return 'blob:mar/0'; }
-    static revokeObjectURL() {}
+    static createObjectURL(object) { return globalThis.__mar_object_url.create(object); }
+    static revokeObjectURL(url) { globalThis.__mar_object_url.revoke(url); }
   }
   globalThis.URL = URL;
 
@@ -2875,8 +3090,106 @@
         return (c === 'x' ? r : (r & 3) | 8).toString(16);
       });
     },
-    subtle: {},
+    subtle: {
+      // A bot check hashes in a worker and asks `subtle.digest` for it; a
+      // library fingerprints itself the same way. SHA-1 and SHA-256 are the
+      // ones asked for, and both are short enough to carry here.
+      digest(algorithm, data) {
+        const name = String(typeof algorithm === 'string' ? algorithm : algorithm && algorithm.name).toUpperCase().replace('-', '');
+        const bytes = data instanceof ArrayBuffer ? new Uint8Array(data)
+          : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+          : new TextEncoder().encode(String(data));
+        return new Promise((resolve, reject) => {
+          if (name === 'SHA256') resolve(sha256(bytes).buffer);
+          else if (name === 'SHA1') resolve(sha1(bytes).buffer);
+          else reject(new globalThis.DOMException(`digest ${algorithm} is not supported here`, 'NotSupportedError'));
+        });
+      },
+      importKey: () => Promise.reject(new Error('unsupported')),
+      generateKey: () => Promise.reject(new Error('unsupported')),
+      encrypt: () => Promise.reject(new Error('unsupported')),
+      decrypt: () => Promise.reject(new Error('unsupported')),
+      sign: () => Promise.reject(new Error('unsupported')),
+      verify: () => Promise.reject(new Error('unsupported')),
+    },
   };
+  function shaPad(bytes, blockBytes) {
+    const bitLength = bytes.length * 8;
+    const total = Math.ceil((bytes.length + 9) / blockBytes) * blockBytes;
+    const padded = new Uint8Array(total);
+    padded.set(bytes);
+    padded[bytes.length] = 0x80;
+    const view = new DataView(padded.buffer);
+    view.setUint32(total - 4, bitLength >>> 0);
+    view.setUint32(total - 8, Math.floor(bitLength / 0x100000000));
+    return padded;
+  }
+  function sha256(bytes) {
+    const K = [
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    const padded = shaPad(bytes, 64);
+    const view = new DataView(padded.buffer);
+    const w = new Uint32Array(64);
+    const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+    for (let offset = 0; offset < padded.length; offset += 64) {
+      for (let i = 0; i < 16; i++) w[i] = view.getUint32(offset + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+        const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+      }
+      let [a, b, c, d, e, f, g, h] = H;
+      for (let i = 0; i < 64; i++) {
+        const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        const ch = (e & f) ^ (~e & g);
+        const t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+        const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        const maj = (a & b) ^ (a & c) ^ (b & c);
+        const t2 = (S0 + maj) >>> 0;
+        h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+      H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    const out = new Uint8Array(32);
+    const outView = new DataView(out.buffer);
+    H.forEach((v, i) => outView.setUint32(i * 4, v));
+    return out;
+  }
+  function sha1(bytes) {
+    const H = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    const padded = shaPad(bytes, 64);
+    const view = new DataView(padded.buffer);
+    const w = new Uint32Array(80);
+    const rotl = (x, n) => (x << n) | (x >>> (32 - n));
+    for (let offset = 0; offset < padded.length; offset += 64) {
+      for (let i = 0; i < 16; i++) w[i] = view.getUint32(offset + i * 4);
+      for (let i = 16; i < 80; i++) w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+      let [a, b, c, d, e] = H;
+      for (let i = 0; i < 80; i++) {
+        const [f, k] = i < 20 ? [(b & c) | (~b & d), 0x5a827999]
+          : i < 40 ? [b ^ c ^ d, 0x6ed9eba1]
+          : i < 60 ? [(b & c) | (b & d) | (c & d), 0x8f1bbcdc]
+          : [b ^ c ^ d, 0xca62c1d6];
+        const t = (rotl(a, 5) + f + e + k + w[i]) >>> 0;
+        e = d; d = c; c = rotl(b, 30); b = a; a = t;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0; H[4] = (H[4] + e) >>> 0;
+    }
+    const out = new Uint8Array(20);
+    const outView = new DataView(out.buffer);
+    H.forEach((v, i) => outView.setUint32(i * 4, v));
+    return out;
+  }
 
   // A page asks `CSS.supports` to decide whether the browser is too old to
   // serve, and sends it to a "please update" page on a no. Nothing here lays
@@ -2890,10 +3203,99 @@
     number: (v) => ({ value: v, unit: 'number' }),
     highlights: new Map(),
   };
-  globalThis.customElements = {
-    define() {}, get: () => undefined,
-    whenDefined: () => Promise.resolve(), upgrade() {},
+  // Custom elements, upgraded in the light DOM. A definition upgrades every
+  // element already in the tree with that name and everything inserted or
+  // created later: the class's constructor runs with the element as `this`,
+  // then `connectedCallback`, then `attributeChangedCallback` for each
+  // observed attribute present. Shadow trees a component renders into are
+  // invisible to the reader either way; the light DOM it fills in is not.
+  const definitions = new Map();
+  const whenDefined = new Map();
+  const upgrading = [];
+  const upgraded = new Set();
+  const upgradeOne = (el, definition) => {
+    const key = keyOf(el);
+    if (upgraded.has(key)) return;
+    upgraded.add(key);
+    upgrading.push(el);
+    try {
+      new definition.ctor();
+      // `super()` handed the constructor this very element, but a base
+      // constructor's return value keeps its own prototype; the class's is
+      // what its methods live on.
+      Object.setPrototypeOf(el, definition.ctor.prototype);
+    } catch (e) {
+      native.record_error('customElements:' + definition.name, describeError(e));
+      upgrading.splice(upgrading.indexOf(el), 1);
+      return;
+    }
+    if (upgrading.length && keyOf(upgrading[upgrading.length - 1]) === key) upgrading.pop();
+    const observed = definition.observed;
+    if (observed.length && typeof el.attributeChangedCallback === 'function') {
+      for (const name of observed) {
+        if (el.hasAttribute(name)) {
+          try { el.attributeChangedCallback(name, null, el.getAttribute(name), null); }
+          catch (e) { native.record_error('attributeChangedCallback:' + definition.name, describeError(e)); }
+        }
+      }
+    }
+    if (el.isConnected && typeof el.connectedCallback === 'function') {
+      try { el.connectedCallback(); }
+      catch (e) { native.record_error('connectedCallback:' + definition.name, describeError(e)); }
+    }
   };
+  const upgradeWithin = (root, inserted = false) => {
+    if (!root || (root.nodeType !== 1 && root.nodeType !== 11) || definitions.size === 0) return;
+    const candidates = root.nodeType === 1 && root.tagName.includes('-') ? [root] : [];
+    for (const el of root.querySelectorAll('*')) if (el.tagName.includes('-')) candidates.push(el);
+    for (const el of candidates) {
+      const definition = definitions.get(el.tagName.toLowerCase());
+      if (!definition) continue;
+      if (upgraded.has(keyOf(el))) {
+        // Already a component; being put into the tree is what it wants
+        // to hear about.
+        if (inserted && el.isConnected && typeof el.connectedCallback === 'function') {
+          try { el.connectedCallback(); }
+          catch (e) { native.record_error('connectedCallback:' + definition.name, describeError(e)); }
+        }
+        continue;
+      }
+      upgradeOne(el, definition);
+    }
+  };
+  globalThis.__mar_upgrade_within = upgradeWithin;
+  globalThis.customElements = {
+    define(name, ctor, options = {}) {
+      name = String(name).toLowerCase();
+      if (definitions.has(name)) throw new globalThis.DOMException(`'${name}' has already been defined`, 'NotSupportedError');
+      if (typeof ctor !== 'function') throw new TypeError('constructor is not a function');
+      let observed = [];
+      try { observed = Array.from(ctor.observedAttributes || []).map(String); } catch (e) { /* not observable */ }
+      const definition = { name, ctor, observed, extends: options.extends ?? null };
+      definitions.set(name, definition);
+      const waiting = whenDefined.get(name);
+      if (waiting) { whenDefined.delete(name); waiting.resolve(ctor); }
+      upgradeWithin(document.documentElement);
+    },
+    get(name) { return definitions.get(String(name).toLowerCase())?.ctor; },
+    getName(ctor) { for (const [name, d] of definitions) if (d.ctor === ctor) return name; return null; },
+    whenDefined(name) {
+      name = String(name).toLowerCase();
+      const known = definitions.get(name);
+      if (known) return Promise.resolve(known.ctor);
+      let entry = whenDefined.get(name);
+      if (!entry) {
+        entry = {};
+        entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+        whenDefined.set(name, entry);
+      }
+      return entry.promise;
+    },
+    upgrade(root) { upgradeWithin(root); },
+  };
+  // An element being upgraded is what its class's constructor gets as
+  // `this`: `super()` in `class X extends HTMLElement` lands here.
+  globalThis.__mar_element_under_construction = () => upgrading.length ? upgrading[upgrading.length - 1] : null;
 
   // -- text, bytes and streams ----------------------------------------------
 
@@ -4398,9 +4800,11 @@
   const hookInsert = (name, pick) => {
     const original = NodeProto[name];
     method(NodeProto, name, function (...args) {
-      const candidates = pick(args).flatMap(scriptsWithin);
+      const inserted = pick(args);
+      const candidates = inserted.flatMap(scriptsWithin);
       const result = original.apply(this, args);
       if (candidates.length) afterInsert(candidates);
+      if (this.isConnected) for (const node of inserted) upgradeWithin(node, true);
       return result;
     });
   };
@@ -4414,7 +4818,12 @@
     const original = Object.getOwnPropertyDescriptor(NodeProto, name);
     define(NodeProto, name, {
       get: original.get,
-      set(v) { original.set.call(this, v); markStarted(name === 'outerHTML' ? this.parentNode : this); },
+      set(v) {
+        original.set.call(this, v);
+        const root = name === 'outerHTML' ? this.parentNode : this;
+        markStarted(root);
+        if (root && root.isConnected) upgradeWithin(root);
+      },
     });
   };
   markupSetter('innerHTML');

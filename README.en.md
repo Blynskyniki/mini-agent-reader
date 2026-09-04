@@ -124,11 +124,12 @@ A page "reads" at 60% of Chrome's text or more.
 |---|---|---|
 | Chrome | 342 / 453 | — |
 | mar, rustls handshake | 267 | 78% |
-| mar, `browser-tls` | 278 | 81% |
+| mar, `browser-tls` | 276 | 81% |
 
 Most of the rest is a bot check that decides on the browser itself rather than
-on the handshake, and a few are applications that keep their work in a
-`Worker`. `python3 bench/corpus.py --chrome` reproduces the table.
+on the handshake. Runs differ by a few pages either way: one proxy, six pages
+at once, and a fifteen-second budget. `python3 bench/corpus.py --chrome`
+reproduces the table.
 
 ### Where the difference comes from
 
@@ -581,13 +582,20 @@ Known and deliberate:
 - **TLS fingerprint only with `browser-tls`.** The default build's handshake
   is rustls, and a site that decides from the handshake alone can tell. The
   feature costs a BoringSSL build; `--proxy` is the other way around it.
-- **No WebSocket, Worker, WebGL or media.** They construct without throwing
-  and do nothing; a `Worker` is reported, because a page that put its work in
-  one has silently lost it. A canvas hands out a 2D context that measures and
-  draws nothing, which is enough for the libraries that open one at import
-  time.
-- **No custom element upgrades.** `customElements.define` records nothing, so
-  a page built entirely from web components renders its light DOM and no more.
+- **No WebSocket, WebGL or media.** They construct without throwing and do
+  nothing. A canvas hands out a 2D context that measures and draws nothing,
+  which is enough for the libraries that open one at import time.
+- **Workers share the thread.** A `Worker` runs its script in the page's
+  interpreter, inside a scope that hides `window` and `document` and supplies
+  `self`, `postMessage` and `importScripts`; messages cross on the next turn
+  of the loop. A bot check that hashes in a worker gets its answer, and
+  `crypto.subtle.digest` computes SHA-1 and SHA-256 for it. Nothing runs in
+  parallel, so a worker that spins waits for the same budget as the page.
+- **Custom elements upgrade in the light DOM only.** `customElements.define`
+  runs the class's constructor against every element with that name,
+  `connectedCallback` and `attributeChangedCallback` included. What a
+  component renders into a shadow root is not the page's text, so a page built
+  entirely from shadow-DOM components still reads as its light DOM.
 - **No layout.** Nothing is positioned or wrapped. What an element reports for
   `getBoundingClientRect` and `offsetWidth` is derived from the cascade — an
   explicit `width` in a stylesheet or an inline style, a `width` attribute on a
