@@ -1043,3 +1043,124 @@ fn a_worker_runs_on_this_thread_and_answers() {
         out.html
     );
 }
+
+#[test]
+fn a_component_hears_its_attributes_change_and_keeps_the_prototype_it_chose() {
+    let out = render(
+        r#"<!doctype html><html><body>
+        <x-counter count="1"></x-counter><x-shimmed></x-shimmed>
+        <script>
+          const seen = [];
+          class Counter extends HTMLElement {
+            static get observedAttributes() { return ['count']; }
+            attributeChangedCallback(name, before, after) { seen.push(`${name}:${before}>${after}`); }
+          }
+          customElements.define('x-counter', Counter);
+          const el = document.querySelector('x-counter');
+          el.setAttribute('count', '2');
+          el.setAttribute('other', 'x');
+          el.removeAttribute('count');
+          el.toggleAttribute('count');
+          // An ES5 shim's stand-in: super() puts the element on the stand-in's
+          // prototype, the stand-in moves it to the transpiled class's, and
+          // that choice has to survive the upgrade.
+          function Legacy() {}
+          Legacy.prototype = Object.create(HTMLElement.prototype);
+          Legacy.prototype.constructor = Legacy;
+          Legacy.prototype.greet = function () { return 'hi from ' + this.tagName.toLowerCase(); };
+          Legacy.prototype.connectedCallback = function () { seen.push(this.greet()); };
+          const proto = Legacy.prototype;
+          class StandIn extends HTMLElement {
+            constructor() { super(); Object.setPrototypeOf(this, proto); Legacy.call(this); }
+          }
+          StandIn.prototype.connectedCallback = proto.connectedCallback;
+          customElements.define('x-shimmed', StandIn);
+          const shimmed = document.querySelector('x-shimmed');
+          seen.push('proto:' + (Object.getPrototypeOf(shimmed) === proto));
+          document.body.setAttribute('data-seen', seen.join('|'));
+        </script></body></html>"#,
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert!(
+        out.html.contains(
+            r#"data-seen="count:null>1|count:1>2|count:2>null|count:null>|hi from x-shimmed|proto:true""#
+        ),
+        "{}",
+        out.html
+    );
+}
+
+#[test]
+fn members_live_on_the_prototypes_a_browser_keeps_them_on() {
+    // Polyfills read descriptors off Element.prototype and Node.prototype
+    // and patch them there; ShadyDOM does, and YouTube forces it on.
+    let out = render(
+        r#"<!doctype html><html><body><p id="p">text</p>
+        <script>
+          const own = (c, n) => Object.prototype.hasOwnProperty.call(c.prototype, n);
+          const p = document.getElementById('p');
+          const text = p.firstChild;
+          const facts = [
+            own(Element, 'innerHTML'), !own(Node, 'innerHTML'), own(Node, 'firstChild'),
+            own(HTMLElement, 'innerText'), own(Document, 'querySelector'), own(Element, 'setAttribute'),
+            !('innerHTML' in text), typeof text.remove === 'function',
+            document.querySelector('p') === p, typeof document.createDocumentFragment().querySelectorAll === 'function',
+            p.getAttribute('nope') === null, p.nodeValue === null, text.nodeValue === 'text',
+            document.hidden === false, typeof document.onclick === 'object',
+          ];
+          facts.push(
+            !('value' in document.createElement('div')), 'value' in document.createElement('input'),
+            'src' in document.createElement('img'), !('src' in document.createElement('a')),
+            typeof Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src').get === 'function',
+            typeof document.createElement('video').play === 'function',
+            typeof document.createElement('audio').canPlayType === 'function',
+            document.createElement('template').content.nodeType === 11,
+            document.createElement('meta').content === '',
+            document.createElement('a').host === '',
+          );
+          const d = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+          Object.defineProperty(Element.prototype, 'innerHTML', {
+            get() { return 'patched:' + d.get.call(this); }, set: d.set, configurable: true,
+          });
+          facts.push(p.innerHTML === 'patched:text');
+          p.setAttribute('data-facts', facts.map((f, i) => f ? '' : i).filter(Boolean).join(',') || 'all');
+        </script></body></html>"#,
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert!(
+        out.html.contains(r#"data-facts="all""#),
+        "failed facts: {}",
+        out.html
+    );
+}
+
+#[test]
+fn a_template_parsed_from_markup_owns_its_content() {
+    // Polymer walks the templates a component's markup contains, and a
+    // template that arrived through `innerHTML` used to name a fragment in
+    // the scratch document it was parsed in — an id that meant some other
+    // node in the live one.
+    let out = render(
+        r#"<!doctype html><html><body><div id="host"></div>
+        <script>
+          const host = document.getElementById('host');
+          host.innerHTML = '<template id="t"><i>z</i></template><b>after</b>';
+          const t = host.firstChild;
+          const clone = t.cloneNode(true);
+          clone.content.firstChild.textContent = 'changed';
+          // A fragment has no `innerHTML` in a browser either; read the child.
+          const facts = [
+            t.content.nodeType === 11, t.content.firstChild.outerHTML === '<i>z</i>',
+            clone.content !== t.content, clone.content.firstChild.outerHTML === '<i>changed</i>',
+            t.content.firstChild.outerHTML === '<i>z</i>', !('innerHTML' in t.content),
+          ];
+          host.setAttribute('data-facts', facts.map((f, i) => f ? '' : i).filter(Boolean).join(',') || 'all');
+        </script></body></html>"#,
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert!(
+        out.html.contains(r#"data-facts="all""#),
+        "failed facts: {}",
+        out.html
+    );
+}

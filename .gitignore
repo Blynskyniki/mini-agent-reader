@@ -4,3 +4,6 @@ npm/bin/
 *.tgz
 .DS_Store
 .claude/worktrees/
+
+# Python caches from bench/
+__pycache__/

@@ -271,9 +271,13 @@ single-sign-on redirect chain gets through.
 time the page reaches it, so a `WeakMap` keyed by element, an expando such as
 `el.__reactFiber$…`, and `a.parentNode === b.parentNode` all behave. Each node
 comes out of the bridge with the prototype for its tag — `HTMLDivElement`,
-`HTMLTemplateElement`, `Text` — chained the way the DOM chains them, so a
-polyfill that patches one interface's prototype reaches that interface and
-nothing else.
+`HTMLTemplateElement`, `Text` — chained the way the DOM chains them, and each
+member sits on the interface that defines it: `firstChild` on `Node`,
+`innerHTML` on `Element`, `src` on `HTMLScriptElement`, `host` on
+`ShadowRoot`. A polyfill that reads a descriptor off one prototype and writes
+its own there — ShadyDOM, which YouTube forces on even in Chrome; a consent
+manager that gates scripts by patching `src` — finds what it expects where it
+expects it, and a text node does not answer to `innerHTML`.
 
 **A virtual clock.** Timers sit in a heap keyed by due time. When microtasks are
 drained and no network call is outstanding, the clock jumps to the next timer.
@@ -597,9 +601,14 @@ Known and deliberate:
   parallel, so a worker that spins waits for the same budget as the page.
 - **Custom elements upgrade in the light DOM only.** `customElements.define`
   runs the class's constructor against every element with that name,
-  `connectedCallback` and `attributeChangedCallback` included. What a
-  component renders into a shadow root is not the page's text, so a page built
-  entirely from shadow-DOM components still reads as its light DOM.
+  `connectedCallback` and `attributeChangedCallback` included, and the
+  callback keeps firing as observed attributes change. A constructor that
+  swaps the element's prototype for a transpiled class's — the ES5 shim
+  Polymer ships — keeps what it chose. What a component renders into a shadow
+  root is not the page's text, so a page built entirely from shadow-DOM
+  components still reads as its light DOM; a page that runs the ShadyDOM
+  polyfill composes into the light DOM and reads. YouTube does exactly that,
+  and its application shell now renders; its feed still does not.
 - **No layout.** Nothing is positioned or wrapped. What an element reports for
   `getBoundingClientRect` and `offsetWidth` is derived from the cascade — an
   explicit `width` in a stylesheet or an inline style, a `width` attribute on a

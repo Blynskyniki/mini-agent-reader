@@ -656,7 +656,7 @@ impl DomNode {
 
     #[qjs(get, configurable)]
     fn inner_text(&self) -> String {
-        self.doc.borrow().text_content(self.id)
+        self.doc.borrow().rendered_text(self.id)
     }
 
     #[qjs(set, rename = "innerText", configurable)]
@@ -664,13 +664,28 @@ impl DomNode {
         self.doc.borrow_mut().set_text_content(self.id, value);
     }
 
-    #[qjs(get, configurable)]
-    fn node_value(&self) -> Option<String> {
+    #[qjs(skip)]
+    fn character_data(&self) -> Option<String> {
         match self.doc.borrow().data(self.id) {
             NodeData::Text(t) => Some(t.to_string()),
             NodeData::Comment(t) => Some(t.to_string()),
             _ => None,
         }
+    }
+
+    /// `null`, not `undefined`, where the DOM says null: an element's
+    /// `nodeValue`, a missing attribute. Code compares with `=== null`.
+    #[qjs(skip)]
+    fn nullable<'js>(ctx: &Ctx<'js>, value: Option<String>) -> Result<Value<'js>> {
+        match value {
+            Some(value) => value.into_js(ctx),
+            None => Ok(Value::new_null(ctx.clone())),
+        }
+    }
+
+    #[qjs(get, configurable)]
+    fn node_value<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        Self::nullable(&ctx, self.character_data())
     }
 
     #[qjs(set, rename = "nodeValue", configurable)]
@@ -684,8 +699,8 @@ impl DomNode {
     }
 
     #[qjs(get, configurable)]
-    fn data(&self) -> Option<String> {
-        self.node_value()
+    fn data<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        Self::nullable(&ctx, self.character_data())
     }
 
     #[qjs(set, rename = "data", configurable)]
@@ -815,8 +830,8 @@ impl DomNode {
 
     // ---- attributes ----------------------------------------------------
 
-    fn get_attribute(&self, name: JsString) -> Option<String> {
-        self.attr(&name.to_ascii_lowercase())
+    fn get_attribute<'js>(&self, ctx: Ctx<'js>, name: JsString) -> Result<Value<'js>> {
+        Self::nullable(&ctx, self.attr(&name.to_ascii_lowercase()))
     }
 
     fn set_attribute(&self, name: JsString, value: JsString) {

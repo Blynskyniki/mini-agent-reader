@@ -755,7 +755,9 @@
       get() {
         const key = keyOf(this) + ':' + prop;
         if (compiled.has(key)) return compiled.get(key);
-        const source = this.getAttribute(prop);
+        // Only an element has an attribute to compile; the document and
+        // the window carry the same handler properties without one.
+        const source = this.nodeType === 1 ? this.getAttribute(prop) : null;
         if (source == null) return null;
         let handler = null;
         try {
@@ -1263,6 +1265,41 @@
   method(NodeProto, 'hasAttributeNS', function (_ns, name) { return this.hasAttribute(name); });
   method(NodeProto, 'removeAttributeNS', function (_ns, name) { this.removeAttribute(name); });
   method(NodeProto, 'toggleAttribute', NodeProto.toggleAttribute);
+  // A component hears about its observed attributes changing, the way it
+  // does in a browser. The three writers below are the native ones; the
+  // wrappers only add the callback, and only once a component exists.
+  const rawSetAttribute = NodeProto.setAttribute;
+  const rawRemoveAttribute = NodeProto.removeAttribute;
+  const rawToggleAttribute = NodeProto.toggleAttribute;
+  const attributeChanged = (el, name, before) => {
+    const definition = upgraded.get(keyOf(el));
+    if (!definition) return;
+    name = String(name).toLowerCase();
+    if (!definition.observed.includes(name) || typeof el.attributeChangedCallback !== 'function') return;
+    const after = el.getAttribute(name);
+    if (before === after) return;
+    try { el.attributeChangedCallback(name, before, after, null); }
+    catch (e) { native.record_error('attributeChangedCallback:' + definition.name, describeError(e)); }
+  };
+  method(NodeProto, 'setAttribute', function (name, value) {
+    if (upgraded.size === 0) return rawSetAttribute.call(this, name, value);
+    const before = this.getAttribute(name);
+    rawSetAttribute.call(this, name, value);
+    attributeChanged(this, name, before);
+  });
+  method(NodeProto, 'removeAttribute', function (name) {
+    if (upgraded.size === 0) return rawRemoveAttribute.call(this, name);
+    const before = this.getAttribute(name);
+    rawRemoveAttribute.call(this, name);
+    attributeChanged(this, name, before);
+  });
+  method(NodeProto, 'toggleAttribute', function (name, force) {
+    if (upgraded.size === 0) return rawToggleAttribute.call(this, name, force);
+    const before = this.getAttribute(name);
+    const result = rawToggleAttribute.call(this, name, force);
+    attributeChanged(this, name, before);
+    return result;
+  });
 
   // Identity and order. `isEqualNode` is how react-helmet decides whether a
   // tag it is about to insert is already there; `compareDocumentPosition` is
@@ -1412,8 +1449,11 @@
   domInterface('HTMLDocument', isType(9), Document.prototype);
   domInterface('XMLDocument', () => false, Document.prototype);
   domInterface('DocumentType', isType(10));
-  // A shadow root is a fragment that knows its host.
-  domInterface('ShadowRoot', (v) => !!v && v.nodeType === 11 && shadowHosts.has(keyOf(v)), DocumentFragment.prototype);
+  // A shadow root is a fragment that knows its host. It gets a prototype of
+  // its own so that `host` and `innerHTML` are there and not on every
+  // fragment: ShadyDOM builds its roots on DocumentFragment.prototype and
+  // assigns `this.host` expecting a plain property.
+  const ShadowRoot = domInterface('ShadowRoot', (v) => !!v && v.nodeType === 11 && shadowHosts.has(keyOf(v)), DocumentFragment.prototype);
   // Nothing here parses SVG into SVG-aware nodes, but an element with an SVG
   // tag name is still what a script means by one.
   const SVG_TAGS = ['svg', 'path', 'circle', 'rect', 'g', 'line', 'polyline', 'polygon', 'ellipse',
@@ -3217,18 +3257,22 @@
   const definitions = new Map();
   const whenDefined = new Map();
   const upgrading = [];
-  const upgraded = new Set();
+  const upgraded = new Map();
   const upgradeOne = (el, definition) => {
     const key = keyOf(el);
     if (upgraded.has(key)) return;
-    upgraded.add(key);
+    upgraded.set(key, definition);
     upgrading.push(el);
+    const before = Object.getPrototypeOf(el);
     try {
       new definition.ctor();
-      // `super()` handed the constructor this very element, but a base
-      // constructor's return value keeps its own prototype; the class's is
-      // what its methods live on.
-      Object.setPrototypeOf(el, definition.ctor.prototype);
+      // `super()` handed the constructor this very element and put it on
+      // `new.target.prototype`. A constructor that swapped the prototype
+      // itself since (an ES5 shim does, to the transpiled class's) keeps
+      // what it chose; one that returned some other object left the element
+      // on its built-in prototype, and the class's is where its methods
+      // live.
+      if (Object.getPrototypeOf(el) === before) Object.setPrototypeOf(el, definition.ctor.prototype);
     } catch (e) {
       native.record_error('customElements:' + definition.name, describeError(e));
       upgrading.splice(upgrading.indexOf(el), 1);
@@ -4690,27 +4734,21 @@
     const key = keyOf(this);
     if (shadowRoots.has(key)) throw new globalThis.DOMException('Shadow root cannot be created on a host which already hosts a shadow tree', 'NotSupportedError');
     const root = native.create_fragment();
+    Object.setPrototypeOf(root, ShadowRoot.prototype);
     shadowRoots.set(key, root);
     shadowHosts.set(keyOf(root), this);
     define(root, 'mode', { value: init.mode === 'closed' ? 'closed' : 'open' });
     define(root, 'delegatesFocus', { value: !!init.delegatesFocus });
     define(root, 'slotAssignment', { value: init.slotAssignment ?? 'named' });
     define(root, 'adoptedStyleSheets', { value: [], writable: true });
-    method(root, 'getElementById', (id) => root.querySelector(`[id="${String(id).replace(/"/g, '\\"')}"]`));
     return root;
+  });
+  define(ShadowRoot.prototype, 'host', { get() { return shadowHosts.get(keyOf(this)) ?? null; } });
+  method(ShadowRoot.prototype, 'getElementById', function (id) {
+    return this.querySelector(`[id="${String(id).replace(/"/g, '\\"')}"]`);
   });
   define(NodeProto, 'shadowRoot', {
     get() { const root = shadowRoots.get(keyOf(this)); return root && root.mode === 'open' ? root : null; },
-  });
-  // `host` already means the URL's host on a link; a shadow root is the one
-  // node for which it means something else.
-  const urlHost = Object.getOwnPropertyDescriptor(NodeProto, 'host');
-  define(NodeProto, 'host', {
-    get() {
-      if (this.nodeType === 11) return shadowHosts.get(keyOf(this)) ?? null;
-      return urlHost.get.call(this);
-    },
-    set(v) { if (this.nodeType !== 11) urlHost.set.call(this, v); },
   });
   define(NodeProto, 'assignedSlot', { get: () => null });
   define(NodeProto, 'part', { get() { return new DOMTokenList(this); } });
@@ -5391,5 +5429,143 @@
         try { define(desc.value, 'name', { value: name }); } catch (e) { /* frozen */ }
       }
     }
+  }
+
+  // A browser keeps each member on the interface that defines it, and code
+  // that patches the DOM reads the descriptor off that prototype and writes
+  // its own there: ShadyDOM, which YouTube forces on even in Chrome, takes
+  // `innerHTML` from Element.prototype and `firstChild` from Node.prototype.
+  // Everything above was put on Node.prototype for brevity. This moves each
+  // member where a browser has it, so a text node no longer answers to
+  // `innerHTML` and a descriptor read off Element.prototype finds one. What
+  // nothing below names stays on Node; a tag's own members (an anchor's
+  // `href`, an input's `value`) go to HTMLElement rather than to one
+  // prototype per tag, which is where feature detection looks for them.
+  {
+    const N = NodeProto;
+    const words = (s) => s.split(/\s+/).filter(Boolean);
+    const place = (names, ...targets) => {
+      for (const name of names) {
+        const desc = Object.getOwnPropertyDescriptor(N, name);
+        if (!desc) continue;
+        for (const target of targets) Object.defineProperty(target.prototype, name, desc);
+        delete N[name];
+      }
+    };
+    place(words(`append prepend replaceChildren querySelector querySelectorAll getElementsByTagName
+      getElementsByClassName children firstElementChild lastElementChild childElementCount`),
+      Element, Document, DocumentFragment);
+    place(words('remove before after replaceWith nextElementSibling previousElementSibling'), Element, CharacterData);
+    // A shadow root reads and writes `innerHTML` as an element does.
+    place(words('innerHTML'), Element, ShadowRoot);
+    const aria = Object.getOwnPropertyNames(N).filter((n) => n.startsWith('aria'));
+    place(words(`getAttribute setAttribute hasAttribute removeAttribute toggleAttribute getAttributeNames matches
+      closest className outerHTML tagName id localName namespaceURI classList slot part attributes attachShadow
+      shadowRoot assignedSlot insertAdjacentHTML insertAdjacentElement insertAdjacentText getBoundingClientRect
+      getClientRects scrollIntoView scrollIntoViewIfNeeded scrollTo scroll scrollBy clientWidth clientHeight
+      scrollWidth scrollHeight scrollTop scrollLeft checkVisibility getAnimations animate attributeStyleMap
+      elementTiming role getAttributeNode getAttributeNodeNS setAttributeNode setAttributeNodeNS removeAttributeNode
+      hasAttributes getAttributeNS setAttributeNS hasAttributeNS removeAttributeNS requestFullscreen`).concat(aria),
+      Element);
+    const handlers = Object.getOwnPropertyNames(N).filter((n) => /^on[a-z]/.test(n));
+    place(handlers, HTMLElement, SVGElement, Document);
+    place(words('hidden dir'), HTMLElement);
+    // The document's `hidden` is its visibility, and its `dir` is the root
+    // element's; neither is an attribute of the document itself.
+    define(Document.prototype, 'hidden', { get() { return this.visibilityState === 'hidden'; } });
+    define(Document.prototype, 'dir', {
+      get() { return this.documentElement ? this.documentElement.dir : ''; },
+      set(v) { if (this.documentElement) this.documentElement.dir = v; },
+    });
+    place(words('style dataset nonce autofocus tabIndex focus blur'), HTMLElement, SVGElement);
+    const node = new Set(words(`constructor contains hasChildNodes appendChild insertBefore removeChild replaceChild
+      cloneNode parentNode lastChild parentElement childNodes nodeValue firstChild nodeName textContent nodeType
+      nextSibling ownerDocument previousSibling marNodeId normalize isSameNode isEqualNode getRootNode
+      compareDocumentPosition lookupNamespaceURI lookupPrefix isDefaultNamespace isConnected addEventListener
+      removeEventListener dispatchEvent data templateContent`));
+    place(Object.getOwnPropertyNames(N).filter((n) => !node.has(n) && !/^[A-Z_]+$/.test(n)), HTMLElement);
+
+    // What a tag defines goes on to the tag's own interface, where a script
+    // that patches `HTMLScriptElement.prototype.src` — every consent manager
+    // that gates third-party scripts — reads the descriptor. What no tag
+    // below claims stays on HTMLElement.
+    const H = HTMLElement.prototype;
+    const settle = (names, ...targets) => {
+      for (const name of words(names)) {
+        const desc = Object.getOwnPropertyDescriptor(H, name);
+        if (!desc) continue;
+        for (const target of targets) Object.defineProperty(target.prototype, name, desc);
+        delete H[name];
+      }
+    };
+    settle('src', HTMLScriptElement, HTMLImageElement, HTMLIFrameElement, HTMLMediaElement, HTMLSourceElement,
+      HTMLEmbedElement, HTMLTrackElement, HTMLInputElement);
+    settle('srcset', HTMLImageElement, HTMLSourceElement);
+    settle('sizes', HTMLImageElement, HTMLSourceElement, HTMLLinkElement);
+    settle('currentSrc', HTMLImageElement, HTMLMediaElement);
+    settle('crossOrigin', HTMLImageElement, HTMLMediaElement, HTMLScriptElement, HTMLLinkElement);
+    settle('referrerPolicy', HTMLAnchorElement, HTMLAreaElement, HTMLImageElement, HTMLIFrameElement, HTMLLinkElement,
+      HTMLScriptElement);
+    settle('integrity', HTMLScriptElement, HTMLLinkElement);
+    settle('loading', HTMLImageElement, HTMLIFrameElement);
+    settle('href', HTMLAnchorElement, HTMLLinkElement, HTMLAreaElement, HTMLBaseElement);
+    settle('target', HTMLAnchorElement, HTMLAreaElement, HTMLBaseElement, HTMLFormElement);
+    settle('download rel hreflang', HTMLAnchorElement, HTMLAreaElement, HTMLLinkElement);
+    settle('protocol host hostname port pathname search hash origin username password', HTMLAnchorElement, HTMLAreaElement);
+    settle('coords shape', HTMLAreaElement);
+    settle('text', HTMLScriptElement, HTMLAnchorElement, HTMLTitleElement, HTMLOptionElement, HTMLBodyElement);
+    settle('content', HTMLMetaElement, HTMLTemplateElement);
+    settle('charset', HTMLScriptElement, HTMLMetaElement);
+    settle('httpEquiv scheme', HTMLMetaElement);
+    settle('media', HTMLLinkElement, HTMLStyleElement, HTMLSourceElement);
+    settle('as', HTMLLinkElement);
+    settle('sheet', HTMLLinkElement, HTMLStyleElement);
+    settle('value', HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement,
+      HTMLProgressElement, HTMLMeterElement, HTMLDataElement, HTMLLIElement, HTMLOutputElement);
+    settle('defaultValue', HTMLInputElement, HTMLTextAreaElement, HTMLOutputElement);
+    settle('checked defaultChecked indeterminate files valueAsNumber stepUp stepDown pattern accept', HTMLInputElement);
+    settle('select setSelectionRange setRangeText selectionStart selectionEnd selectionDirection placeholder maxLength minLength readOnly',
+      HTMLInputElement, HTMLTextAreaElement);
+    settle('alt', HTMLImageElement, HTMLInputElement, HTMLAreaElement);
+    settle('autocomplete', HTMLInputElement, HTMLFormElement, HTMLSelectElement, HTMLTextAreaElement);
+    settle('min max', HTMLInputElement, HTMLMeterElement, HTMLProgressElement);
+    settle('step', HTMLInputElement);
+    settle('size', HTMLInputElement, HTMLSelectElement);
+    settle('multiple', HTMLInputElement, HTMLSelectElement);
+    settle('required', HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement);
+    settle('disabled', HTMLInputElement, HTMLButtonElement, HTMLSelectElement, HTMLTextAreaElement, HTMLOptionElement,
+      HTMLOptGroupElement, HTMLFieldSetElement, HTMLLinkElement, HTMLStyleElement);
+    settle('selected', HTMLOptionElement);
+    settle('selectedIndex selectedOptions', HTMLSelectElement);
+    settle('options', HTMLSelectElement, HTMLDataListElement);
+    settle('form', HTMLInputElement, HTMLButtonElement, HTMLSelectElement, HTMLTextAreaElement, HTMLOptionElement,
+      HTMLLabelElement, HTMLFieldSetElement, HTMLOutputElement, HTMLObjectElement, HTMLLegendElement);
+    settle('labels', HTMLInputElement, HTMLButtonElement, HTMLSelectElement, HTMLTextAreaElement, HTMLMeterElement,
+      HTMLOutputElement, HTMLProgressElement);
+    settle('validity validationMessage willValidate checkValidity reportValidity setCustomValidity', HTMLInputElement,
+      HTMLButtonElement, HTMLSelectElement, HTMLTextAreaElement, HTMLFieldSetElement, HTMLOutputElement, HTMLObjectElement);
+    settle('elements', HTMLFormElement, HTMLFieldSetElement);
+    settle('submit requestSubmit reset action method enctype', HTMLFormElement);
+    settle('rows cols wrap', HTMLTextAreaElement);
+    settle('htmlFor', HTMLLabelElement, HTMLOutputElement);
+    settle('width height', HTMLImageElement, HTMLCanvasElement, HTMLVideoElement, HTMLIFrameElement, HTMLEmbedElement,
+      HTMLObjectElement, HTMLInputElement, HTMLSourceElement);
+    settle('naturalWidth naturalHeight complete decode', HTMLImageElement);
+    settle('useMap', HTMLImageElement, HTMLObjectElement);
+    settle('getContext toDataURL toBlob', HTMLCanvasElement);
+    settle('captureStream', HTMLCanvasElement, HTMLMediaElement);
+    settle(`canPlayType play pause load paused ended muted volume currentTime duration playbackRate networkState seeking
+      autoplay loop controls playsInline defaultMuted buffered played seekable textTracks preload`, HTMLMediaElement);
+    settle('poster videoWidth videoHeight requestPictureInPicture', HTMLVideoElement);
+    settle('kind srclang', HTMLTrackElement);
+    settle('label', HTMLTrackElement, HTMLOptionElement, HTMLOptGroupElement);
+    settle('contentWindow contentDocument', HTMLIFrameElement, HTMLObjectElement);
+    settle('getSVGDocument', HTMLIFrameElement, HTMLObjectElement, HTMLEmbedElement);
+    settle('open', HTMLDialogElement, HTMLDetailsElement);
+    settle('showModal show close', HTMLDialogElement);
+    settle('dateTime', HTMLTimeElement, HTMLModElement);
+    settle('cite', HTMLQuoteElement, HTMLModElement);
+    settle('headers abbr scope axis', HTMLTableCellElement);
+    settle('popoverTarget', HTMLButtonElement, HTMLInputElement);
   }
 })();

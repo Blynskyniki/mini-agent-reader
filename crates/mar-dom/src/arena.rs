@@ -453,6 +453,40 @@ impl Document {
         out
     }
 
+    /// The text a reader sees (`HTMLElement.innerText`, near enough): as
+    /// `text_content`, but without what a browser never renders — the
+    /// contents of script, style, template and noscript elements. A page
+    /// measures `document.body.innerText` to decide whether it has content,
+    /// and its own inline data must not count.
+    pub fn rendered_text(&self, id: NodeId) -> String {
+        fn walk(doc: &Document, id: NodeId, out: &mut String) {
+            if let NodeData::Text(t) = doc.data(id) {
+                out.push_str(t);
+                return;
+            }
+            let unrendered = doc.element(id).is_some_and(|e| {
+                matches!(
+                    e.local_name().as_ref(),
+                    "script" | "style" | "template" | "noscript"
+                )
+            });
+            if unrendered {
+                return;
+            }
+            for child in doc.children(id) {
+                walk(doc, child, out);
+            }
+        }
+        let mut out = String::new();
+        if let NodeData::Text(t) = self.data(id) {
+            out.push_str(t);
+        }
+        for child in self.children(id) {
+            walk(self, child, &mut out);
+        }
+        out
+    }
+
     /// Replace all children of `id` with a single text node.
     pub fn set_text_content(&mut self, id: NodeId, text: impl Into<StrTendril>) {
         while let Some(child) = self.node(id).first_child {
@@ -539,6 +573,7 @@ impl Document {
     /// `cloneNode`, where `src` and `self` are the same document.
     pub fn import_subtree(&mut self, src: &Document, src_id: NodeId) -> NodeId {
         let new_root = self.create(src.data(src_id).clone());
+        self.copy_template_contents(src, src_id, new_root);
         // Explicit stack of (source, destination-parent) pairs: a document can
         // be deeper than the native stack tolerates.
         let mut stack: Vec<(NodeId, NodeId)> = src
@@ -550,13 +585,7 @@ impl Document {
         while let Some((src_child, dst_parent)) = stack.pop() {
             let copy = self.create(src.data(src_child).clone());
             self.append(dst_parent, copy);
-            // A copied <template> keeps its own detached content fragment.
-            if let Some(tpl) = src.element(src_child).and_then(|e| e.template_contents) {
-                let tpl_copy = self.import_subtree(src, tpl);
-                if let Some(el) = self.element_mut(copy) {
-                    el.template_contents = Some(tpl_copy);
-                }
-            }
+            self.copy_template_contents(src, src_child, copy);
             let mut kids: Vec<_> = src.children(src_child).map(|c| (c, copy)).collect();
             kids.reverse();
             stack.extend(kids);
@@ -564,25 +593,59 @@ impl Document {
         new_root
     }
 
+    /// A copied `<template>` gets a copy of its content fragment too. The
+    /// cloned element data still names the source's fragment, which is a
+    /// node of another document when `innerHTML` parsed into a scratch one —
+    /// or, for a clone, the original's own content, which the clone would
+    /// then share. Either way the copy needs one of its own, and the root of
+    /// the copy needs it as much as any descendant.
+    fn copy_template_contents(&mut self, src: &Document, from: NodeId, to: NodeId) {
+        if let Some(tpl) = src.element(from).and_then(|e| e.template_contents) {
+            let tpl_copy = self.import_subtree(src, tpl);
+            if let Some(el) = self.element_mut(to) {
+                el.template_contents = Some(tpl_copy);
+            }
+        }
+    }
+
     /// Copy `id` within this document. `deep = false` copies the node alone.
     pub fn clone_node(&mut self, id: NodeId, deep: bool) -> NodeId {
         if !deep {
-            return self.create(self.data(id).clone());
+            let copy = self.create(self.data(id).clone());
+            // A shallow copy of a template starts with empty content of its
+            // own rather than a pointer at the original's.
+            if let Some(el) = self.element_mut(copy) {
+                el.template_contents = None;
+            }
+            return copy;
         }
         // Split the borrow by cloning the source shallowly first: import_subtree
         // needs &self and &mut self at once, so walk it manually here.
         let new_root = self.create(self.data(id).clone());
+        self.clone_template_contents(id, new_root);
         let mut stack: Vec<(NodeId, NodeId)> = self.children(id).map(|c| (c, new_root)).collect();
         stack.reverse();
         while let Some((src_child, dst_parent)) = stack.pop() {
             let data = self.data(src_child).clone();
             let copy = self.create(data);
             self.append(dst_parent, copy);
+            self.clone_template_contents(src_child, copy);
             let mut kids: Vec<_> = self.children(src_child).map(|c| (c, copy)).collect();
             kids.reverse();
             stack.extend(kids);
         }
         new_root
+    }
+
+    /// A deep-cloned `<template>` gets a deep clone of its content, not a
+    /// share of the original's.
+    fn clone_template_contents(&mut self, from: NodeId, to: NodeId) {
+        if let Some(tpl) = self.element(from).and_then(|e| e.template_contents) {
+            let tpl_copy = self.clone_node(tpl, true);
+            if let Some(el) = self.element_mut(to) {
+                el.template_contents = Some(tpl_copy);
+            }
+        }
     }
 
     /// Is `ancestor` an inclusive ancestor of `id`? (`Node.contains`)
