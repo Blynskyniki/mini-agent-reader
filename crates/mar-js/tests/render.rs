@@ -268,7 +268,7 @@ fn a_synchronous_loop_is_stopped_by_the_wall_clock() {
 fn navigation_is_reported_not_followed() {
     let out = render(r#"<body><script>location.href = '/next?a=1';</script></body>"#);
     assert_eq!(
-        out.requested_navigation.as_deref(),
+        out.requested_navigation.as_ref().map(|n| n.url.as_str()),
         Some("https://example.com/next?a=1"),
         "resolved against the page URL, and not acted on"
     );
@@ -340,7 +340,7 @@ fn the_environment_does_not_advertise_itself() {
 fn reload_is_a_navigation_to_the_same_url() {
     let out = render(r#"<body><script>location.reload();</script></body>"#);
     assert_eq!(
-        out.requested_navigation.as_deref(),
+        out.requested_navigation.as_ref().map(|n| n.url.as_str()),
         Some("https://example.com/page"),
         "a challenge page sets a cookie and reloads; the reload has to be visible"
     );
@@ -451,7 +451,8 @@ fn the_running_script_is_document_current_script() {
     );
     assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
     assert!(
-        out.html.contains("SCRIPT https://example.com/assets/bundle.js"),
+        out.html
+            .contains("SCRIPT https://example.com/assets/bundle.js"),
         "the running script knows where it came from: {}",
         out.html
     );
@@ -843,5 +844,165 @@ fn the_import_graph_draws_on_the_page_budget() {
     assert!(
         reported.contains("budget"),
         "a page cannot spend more through imports than through fetch: {reported}"
+    );
+}
+
+#[test]
+fn a_script_the_page_inserts_runs_and_reports_load() {
+    // Every webpack chunk and every tag manager arrives this way.
+    let net = StaticNetwork::new().route(
+        "/chunk.js",
+        200,
+        "text/javascript",
+        "document.getElementById('out').textContent = 'chunk:' + document.currentScript.getAttribute('src');",
+    );
+    let out = render_with(
+        net,
+        r#"<body><div id="out"></div><script>
+          const s = document.createElement('script');
+          s.src = '/chunk.js';
+          s.onload = () => { document.getElementById('out').textContent += ' loaded'; };
+          document.head.appendChild(s);
+          const inline = document.createElement('script');
+          inline.textContent = 'window.__inline = 1';
+          document.body.appendChild(inline);
+          const markup = document.createElement('div');
+          markup.innerHTML = '<script>window.__markup = 1<\/script>';
+          document.body.appendChild(markup);
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("chunk:/chunk.js loaded"),
+        "the inserted script ran with currentScript set, then fired load: {}",
+        out.html
+    );
+}
+
+#[test]
+fn a_submitted_form_is_a_post_navigation() {
+    let out = render(
+        r#"<body><form method="post" action="/login">
+          <input name="user" value="ann"><input name="remember" type="checkbox" checked>
+          <input name="skip" type="checkbox"><select name="lang"><option value="ru" selected>ru</option></select>
+        </form><script>document.querySelector('form').submit();</script></body>"#,
+    );
+    let nav = out
+        .requested_navigation
+        .expect("the submit asked to navigate");
+    assert_eq!(nav.method, "POST");
+    assert_eq!(nav.url, "https://example.com/login");
+    assert_eq!(nav.body.as_deref(), Some("user=ann&remember=on&lang=ru"));
+}
+
+#[test]
+fn a_node_is_one_object_and_attributes_are_a_named_map() {
+    let out = render(
+        r#"<body><div id="out"></div><p id="a"></p><p id="b"></p><script>
+          const a = document.getElementById('a'), b = document.getElementById('b');
+          a.__mine = 'kept';
+          const facts = [
+            a.parentNode === b.parentNode,
+            document.querySelector('#a').__mine === 'kept',
+            a.getRootNode() === document,
+            a.constructor.name,
+            document.body instanceof HTMLBodyElement && !(a instanceof HTMLBodyElement),
+          ];
+          a.setAttribute('onsubmit', 't');
+          facts.push(a.attributes.onsubmit.value, a.attributes.length, a.attributes[0].name);
+          a.removeAttributeNode(a.getAttributeNode('onsubmit'));
+          facts.push(a.hasAttribute('onsubmit'));
+          const frag = document.createDocumentFragment();
+          frag.appendChild(document.createElement('i'));
+          frag.appendChild(document.createElement('u'));
+          b.appendChild(frag);
+          facts.push(frag.nodeType, b.childNodes.length, frag.childNodes.length);
+          document.getElementById('out').textContent = facts.join('|');
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html
+            .contains("true|true|true|HTMLParagraphElement|true|t|2|id|false|11|2|0"),
+        "identity, prototypes, attributes and fragments behave: {}",
+        out.html
+    );
+}
+
+#[test]
+fn an_import_map_gives_a_bare_specifier_a_url() {
+    let net = StaticNetwork::new().route(
+        "/vendor/greet.js",
+        200,
+        "text/javascript",
+        "export const greet = (n) => 'hello ' + n;",
+    );
+    let out = render_with(
+        net,
+        r#"<head><script type="importmap">{"imports": {"greet": "/vendor/greet.js"}}</script></head>
+        <body><div id="out"></div><script type="module">
+          import { greet } from 'greet';
+          document.getElementById('out').textContent = greet(import.meta.url);
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("hello https://example.com/page"),
+        "the map resolved the specifier and import.meta.url is the page: {}",
+        out.html
+    );
+}
+
+#[test]
+fn a_template_has_content_and_a_parsed_document_has_a_body() {
+    let out = render(
+        r#"<body><template id="t"><p class="x">hi</p></template><div id="out"></div><script>
+          const t = document.getElementById('t');
+          const parsed = new DOMParser().parseFromString('<p>parsed</p>', 'text/html');
+          document.getElementById('out').textContent = [
+            t.content instanceof DocumentFragment,
+            t.content.cloneNode(true).querySelector('.x').textContent,
+            parsed.body.textContent,
+            document.createElement('canvas').getContext('2d') !== null,
+            typeof document.createElement('iframe').contentWindow.document.write,
+          ].join('|');
+        </script></body>"#,
+    );
+    assert!(out.errors.is_empty(), "no script errors: {:?}", out.errors);
+    assert!(
+        out.html.contains("true|hi|parsed|true|function"),
+        "templates, DOMParser, canvas and frames answer: {}",
+        out.html
+    );
+}
+
+#[test]
+fn a_call_as_a_for_in_target_parses_and_throws_only_when_assigned() {
+    // servicepipe's bot check does `for (f() in [])` inside try/catch to
+    // tell a browser from another engine. V8 parses it, runs the call, and
+    // throws only when there is a key to assign; QuickJS refused to parse it
+    // and the whole script died. The vendored QuickJS carries the fix.
+    let out = render(
+        r#"<body><div id="out"></div><script>
+          var calls = 0;
+          function f() { calls++; }
+          var facts = [];
+          try { for (f() in []); facts.push('empty ok'); } catch (e) { facts.push('empty threw ' + e.name); }
+          try { for (f() in {a: 1}); facts.push('keyed ok'); } catch (e) { facts.push('keyed ' + e.name); }
+          try { for (f() of [1]); facts.push('of ok'); } catch (e) { facts.push('of ' + e.name); }
+          facts.push('calls ' + calls);
+          document.getElementById('out').textContent = facts.join('|');
+        </script></body>"#,
+    );
+    assert!(
+        out.errors.is_empty(),
+        "the script itself parses: {:?}",
+        out.errors
+    );
+    assert!(
+        out.html
+            .contains("empty ok|keyed ReferenceError|of ReferenceError|calls 2"),
+        "V8's behaviour, exactly: {}",
+        out.html
     );
 }

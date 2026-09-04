@@ -9,6 +9,7 @@ mod policy;
 mod robots;
 pub mod site;
 pub mod tls;
+mod transport;
 
 pub use charset::{decode_body, sniff_charset};
 pub use policy::{Policy, PolicyError, ResourceKind};
@@ -35,6 +36,14 @@ pub struct ClientConfig {
     pub trust: TrustMode,
     /// Extra roots beyond the bundled ones, from a caller-supplied PEM bundle.
     pub extra_roots: Vec<ureq::tls::Certificate<'static>>,
+    /// The same bundles as PEM text, for the transport that parses its own.
+    pub extra_roots_pem: Vec<Vec<u8>>,
+    /// Present the handshake and HTTP/2 of a current Chrome rather than
+    /// rustls' own. Needs the `browser-tls` feature; without it this is
+    /// ignored. On by default when the feature is compiled in, because a
+    /// site that inspects the handshake serves a browser and refuses
+    /// anything else.
+    pub impersonate: bool,
     /// An HTTP or SOCKS proxy to send everything through.
     ///
     /// The handshake here is rustls, whose JA3 and JA4 are not Chrome's. A
@@ -57,11 +66,13 @@ impl Default for ClientConfig {
             user_agent: mar_js::state::default_user_agent().to_owned(),
             accept_language: "en-US,en;q=0.9".to_owned(),
             timeout: Duration::from_secs(15),
-            max_redirects: 5,
-            max_body_bytes: 8 * 1024 * 1024,
+            max_redirects: 20,
+            max_body_bytes: 32 * 1024 * 1024,
             policy: Policy::default(),
             trust: TrustMode::default(),
             extra_roots: Vec::new(),
+            extra_roots_pem: Vec::new(),
+            impersonate: cfg!(feature = "browser-tls"),
             proxy: None,
             obey_robots: false,
             keep_raw: false,
@@ -87,22 +98,20 @@ pub enum NetError {
 
 /// A blocking HTTP client with browser-shaped headers.
 ///
-/// One agent is shared across requests so connections and the cookie jar are
-/// reused. Cloning is cheap and thread-safe.
+/// One transport is shared across requests so connections and the cookie jar
+/// are reused. Cloning is cheap and thread-safe.
 #[derive(Clone)]
 pub struct HttpClient {
-    agent: ureq::Agent,
-    /// Used only to retry a request the primary agent rejected on certificate
-    /// grounds. See [`tls::TrustMode`].
-    fallback_agent: Option<ureq::Agent>,
+    /// What opens the sockets: rustls through ureq, or Chrome's handshake
+    /// through BoringSSL. `None` when the transport could not be built,
+    /// with the reason in `transport_error`.
+    transport: Option<Arc<dyn transport::Transport>>,
     config: Arc<ClientConfig>,
     requests: Arc<AtomicUsize>,
-    /// Hosts already known to need the fallback, so the second and later
-    /// requests to one skip the handshake that is going to fail.
-    needs_fallback: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
-    /// Set when the configured proxy would not parse. Every request fails with
-    /// it rather than quietly going direct.
-    proxy_error: Option<String>,
+    /// Set when the configured proxy would not parse, or the transport could
+    /// not be built. Every request fails with it rather than quietly going
+    /// direct.
+    transport_error: Option<String>,
     /// `robots.txt` per host, fetched at most once each.
     robots: Arc<std::sync::RwLock<std::collections::HashMap<String, robots::Rules>>>,
     /// Responses fetched ahead of the page asking for them.
@@ -120,54 +129,40 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub fn new(config: ClientConfig) -> Self {
-        // The bundled roots plus anything the caller added.
-        let mut extra = tls::extra_roots();
-        extra.extend(config.extra_roots.iter().cloned());
-
-        // A proxy that will not parse must not degrade into going direct. The
-        // caller asked for egress through somewhere specific, and silently
-        // ignoring that is how a scrape leaks its real address.
-        let mut proxy_error = None;
-        let proxy = match config.proxy.as_deref().map(ureq::Proxy::new) {
-            Some(Ok(p)) => Some(p),
-            Some(Err(e)) => {
-                proxy_error = Some(format!("proxy {:?} is not usable: {e}", config.proxy));
-                None
+    pub fn new(mut config: ClientConfig) -> Self {
+        let built: Result<Arc<dyn transport::Transport>, String> = {
+            #[cfg(feature = "browser-tls")]
+            {
+                if config.impersonate {
+                    transport::browser::BrowserTransport::new(&config)
+                        .map(|t| Arc::new(t) as Arc<dyn transport::Transport>)
+                } else {
+                    transport::ureq_transport::UreqTransport::new(&config)
+                        .map(|t| Arc::new(t) as Arc<dyn transport::Transport>)
+                }
             }
-            None => None,
+            #[cfg(not(feature = "browser-tls"))]
+            {
+                transport::ureq_transport::UreqTransport::new(&config)
+                    .map(|t| Arc::new(t) as Arc<dyn transport::Transport>)
+            }
         };
-
-        let build = |tls_config: ureq::tls::TlsConfig| -> ureq::Agent {
-            ureq::Agent::config_builder()
-                .timeout_global(Some(config.timeout))
-                // Redirects are followed here rather than in the engine so the
-                // page only ever sees the final URL.
-                .max_redirects(config.max_redirects)
-                .save_redirect_history(true)
-                .user_agent(&config.user_agent)
-                .tls_config(tls_config)
-                .proxy(proxy.clone())
-                // A 403 or a 503 is where the interesting bodies live: a bot
-                // check, a consent gate, a "you are not welcome" page. Treating
-                // the status as a transport error throws that body away, and
-                // the caller is then told the response had no content type,
-                // which is both wrong and unactionable.
-                .http_status_as_error(false)
-                .build()
-                .into()
+        let (transport, transport_error) = match built {
+            Ok(t) => {
+                // The page must claim to be what the handshake claims to be.
+                if let Some(ua) = t.user_agent() {
+                    config.user_agent = ua;
+                }
+                (Some(t), None)
+            }
+            Err(e) => (None, Some(e)),
         };
-
-        let agent = build(tls::primary_config(config.trust, &extra));
-        let fallback_agent = tls::fallback_config(config.trust, &extra).map(build);
 
         HttpClient {
-            agent,
-            fallback_agent,
+            transport,
             config: Arc::new(config),
             requests: Arc::new(AtomicUsize::new(0)),
-            needs_fallback: Arc::new(std::sync::RwLock::new(Default::default())),
-            proxy_error,
+            transport_error,
             robots: Arc::new(std::sync::RwLock::new(Default::default())),
             prefetched: Arc::new(std::sync::Mutex::new(Default::default())),
         }
@@ -214,8 +209,7 @@ impl HttpClient {
                         if std::time::Instant::now() >= deadline {
                             return;
                         }
-                        let Ok(fetched) =
-                            self.execute("GET", url, &[], None, kind, Some(referer))
+                        let Ok(fetched) = self.execute("GET", url, &[], None, kind, Some(referer))
                         else {
                             continue;
                         };
@@ -237,18 +231,16 @@ impl HttpClient {
 
     /// Does this client carry a second trust set to fall back on?
     pub fn has_extended_trust(&self) -> bool {
-        self.fallback_agent.is_some()
+        self.transport
+            .as_ref()
+            .is_some_and(|t| t.has_extended_trust())
     }
 
     /// Hosts that needed the extended trust set during this client's life.
     pub fn hosts_using_extended_trust(&self) -> Vec<String> {
-        self.needs_fallback
-            .read()
-            .map(|set| {
-                let mut hosts: Vec<String> = set.iter().cloned().collect();
-                hosts.sort();
-                hosts
-            })
+        self.transport
+            .as_ref()
+            .map(|t| t.hosts_using_extended_trust())
             .unwrap_or_default()
     }
 
@@ -261,51 +253,12 @@ impl HttpClient {
         self.requests.load(Ordering::Relaxed)
     }
 
-    /// Every agent that could serve a request, primary first.
-    ///
-    /// Each carries its own jar, and which one a host lands on is decided by
-    /// its certificate chain, so a cookie has to be written to both to survive
-    /// a switch between them.
-    fn agents(&self) -> impl Iterator<Item = &ureq::Agent> {
-        std::iter::once(&self.agent).chain(self.fallback_agent.iter())
-    }
-
     /// What `document.cookie` should read as on `url`.
     pub fn cookies_for(&self, url: &str) -> String {
-        let Ok(parsed) = url::Url::parse(url) else {
-            return String::new();
-        };
-        // The jar can only be queried by an exact domain, path and name triple,
-        // so the candidates a browser would match against are enumerated and
-        // the jar decides which of them it actually holds.
-        let domains = domain_candidates(parsed.host_str().unwrap_or_default());
-        let paths = path_candidates(parsed.path());
-
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for agent in self.agents() {
-            let jar = agent.cookie_jar_lock();
-            let names: Vec<String> = jar.iter().map(|c| c.name().to_owned()).collect();
-            for name in names {
-                if pairs.iter().any(|(existing, _)| *existing == name) {
-                    continue;
-                }
-                let found = domains.iter().find_map(|domain| {
-                    paths
-                        .iter()
-                        .find_map(|path| jar.get(domain, path, &name))
-                        .map(|c| c.value().to_owned())
-                });
-                if let Some(value) = found {
-                    pairs.push((name, value));
-                }
-            }
-        }
-
-        pairs
-            .into_iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ")
+        self.transport
+            .as_ref()
+            .map(|t| t.cookies_for(url))
+            .unwrap_or_default()
     }
 
     /// Apply a `document.cookie = ...` a script performed on `url`.
@@ -313,14 +266,8 @@ impl HttpClient {
     /// Kept verbatim rather than as a name and value, so `path`, `domain` and
     /// `expires` are honoured by the same rules a response's `Set-Cookie` gets.
     pub fn apply_script_cookie(&self, url: &str, raw: &str) {
-        let Ok(uri) = url.parse::<ureq::http::Uri>() else {
-            return;
-        };
-        for agent in self.agents() {
-            let Ok(cookie) = ureq::Cookie::parse(raw.to_owned(), &uri) else {
-                continue;
-            };
-            let _ = agent.cookie_jar_lock().insert(cookie, &uri);
+        if let Some(t) = &self.transport {
+            t.apply_script_cookie(url, raw);
         }
     }
 
@@ -340,8 +287,30 @@ impl HttpClient {
 
     /// Fetch a top-level document.
     pub fn get_document(&self, url: &str) -> Result<Fetched, NetError> {
+        self.fetch_document(url, "GET", None)
+    }
+
+    /// Fetch a top-level document by whatever method a navigation asked
+    /// for. A POST carries a form body; that is what a submitted form is.
+    pub fn fetch_document(
+        &self,
+        url: &str,
+        method: &str,
+        body: Option<&str>,
+    ) -> Result<Fetched, NetError> {
         self.check_robots(url)?;
-        self.execute("GET", url, &[], None, ResourceKind::Document, None)
+        tracing::debug!(
+            method,
+            url,
+            cookies = %self.cookies_for(url),
+            "document request"
+        );
+        let form = [(
+            "Content-Type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        )];
+        let headers: &[(String, String)] = if body.is_some() { &form } else { &[] };
+        self.execute(method, url, headers, body, ResourceKind::Document, None)
     }
 
     /// Refuse a document `robots.txt` puts off limits.
@@ -409,7 +378,9 @@ impl HttpClient {
     ) -> Vec<(&'static str, String)> {
         let mut headers = vec![
             ("Accept-Language", self.config.accept_language.clone()),
-            ("Accept-Encoding", "gzip, deflate, br".to_owned()),
+            // Only what this client can decode. Advertising deflate as a browser does
+            // invites a body nobody here can read.
+            ("Accept-Encoding", "gzip, br".to_owned()),
             ("Upgrade-Insecure-Requests", "1".to_owned()),
             (
                 "Sec-CH-UA",
@@ -469,9 +440,12 @@ impl HttpClient {
         kind: ResourceKind,
         referer: Option<&url::Url>,
     ) -> Result<Fetched, NetError> {
-        if let Some(problem) = &self.proxy_error {
+        if let Some(problem) = &self.transport_error {
             return Err(NetError::Transport(problem.clone()));
         }
+        let Some(transport) = &self.transport else {
+            return Err(NetError::Transport("no transport".to_owned()));
+        };
         let parsed = url::Url::parse(url).map_err(|source| NetError::Url {
             url: url.to_owned(),
             source,
@@ -488,12 +462,13 @@ impl HttpClient {
         }
         self.requests.fetch_add(1, Ordering::Relaxed);
 
-        // ureq 3 exposes typed per-method builders; going through the http
-        // crate keeps one code path for every method, body or not.
         let mut header_pairs: Vec<(String, String)> = self
             .browser_headers(kind, &parsed, referer)
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value))
+            // A transport that presents a browser sets that browser's own
+            // values for these, in that browser's order.
+            .filter(|(name, _)| !transport.owns_header(name))
             .collect();
         // Caller headers win: a page's own Content-Type or Authorization must
         // not be shadowed by the defaults above.
@@ -502,110 +477,29 @@ impl HttpClient {
             header_pairs.push((name.clone(), value.clone()));
         }
 
-        let body = body.filter(|b| !b.is_empty());
-        let uri = parsed.as_str().to_owned();
-        let method = method.to_owned();
-
-        // Built fresh for each attempt: `Agent::run` consumes the request, and
-        // a certificate retry needs an identical second copy.
-        let build = || -> Result<ureq::http::request::Builder, NetError> {
-            let mut builder = ureq::http::Request::builder()
-                .method(method.as_str())
-                .uri(&uri);
-            for (name, value) in &header_pairs {
-                builder = builder.header(name.as_str(), value.as_str());
-            }
-            Ok(builder)
-        };
-
-        // A bodyless request must carry no body at all. Handing ureq an empty
-        // string instead produces `Content-Length: 0` on a GET, which no
-        // browser sends and which a bot check reads as an automated client.
-        let send = |agent: &ureq::Agent| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-            let builder = match build() {
-                Ok(b) => b,
-                Err(_) => return Err(ureq::Error::BadUri(uri.clone())),
-            };
-            match body {
-                Some(text) => agent.run(builder.body(text).map_err(ureq::Error::Http)?),
-                None => agent.run(builder.body(()).map_err(ureq::Error::Http)?),
-            }
-        };
-
-        // A host already known to need the extended trust set skips straight
-        // to it rather than repeating a handshake that is going to fail.
-        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-        let known_fallback = self
-            .needs_fallback
-            .read()
-            .map(|set| set.contains(&host))
-            .unwrap_or(false);
-
-        let first_agent = match (known_fallback, &self.fallback_agent) {
-            (true, Some(agent)) => agent,
-            _ => &self.agent,
-        };
-
-        let mut outcome = send(first_agent);
-
-        // Retry once against the extended trust set when the public roots
-        // rejected the chain. Only a certificate failure qualifies: a refused
-        // connection or a timeout would fail the same way twice.
-        if !known_fallback
-            && let Some(fallback) = &self.fallback_agent
-            && let Err(e) = &outcome
-            && tls::is_certificate_error(&e.to_string())
-        {
-            tracing::debug!(host = %host, "retrying with the extended trust set");
-            let retried = send(fallback);
-            if retried.is_ok()
-                && let Ok(mut set) = self.needs_fallback.write()
-            {
-                set.insert(host.clone());
-            }
-            outcome = retried;
-        }
-
-        let mut response = match outcome {
-            Ok(r) => r,
-            Err(e) => return Err(NetError::Transport(e.to_string())),
-        };
-
-        let status = response.status().as_u16();
-        let status_text = response
-            .status()
-            .canonical_reason()
-            .unwrap_or_default()
-            .to_owned();
-        let headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_owned())))
-            .collect();
-        let final_url = {
-            use ureq::ResponseExt;
-            response.get_uri().to_string()
-        };
+        let incoming = transport
+            .send(transport::Outgoing {
+                method,
+                url: parsed.as_str(),
+                headers: &header_pairs,
+                body,
+                limit: self.config.max_body_bytes,
+            })
+            .map_err(NetError::Transport)?;
+        let transport::Incoming {
+            status,
+            status_text,
+            final_url,
+            headers,
+            body: raw,
+            truncated,
+        } = incoming;
         let content_type = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-
-        // Bodies come back as raw bytes: ureq's own charset support is not
-        // enabled, because it transcodes from the Content-Type header alone and
-        // would decode a body this crate then decodes again. `decode_body`
-        // below follows the full sniffing order instead.
-        let limit = self.config.max_body_bytes;
-        let raw = response
-            .body_mut()
-            .with_config()
-            // +1 so a body exactly at the limit is not reported as truncated.
-            .limit((limit + 1) as u64)
-            .read_to_vec()
-            .map_err(|e| NetError::Transport(e.to_string()))?;
-        let truncated = raw.len() > limit;
-        let raw = if truncated { &raw[..limit] } else { &raw[..] };
+        let raw = &raw[..];
 
         // Keep a small window of the original bytes: the decoded text cannot
         // be used to recognise a binary format.
@@ -654,38 +548,6 @@ fn registrable(host: &str) -> String {
         return host.to_ascii_lowercase();
     }
     labels[labels.len() - 2..].join(".").to_ascii_lowercase()
-}
-
-/// A host and every parent a cookie could have been scoped to.
-///
-/// `www.gosuslugi.ru` yields itself and `gosuslugi.ru`, which is what a
-/// `Domain=` attribute one level up produces.
-fn domain_candidates(host: &str) -> Vec<String> {
-    let host = host.trim_start_matches('.').to_ascii_lowercase();
-    let mut out = vec![host.clone()];
-    let labels: Vec<&str> = host.split('.').collect();
-    for cut in 1..labels.len().saturating_sub(1) {
-        out.push(labels[cut..].join("."));
-    }
-    out
-}
-
-/// A path and every prefix directory of it, longest first, as cookie matching
-/// walks upward from the request path to the root.
-fn path_candidates(path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = if path.is_empty() { "/" } else { path };
-    loop {
-        out.push(current.to_owned());
-        match current.rfind('/') {
-            Some(0) | None => break,
-            Some(cut) => current = &current[..cut],
-        }
-    }
-    if !out.iter().any(|p| p == "/") {
-        out.push("/".to_owned());
-    }
-    out
 }
 
 /// What kind of resource a response holds.
@@ -907,7 +769,10 @@ mod cookie_tests {
     use super::*;
 
     fn client() -> HttpClient {
-        HttpClient::new(ClientConfig::default())
+        HttpClient::new(ClientConfig {
+            impersonate: false,
+            ..ClientConfig::default()
+        })
     }
 
     #[test]
@@ -953,6 +818,7 @@ mod cookie_tests {
 
     #[test]
     fn candidates_walk_up_the_host_and_the_path() {
+        use crate::transport::{domain_candidates, path_candidates};
         assert_eq!(
             domain_candidates("www.gosuslugi.ru"),
             ["www.gosuslugi.ru", "gosuslugi.ru"]

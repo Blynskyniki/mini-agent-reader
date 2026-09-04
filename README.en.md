@@ -111,6 +111,25 @@ the request budget allows.
 Wikipedia is the memory ceiling: a document over a megabyte costs 27.7 MB, still
 half what Chromium spends on an empty tab.
 
+### Coverage
+
+Speed is worth nothing on a page that comes out blank, so there is a second
+harness: `bench/corpus.json`, 453 live sites — the top of the Tranco list with
+infrastructure, parked and duplicate hosts removed, plus the Russian web and a
+set of client-rendered applications — read by `chrome-headless-shell` and by
+`mar` in the same session, reduced to visible text the same way, and compared.
+A page "reads" at 60% of Chrome's text or more.
+
+| | reads | of what Chrome read |
+|---|---|---|
+| Chrome | 342 / 453 | — |
+| mar, rustls handshake | 267 | 78% |
+| mar, `browser-tls` | 278 | 81% |
+
+Most of the rest is a bot check that decides on the browser itself rather than
+on the handshake, and a few are applications that keep their work in a
+`Worker`. `python3 bench/corpus.py --chrome` reproduces the table.
+
 ### Where the difference comes from
 
 Three sources, in order of contribution.
@@ -212,6 +231,12 @@ Arguments cross that surface the way the DOM says they do. `setAttribute('x',
 42)` and `el.className = 1` are ordinary code, so a string parameter takes
 `ToString(value)` rather than refusing anything that is not already a string.
 
+**The parser is the web's, not the spec's, where the two disagree.** QuickJS
+is vendored with one change: `for (f() in o)` parses, runs the call, and throws
+a ReferenceError only when there is a key to assign, which is what V8 does.
+A bot check wraps `for (f() in [])` in `try/catch` to tell a browser from
+another engine, and an engine that refuses to parse it fails the whole script.
+
 **Classic scripts run in sloppy mode**, because that is what a `<script>` is.
 Under strict mode an assignment to an undeclared name is a ReferenceError, and
 that is not a corner case: React's streaming markup bootstraps itself with bare
@@ -219,12 +244,31 @@ that is not a corner case: React's streaming markup bootstraps itself with bare
 suspense boundary on every server-rendered React page.
 
 **Modules are the host's job too.** An `import` is resolved against the
-importing module's URL and fetched through the same seam as every other
-subresource, on the same budget. QuickJS asks for it synchronously, part-way
-through the module that imported it, which is exactly what a blocking provider
-and a virtual clock are for. A module's body runs inside a promise, so a throw
-on its first line is watched for rather than lost — otherwise an application
-that died immediately looks like one that rendered nothing on purpose.
+importing module's URL — or through the page's `<script type="importmap">`,
+which is what gives `import '@wordpress/interactivity'` somewhere to go — and
+fetched through the same seam as every other subresource, on the same budget.
+QuickJS asks for it synchronously, part-way through the module that imported
+it, which is exactly what a blocking provider and a virtual clock are for. A
+module's body runs inside a promise, so a throw on its first line is watched
+for rather than lost — otherwise an application that died immediately looks
+like one that rendered nothing on purpose. `import.meta.url` is set, because
+`new URL('.', import.meta.url)` is how a bundle finds its own assets.
+
+**A script the page inserts runs.** Webpack loads every lazy chunk by
+appending a `<script src>`, a tag manager loads everything that way, and a page
+whose inserted scripts never ran is a page whose application never started. An
+inserted script is fetched and run with `document.currentScript` pointing at
+it, fires `load` or `error` on its element, and a submitted form is a
+navigation — a POST with a body when the form says so, which is how a
+single-sign-on redirect chain gets through.
+
+**A node is one object.** The same element is the same JavaScript object every
+time the page reaches it, so a `WeakMap` keyed by element, an expando such as
+`el.__reactFiber$…`, and `a.parentNode === b.parentNode` all behave. Each node
+comes out of the bridge with the prototype for its tag — `HTMLDivElement`,
+`HTMLTemplateElement`, `Text` — chained the way the DOM chains them, so a
+polyfill that patches one interface's prototype reaches that interface and
+nothing else.
 
 **A virtual clock.** Timers sit in a heap keyed by due time. When microtasks are
 drained and no network call is outstanding, the clock jumps to the next timer.
@@ -482,10 +526,25 @@ something, sets a cookie and calls `location.reload()` is served the real thing
 on the second request — which also means a repeat of a URL counts as a loop only
 when the cookies are unchanged too, because otherwise it is a different request.
 
-What is missing: TLS fingerprint spoofing. The handshake is rustls, and its JA3
-and JA4 differ from Chrome's. Sites that check exactly that will see the
-difference. If you need parity, put a fingerprint-impersonating proxy in front
-and point `--proxy` at it:
+The handshake can look like a browser's too. A build with the `browser-tls`
+feature speaks TLS and HTTP/2 through BoringSSL exactly as a current Chrome
+does — cipher order, extension set, GREASE, ALPS, the HTTP/2 SETTINGS frame —
+so JA3, JA4 and Akamai's HTTP/2 fingerprint all match, and `navigator.userAgent`
+says the same version the handshake does. On the corpus this is what opens
+reddit, x.com, tass.ru, lamoda.ru, mvideo.ru, target.com and g1.globo.com,
+each of which refuses rustls' handshake outright.
+
+```bash
+cargo build --release --features browser-tls   # needs cmake and a C++ compiler
+mar read https://www.reddit.com/r/rust/
+mar --no-impersonate read https://example.com/  # rustls' own handshake
+```
+
+What it does not do is solve a challenge. Cloudflare's "Just a moment" page
+and Akamai's "Access Denied" decide on more than the handshake — they run
+JavaScript that measures the browser — and a matching fingerprint gets the
+challenge served rather than the page. A proxy still works for whatever the
+build lacks:
 
 ```bash
 mar --proxy socks5://127.0.0.1:1080 read https://example.com/
@@ -493,7 +552,8 @@ mar --proxy socks5://127.0.0.1:1080 read https://example.com/
 
 A proxy that will not parse fails every request rather than quietly going
 direct: silently falling back is how a scrape leaks the address it was trying
-not to use.
+not to use. With no `--proxy`, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from
+the environment are honoured, the way `curl` and a browser honour them.
 
 ## Safety
 
@@ -518,12 +578,16 @@ read, not which stylesheet a page it was already allowed to read pulls in.
 Known and deliberate:
 
 - **No screenshots or PDFs.** They need the renderer this project removes.
-- **No TLS fingerprint spoofing.** Headers look like Chrome; the handshake
-  does not. `--proxy` is the way around it.
-- **No import maps.** A bare specifier (`import x from 'lodash'`) has nothing
-  to resolve against and is reported as such rather than guessed at.
-- **No WebSocket, Worker, WebGL, canvas or media.** They construct without
-  throwing and do nothing.
+- **TLS fingerprint only with `browser-tls`.** The default build's handshake
+  is rustls, and a site that decides from the handshake alone can tell. The
+  feature costs a BoringSSL build; `--proxy` is the other way around it.
+- **No WebSocket, Worker, WebGL or media.** They construct without throwing
+  and do nothing; a `Worker` is reported, because a page that put its work in
+  one has silently lost it. A canvas hands out a 2D context that measures and
+  draws nothing, which is enough for the libraries that open one at import
+  time.
+- **No custom element upgrades.** `customElements.define` records nothing, so
+  a page built entirely from web components renders its light DOM and no more.
 - **No layout.** Nothing is positioned or wrapped. What an element reports for
   `getBoundingClientRect` and `offsetWidth` is derived from the cascade — an
   explicit `width` in a stylesheet or an inline style, a `width` attribute on a
@@ -535,9 +599,6 @@ Known and deliberate:
   ICU. Dates and prices come out plausible rather than exact. It is a shim and
   not an omission for one reason: without any `Intl` at all, a page that formats
   a single price throws inside its render and paints nothing.
-- **No TLS fingerprint.** The handshake is rustls, not a browser's. A few
-  sites accept the same request from `curl` and refuse it here, and the answer
-  is a fingerprint-impersonating proxy rather than anything in this code.
 - **Trackers are not fetched.** Analytics, ad exchanges and chat widgets are
   skipped by domain: they cost a request each and change nothing a reader will
   see. Everything else the page asks for is fetched, wherever it is hosted,
@@ -553,7 +614,7 @@ Known and deliberate:
 cargo test
 ```
 
-A hundred and twenty tests: DOM structure and serialization round-trips, CSS
+About a hundred and thirty tests: DOM structure and serialization round-trips, CSS
 selector semantics, charset sniffing in the spec's precedence order (including a
 regression for double-decoded koi8-r), SSRF policy, which hosts count as the
 same site, `robots.txt` grouping and longest-match precedence, the cookie jar

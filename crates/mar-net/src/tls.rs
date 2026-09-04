@@ -60,6 +60,11 @@ pub fn extra_roots() -> Vec<Certificate<'static>> {
         .collect()
 }
 
+/// The bundled roots as PEM, for a transport that builds its own store.
+pub fn extra_roots_pem() -> Vec<&'static [u8]> {
+    vec![RU_ROOT_CA, RU_SUB_CA]
+}
+
 /// Describe the bundled certificates without pulling in an X.509 parser: the
 /// fields below are fixed properties of these two files.
 pub fn bundled_certs() -> Vec<BundledCert> {

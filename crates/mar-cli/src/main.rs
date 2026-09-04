@@ -49,11 +49,19 @@ struct Cli {
     /// Send everything through an HTTP or SOCKS proxy, e.g.
     /// `http://127.0.0.1:8080` or `socks5://user:pass@host:1080`.
     ///
-    /// This is also the answer to TLS fingerprinting: the handshake here is
-    /// rustls, whose JA3 and JA4 are not Chrome's, so a site that checks
-    /// exactly that wants a fingerprint-impersonating proxy in front.
+    /// Without one, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from the
+    /// environment are honoured.
     #[arg(long, global = true, env = "MAR_PROXY", value_name = "URL")]
     proxy: Option<String>,
+
+    /// Present rustls' own TLS handshake instead of Chrome's.
+    ///
+    /// A build with the `browser-tls` feature speaks TLS and HTTP/2 exactly
+    /// as a current Chrome does, which is what a site that inspects the
+    /// handshake expects to see. This turns that off. A build without the
+    /// feature always uses rustls, and the flag changes nothing.
+    #[arg(long, global = true, env = "MAR_NO_IMPERSONATE")]
+    no_impersonate: bool,
 
     /// Ask each site's robots.txt before fetching a page from it.
     #[arg(long, global = true, env = "MAR_OBEY_ROBOTS")]
@@ -226,7 +234,7 @@ struct RenderArgs {
     horizon_ms: i64,
 
     /// Memory ceiling for the JavaScript heap, in megabytes.
-    #[arg(long, default_value_t = 64, env = "MAR_MEMORY_MB")]
+    #[arg(long, default_value_t = 256, env = "MAR_MEMORY_MB")]
     memory_mb: usize,
 }
 
@@ -302,6 +310,7 @@ fn main() {
     };
 
     let mut ca_bundle = Vec::new();
+    let mut ca_bundle_pem = Vec::new();
     for path in &cli.ca_bundle {
         match mar_net::load_pem_bundle(path) {
             Ok(certs) => ca_bundle.extend(certs),
@@ -310,13 +319,18 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        if let Ok(bytes) = std::fs::read(path) {
+            ca_bundle_pem.push(bytes);
+        }
     }
 
     let egress = Egress {
         mode: cli.trust.into(),
         extra_roots: ca_bundle,
+        extra_roots_pem: ca_bundle_pem,
         proxy: cli.proxy.clone(),
         obey_robots: cli.obey_robots,
+        impersonate: !cli.no_impersonate,
     };
 
     if let Err(e) = run(cli.command, policy, egress) {
@@ -330,19 +344,24 @@ fn main() {
 struct Egress {
     mode: mar_net::TrustMode,
     extra_roots: Vec<ureq::tls::Certificate<'static>>,
+    extra_roots_pem: Vec<Vec<u8>>,
     proxy: Option<String>,
     obey_robots: bool,
+    impersonate: bool,
 }
 
 impl Egress {
     fn client_config(&self, policy: Policy) -> mar_net::ClientConfig {
+        let defaults = mar_net::ClientConfig::default();
         mar_net::ClientConfig {
             policy,
             trust: self.mode,
             extra_roots: self.extra_roots.clone(),
+            extra_roots_pem: self.extra_roots_pem.clone(),
             proxy: self.proxy.clone(),
             obey_robots: self.obey_robots,
-            ..Default::default()
+            impersonate: defaults.impersonate && self.impersonate,
+            ..defaults
         }
     }
 }

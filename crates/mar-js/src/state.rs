@@ -4,9 +4,9 @@ use crate::net::HttpResponse;
 use crate::timers::TimerQueue;
 use mar_dom::NodeId;
 use std::cell::RefCell;
-use std::time::Instant;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,28 @@ pub struct ScriptError {
     pub source: String,
 }
 
+/// Where a page asked to go, and how.
+///
+/// A `location.href` assignment is a GET, but a `form.submit()` on a POST
+/// form is a POST with a body, and the login and single-sign-on flows that
+/// use one are not reachable any other way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Navigation {
+    pub url: String,
+    pub method: String,
+    pub body: Option<String>,
+}
+
+impl Navigation {
+    pub fn get(url: impl Into<String>) -> Self {
+        Navigation {
+            url: url.into(),
+            method: "GET".to_owned(),
+            body: None,
+        }
+    }
+}
+
 /// Limits that keep one page from consuming the process.
 #[derive(Debug, Clone)]
 pub struct Limits {
@@ -68,12 +90,12 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            memory_bytes: 64 * 1024 * 1024,
+            memory_bytes: 256 * 1024 * 1024,
             stack_bytes: 1024 * 1024,
             wall_ms: 15_000,
             virtual_horizon_ms: 10_000,
             max_timer_callbacks: 10_000,
-            max_requests: 128,
+            max_requests: 384,
             max_console_bytes: 256 * 1024,
         }
     }
@@ -100,7 +122,7 @@ pub struct PageState {
     pub session_storage: HashMap<String, String>,
     /// Set when a script assigns `location.href` or calls `location.replace`.
     /// The caller decides whether to follow it.
-    pub requested_navigation: Option<String>,
+    pub requested_navigation: Option<Navigation>,
     /// `document.readyState`.
     pub ready_state: &'static str,
     /// The `<script>` element currently executing, for `document.currentScript`.

@@ -7,8 +7,9 @@
 
 use mar_dom::{Document, LocalName, Matcher, NodeData, NodeId, QualName, StrTendril, ns};
 use rquickjs::class::{Trace, Tracer};
-use rquickjs::{Class, Ctx, Error, IntoJs, JsLifetime, Result, Value};
+use rquickjs::{Class, Ctx, Error, IntoJs, JsLifetime, Object, Persistent, Result, Value};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// A string argument, coerced the way the DOM coerces.
@@ -31,12 +32,13 @@ impl<'js> rquickjs::FromJs<'js> for JsString {
                 .as_string()
                 .expect("a string value has a string")
                 .to_string()?,
-            _ => value.get::<rquickjs::Coerced<String>>().map(|c| c.0).or_else(
-                |_| -> Result<String> {
+            _ => value
+                .get::<rquickjs::Coerced<String>>()
+                .map(|c| c.0)
+                .or_else(|_| -> Result<String> {
                     let _ = ctx;
                     Ok(String::new())
-                },
-            )?,
+                })?,
         }))
     }
 }
@@ -60,30 +62,130 @@ impl From<JsString> for StrTendril {
     }
 }
 
+/// The prototypes a node handle is created with, one per kind of node and
+/// one per tag, as the prelude built them.
+///
+/// A `<div>` is an `HTMLDivElement`, and a page that patches
+/// `HTMLTemplateElement.prototype` expects the patch to reach templates and
+/// nothing else. With one prototype for every node the patch reaches every
+/// node, and with none of these registered every node is a bare `Node`.
+#[derive(Default)]
+pub struct Prototypes {
+    element: Option<Persistent<Object<'static>>>,
+    document: Option<Persistent<Object<'static>>>,
+    fragment: Option<Persistent<Object<'static>>>,
+    text: Option<Persistent<Object<'static>>>,
+    comment: Option<Persistent<Object<'static>>>,
+    doctype: Option<Persistent<Object<'static>>>,
+    by_tag: HashMap<String, Persistent<Object<'static>>>,
+}
+
+/// One JS object per node, for as long as the page lives.
+///
+/// The DOM's identity rule is that the same node is the same object: a page
+/// keeps a `WeakMap` keyed by element, sets `el.__reactFiber$` and reads it
+/// back off `event.target.parentNode`, and compares `a.parentNode ===
+/// b.parentNode`. A fresh handle on every access breaks all three, and with
+/// them React's event delegation, Alpine's scopes and anything else that
+/// remembers an element.
+#[derive(Default)]
+pub struct Handles {
+    cache: HashMap<u32, Persistent<Object<'static>>>,
+    prototypes: Prototypes,
+}
+
 /// The page document, shared between Rust and every JS handle.
 #[derive(Clone)]
-pub struct SharedDoc(Rc<RefCell<Document>>);
+pub struct SharedDoc {
+    doc: Rc<RefCell<Document>>,
+    handles: Rc<RefCell<Handles>>,
+}
 
 impl SharedDoc {
     pub fn new(doc: Document) -> Self {
-        SharedDoc(Rc::new(RefCell::new(doc)))
+        SharedDoc {
+            doc: Rc::new(RefCell::new(doc)),
+            handles: Rc::new(RefCell::new(Handles::default())),
+        }
     }
 
     #[inline]
     pub fn borrow(&self) -> std::cell::Ref<'_, Document> {
-        self.0.borrow()
+        self.doc.borrow()
     }
 
     #[inline]
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Document> {
-        self.0.borrow_mut()
+        self.doc.borrow_mut()
     }
 
     /// Take the document back out once scripting is done.
     pub fn into_inner(self) -> std::result::Result<Document, Self> {
-        Rc::try_unwrap(self.0)
+        let handles = self.handles.clone();
+        Rc::try_unwrap(self.doc)
             .map(RefCell::into_inner)
-            .map_err(SharedDoc)
+            .map_err(|doc| SharedDoc { doc, handles })
+    }
+
+    /// Forget every handle. Must run while the runtime that owns them is
+    /// still alive: a handle freed after it is a use after free.
+    pub fn clear_handles(&self) {
+        if let Ok(mut handles) = self.handles.try_borrow_mut() {
+            handles.cache.clear();
+            handles.prototypes = Prototypes::default();
+        }
+    }
+
+    /// Install the prototypes the prelude built. `tags` maps a lower-case
+    /// tag name to the prototype its elements get.
+    pub fn register_prototypes<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        kinds: Object<'js>,
+        tags: Object<'js>,
+    ) -> Result<()> {
+        let save = |name: &str| -> Result<Option<Persistent<Object<'static>>>> {
+            let value: Option<Object<'js>> = kinds.get(name)?;
+            Ok(value.map(|o| Persistent::save(ctx, o)))
+        };
+        let mut prototypes = Prototypes {
+            element: save("element")?,
+            document: save("document")?,
+            fragment: save("fragment")?,
+            text: save("text")?,
+            comment: save("comment")?,
+            doctype: save("doctype")?,
+            by_tag: HashMap::new(),
+        };
+        for (tag, proto) in tags.props::<String, Object<'js>>().flatten() {
+            prototypes
+                .by_tag
+                .insert(tag.to_ascii_lowercase(), Persistent::save(ctx, proto));
+        }
+        if let Ok(mut handles) = self.handles.try_borrow_mut() {
+            handles.prototypes = prototypes;
+        }
+        Ok(())
+    }
+
+    /// The prototype a fresh handle for `id` should have, if one is registered.
+    fn prototype_for<'js>(&self, ctx: &Ctx<'js>, id: NodeId) -> Option<Object<'js>> {
+        let handles = self.handles.try_borrow().ok()?;
+        let protos = &handles.prototypes;
+        let doc = self.doc.try_borrow().ok()?;
+        let chosen = match doc.data(id) {
+            NodeData::Element(e) => {
+                let tag = e.local_name().as_ref();
+                protos.by_tag.get(tag).or(protos.element.as_ref())
+            }
+            NodeData::Text(_) => protos.text.as_ref(),
+            NodeData::Comment(_) => protos.comment.as_ref(),
+            NodeData::Document if id == doc.root() => protos.document.as_ref(),
+            NodeData::Document => protos.fragment.as_ref(),
+            NodeData::Doctype { .. } => protos.doctype.as_ref(),
+            NodeData::ProcessingInstruction { .. } => protos.comment.as_ref(),
+        }?;
+        chosen.clone().restore(ctx).ok()
     }
 
     /// Copy the current tree out without consuming the handle.
@@ -121,9 +223,28 @@ impl DomNode {
         DomNode { doc, id }
     }
 
-    /// Wrap a node id as a JS object.
+    /// The JS object for a node: the one it already has, or a new one that
+    /// is remembered from now on.
     pub fn wrap<'js>(ctx: &Ctx<'js>, doc: &SharedDoc, id: NodeId) -> Result<Class<'js, DomNode>> {
-        Class::instance(ctx.clone(), DomNode::new(doc.clone(), id))
+        let key = id.as_u32();
+        if let Ok(handles) = doc.handles.try_borrow()
+            && let Some(kept) = handles.cache.get(&key)
+        {
+            let object = kept.clone().restore(ctx)?;
+            if let Some(class) = Class::<DomNode>::from_object(&object) {
+                return Ok(class);
+            }
+        }
+        let node = DomNode::new(doc.clone(), id);
+        let class = match doc.prototype_for(ctx, id) {
+            Some(proto) => Class::instance_proto(node, proto)?,
+            None => Class::instance(ctx.clone(), node)?,
+        };
+        if let Ok(mut handles) = doc.handles.try_borrow_mut() {
+            let object: Object<'js> = class.clone().into_inner();
+            handles.cache.insert(key, Persistent::save(ctx, object));
+        }
+        Ok(class)
     }
 
     /// Wrap an optional node id, mapping `None` to JS `null`.
@@ -164,6 +285,46 @@ impl DomNode {
             .and_then(|e| e.attr(&LocalName::from(name)).map(str::to_owned))
     }
 
+    /// What inserting `node` actually inserts: the node, or, for a document
+    /// fragment, its children. A fragment is a carrier, and a page that
+    /// builds one and appends it expects the children in the tree and the
+    /// fragment empty afterwards.
+    fn to_insert(&self, node: NodeId) -> Vec<NodeId> {
+        let doc = self.doc.borrow();
+        let is_fragment = matches!(doc.data(node), NodeData::Document) && node != doc.root();
+        if is_fragment {
+            doc.children(node).collect()
+        } else {
+            vec![node]
+        }
+    }
+
+    /// The content fragment of a `<template>`, made on first use for a
+    /// template the page built itself; `None` for any other element.
+    fn template_contents(&self) -> Option<NodeId> {
+        let existing = {
+            let doc = self.doc.borrow();
+            match doc.element(self.id) {
+                Some(e) if e.local_name().as_ref() == "template" => Some(e.template_contents),
+                _ => None,
+            }
+        }?;
+        Some(existing.unwrap_or_else(|| {
+            let mut doc = self.doc.borrow_mut();
+            let id = doc.create(NodeData::Document);
+            if let Some(el) = doc.element_mut(self.id) {
+                el.template_contents = Some(id);
+            }
+            id
+        }))
+    }
+
+    /// Where an element's markup lives: under it, or, for a template, in its
+    /// content fragment.
+    fn markup_root(&self) -> NodeId {
+        self.template_contents().unwrap_or(self.id)
+    }
+
     fn set_attr_raw(&self, name: &str, value: &str) {
         let mut doc = self.doc.borrow_mut();
         if let Some(el) = doc.element_mut(self.id) {
@@ -172,6 +333,22 @@ impl DomNode {
                 StrTendril::from(value),
             );
         }
+    }
+}
+
+/// JavaScript truthiness, for a flag a page may pass as anything.
+fn truthy(value: &Value<'_>) -> bool {
+    match value.type_of() {
+        rquickjs::Type::Undefined | rquickjs::Type::Null | rquickjs::Type::Uninitialized => false,
+        rquickjs::Type::Bool => value.as_bool().unwrap_or(false),
+        rquickjs::Type::Int | rquickjs::Type::Float => {
+            value.as_number().is_some_and(|n| n != 0.0 && !n.is_nan())
+        }
+        rquickjs::Type::String => value
+            .as_string()
+            .and_then(|s| s.to_string().ok())
+            .is_some_and(|s| !s.is_empty()),
+        _ => true,
     }
 }
 
@@ -186,52 +363,60 @@ fn throw_str(ctx: &Ctx<'_>, message: &str) -> Error {
 impl DomNode {
     // ---- identity ------------------------------------------------------
 
-    #[qjs(get)]
+    // A detached Document node stands in for a fragment, and a script tells
+    // the two apart by nodeType: React and every sanitiser branch on 11.
+    #[qjs(get, configurable)]
     fn node_type(&self) -> u16 {
-        self.doc.borrow().data(self.id).node_type()
+        let doc = self.doc.borrow();
+        match doc.data(self.id) {
+            NodeData::Document if self.id != doc.root() => 11,
+            data => data.node_type(),
+        }
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn node_name(&self) -> String {
         let doc = self.doc.borrow();
         match doc.data(self.id) {
             NodeData::Element(e) => e.local_name().as_ref().to_ascii_uppercase(),
             NodeData::Text(_) => "#text".into(),
             NodeData::Comment(_) => "#comment".into(),
+            NodeData::Document if self.id != doc.root() => "#document-fragment".into(),
             NodeData::Document => "#document".into(),
             NodeData::Doctype { name, .. } => name.to_string(),
             NodeData::ProcessingInstruction { target, .. } => target.to_string(),
         }
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn tag_name(&self) -> Option<String> {
         self.tag().map(|t| t.to_ascii_uppercase())
     }
 
-    #[qjs(get, rename = "localName")]
+    #[qjs(get, rename = "localName", configurable)]
     fn js_local_name(&self) -> Option<String> {
         self.tag()
     }
 
     /// Stable arena id. The CDP layer addresses nodes by this.
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn mar_node_id(&self) -> u32 {
         self.id.as_u32()
     }
 
     // ---- tree ----------------------------------------------------------
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn parent_node<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let doc = self.doc.borrow();
-        // The arena root stands in for `document`; it is not an element parent.
-        let parent = doc.node(self.id).parent.filter(|&p| p != doc.root());
-        drop(doc);
+        // The arena root stands in for `document`, and `document` is what the
+        // DOM says the parent of <html> is. A walk up from any node therefore
+        // ends at the document, which is where a delegated listener sits: a
+        // `document.addEventListener('click')` has to see a click that bubbled.
+        let parent = self.doc.borrow().node(self.id).parent;
         DomNode::wrap_opt(&ctx, &self.doc, parent)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn parent_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let doc = self.doc.borrow();
         let parent = doc
@@ -242,13 +427,13 @@ impl DomNode {
         DomNode::wrap_opt(&ctx, &self.doc, parent)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn child_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let ids: Vec<_> = self.doc.borrow().children(self.id).collect();
         DomNode::wrap_list(&ctx, &self.doc, ids)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn children<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let doc = self.doc.borrow();
         let ids: Vec<_> = doc
@@ -259,7 +444,7 @@ impl DomNode {
         DomNode::wrap_list(&ctx, &self.doc, ids)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn child_element_count(&self) -> usize {
         let doc = self.doc.borrow();
         doc.children(self.id)
@@ -267,19 +452,19 @@ impl DomNode {
             .count()
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn first_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let id = self.doc.borrow().node(self.id).first_child;
         DomNode::wrap_opt(&ctx, &self.doc, id)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn last_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let id = self.doc.borrow().node(self.id).last_child;
         DomNode::wrap_opt(&ctx, &self.doc, id)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn first_element_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let doc = self.doc.borrow();
         let id = doc.children(self.id).find(|&c| doc.data(c).is_element());
@@ -287,7 +472,7 @@ impl DomNode {
         DomNode::wrap_opt(&ctx, &self.doc, id)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn last_element_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let doc = self.doc.borrow();
         let id = doc
@@ -298,37 +483,43 @@ impl DomNode {
         DomNode::wrap_opt(&ctx, &self.doc, id)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn next_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let id = self.doc.borrow().node(self.id).next_sibling;
         DomNode::wrap_opt(&ctx, &self.doc, id)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn previous_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let id = self.doc.borrow().node(self.id).prev_sibling;
         DomNode::wrap_opt(&ctx, &self.doc, id)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn next_element_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let id = self.doc.borrow().next_element_sibling(self.id);
         DomNode::wrap_opt(&ctx, &self.doc, id)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn previous_element_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let id = self.doc.borrow().prev_element_sibling(self.id);
         DomNode::wrap_opt(&ctx, &self.doc, id)
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn owner_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         // `document` is installed as a global; hand back the same object.
         ctx.globals().get::<_, Value>("document")
     }
 
-    fn contains(&self, other: Class<'_, DomNode>) -> bool {
+    // `contains(null)` and `contains(window)` are false, not exceptions: the
+    // usual caller is `if (!menu.contains(event.target))` and the target is
+    // whatever the event landed on.
+    fn contains(&self, other: Value<'_>) -> bool {
+        let Some(other) = other.as_object().and_then(Class::<DomNode>::from_object) else {
+            return false;
+        };
         let other_id = other.borrow().id;
         self.doc.borrow().contains(self.id, other_id)
     }
@@ -348,7 +539,9 @@ impl DomNode {
         if self.doc.borrow().contains(child_id, self.id) {
             return Err(throw_str(&ctx, "HierarchyRequestError: cyclic appendChild"));
         }
-        self.doc.borrow_mut().append(self.id, child_id);
+        for id in self.to_insert(child_id) {
+            self.doc.borrow_mut().append(self.id, id);
+        }
         Ok(child)
     }
 
@@ -356,8 +549,9 @@ impl DomNode {
         &self,
         ctx: Ctx<'js>,
         node: Class<'js, DomNode>,
-        reference: Option<Class<'js, DomNode>>,
+        reference: rquickjs::function::Opt<Option<Class<'js, DomNode>>>,
     ) -> Result<Class<'js, DomNode>> {
+        let reference = reference.0.flatten();
         let node_id = node.borrow().id;
         if self.doc.borrow().contains(node_id, self.id) {
             return Err(throw_str(
@@ -365,13 +559,15 @@ impl DomNode {
                 "HierarchyRequestError: cyclic insertBefore",
             ));
         }
-        match reference {
-            Some(r) => {
-                let ref_id = r.borrow().id;
-                self.doc.borrow_mut().insert_before(ref_id, node_id);
+        for id in self.to_insert(node_id) {
+            match &reference {
+                Some(r) => {
+                    let ref_id = r.borrow().id;
+                    self.doc.borrow_mut().insert_before(ref_id, id);
+                }
+                // A null reference means append, per the DOM spec.
+                None => self.doc.borrow_mut().append(self.id, id),
             }
-            // A null reference means append, per the DOM spec.
-            None => self.doc.borrow_mut().append(self.id, node_id),
         }
         Ok(node)
     }
@@ -397,15 +593,13 @@ impl DomNode {
     ) -> Result<Class<'js, DomNode>> {
         let new_id = new_child.borrow().id;
         let old_id = old_child.borrow().id;
-        {
-            let mut doc = self.doc.borrow_mut();
-            if doc.node(old_id).parent != Some(self.id) {
-                drop(doc);
-                return Err(throw_str(&ctx, "NotFoundError: node is not a child"));
-            }
-            doc.insert_before(old_id, new_id);
-            doc.detach(old_id);
+        if self.doc.borrow().node(old_id).parent != Some(self.id) {
+            return Err(throw_str(&ctx, "NotFoundError: node is not a child"));
         }
+        for id in self.to_insert(new_id) {
+            self.doc.borrow_mut().insert_before(old_id, id);
+        }
+        self.doc.borrow_mut().detach(old_id);
         Ok(old_child)
     }
 
@@ -413,57 +607,64 @@ impl DomNode {
         self.doc.borrow_mut().detach(self.id);
     }
 
-    fn clone_node<'js>(&self, ctx: Ctx<'js>, deep: Option<bool>) -> Result<Class<'js, DomNode>> {
-        let copy = self
-            .doc
-            .borrow_mut()
-            .clone_node(self.id, deep.unwrap_or(false));
+    // `Opt`, not `Option`: an `Option` parameter still counts towards the
+    // arity, and `cloneNode()` with no argument then throws.
+    fn clone_node<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        deep: rquickjs::function::Opt<Value<'js>>,
+    ) -> Result<Class<'js, DomNode>> {
+        let deep = deep.0.is_some_and(|v| truthy(&v));
+        let copy = self.doc.borrow_mut().clone_node(self.id, deep);
         DomNode::wrap(&ctx, &self.doc, copy)
     }
 
     fn append(&self, nodes: rquickjs::function::Rest<Class<'_, DomNode>>) {
-        let mut doc = self.doc.borrow_mut();
         for n in nodes.0 {
             let id = n.borrow().id;
-            doc.append(self.id, id);
+            for id in self.to_insert(id) {
+                self.doc.borrow_mut().append(self.id, id);
+            }
         }
     }
 
     fn prepend(&self, nodes: rquickjs::function::Rest<Class<'_, DomNode>>) {
-        let mut doc = self.doc.borrow_mut();
-        let first = doc.node(self.id).first_child;
+        let first = self.doc.borrow().node(self.id).first_child;
         for n in nodes.0 {
             let id = n.borrow().id;
-            match first {
-                Some(f) => doc.insert_before(f, id),
-                None => doc.append(self.id, id),
+            for id in self.to_insert(id) {
+                let mut doc = self.doc.borrow_mut();
+                match first {
+                    Some(f) => doc.insert_before(f, id),
+                    None => doc.append(self.id, id),
+                }
             }
         }
     }
 
     // ---- text and markup -----------------------------------------------
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn text_content(&self) -> String {
         self.doc.borrow().text_content(self.id)
     }
 
-    #[qjs(set, rename = "textContent")]
+    #[qjs(set, rename = "textContent", configurable)]
     fn set_text_content(&self, value: JsString) {
         self.doc.borrow_mut().set_text_content(self.id, value);
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn inner_text(&self) -> String {
         self.doc.borrow().text_content(self.id)
     }
 
-    #[qjs(set, rename = "innerText")]
+    #[qjs(set, rename = "innerText", configurable)]
     fn set_inner_text(&self, value: JsString) {
         self.doc.borrow_mut().set_text_content(self.id, value);
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn node_value(&self) -> Option<String> {
         match self.doc.borrow().data(self.id) {
             NodeData::Text(t) => Some(t.to_string()),
@@ -472,7 +673,7 @@ impl DomNode {
         }
     }
 
-    #[qjs(set, rename = "nodeValue")]
+    #[qjs(set, rename = "nodeValue", configurable)]
     fn set_node_value(&self, value: JsString) {
         let mut doc = self.doc.borrow_mut();
         match &mut doc.node_mut(self.id).data {
@@ -482,22 +683,30 @@ impl DomNode {
         }
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn data(&self) -> Option<String> {
         self.node_value()
     }
 
-    #[qjs(set, rename = "data")]
+    #[qjs(set, rename = "data", configurable)]
     fn set_data(&self, value: JsString) {
         self.set_node_value(value);
     }
 
-    #[qjs(get, rename = "innerHTML")]
-    fn inner_html(&self) -> String {
-        mar_dom::inner_html(&self.doc.borrow(), self.id)
+    /// The fragment a `<template>` keeps its content in. The parser puts a
+    /// template's children there rather than under the element, and a
+    /// template the page built itself gets one the first time it is asked.
+    #[qjs(get, configurable)]
+    fn template_content<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        DomNode::wrap_opt(&ctx, &self.doc, self.template_contents())
     }
 
-    #[qjs(set, rename = "innerHTML")]
+    #[qjs(get, rename = "innerHTML", configurable)]
+    fn inner_html(&self) -> String {
+        mar_dom::inner_html(&self.doc.borrow(), self.markup_root())
+    }
+
+    #[qjs(set, rename = "innerHTML", configurable)]
     fn set_inner_html(&self, html: JsString) {
         // Parse into a scratch document first: a malformed fragment then cannot
         // corrupt the live tree, and the tree sink stays single-document.
@@ -508,23 +717,24 @@ impl DomNode {
             .map(|e| e.name.clone())
             .unwrap_or_else(|| QualName::new(None, ns!(html), LocalName::from("div")));
         let (frag, holder) = mar_dom::parse_fragment_document(&html, &context);
+        let root = self.markup_root();
         let mut doc = self.doc.borrow_mut();
-        while let Some(c) = doc.node(self.id).first_child {
+        while let Some(c) = doc.node(root).first_child {
             doc.detach(c);
         }
         let kids: Vec<_> = frag.children(holder).collect();
         for k in kids {
             let copy = doc.import_subtree(&frag, k);
-            doc.append(self.id, copy);
+            doc.append(root, copy);
         }
     }
 
-    #[qjs(get, rename = "outerHTML")]
+    #[qjs(get, rename = "outerHTML", configurable)]
     fn outer_html(&self) -> String {
         mar_dom::outer_html(&self.doc.borrow(), self.id)
     }
 
-    #[qjs(set, rename = "outerHTML")]
+    #[qjs(set, rename = "outerHTML", configurable)]
     fn set_outer_html(&self, html: JsString) {
         let (context, parent) = {
             let doc = self.doc.borrow();
@@ -624,10 +834,13 @@ impl DomNode {
         }
     }
 
-    fn toggle_attribute(&self, name: JsString, force: Option<bool>) -> bool {
+    fn toggle_attribute(&self, name: JsString, force: rquickjs::function::Opt<Value<'_>>) -> bool {
         let lower = name.to_ascii_lowercase();
         let present = self.attr(&lower).is_some();
-        let target = force.unwrap_or(!present);
+        let target = match force.0 {
+            Some(v) if !v.is_undefined() => truthy(&v),
+            _ => !present,
+        };
         if target {
             self.set_attr_raw(&lower, "");
         } else {
@@ -647,22 +860,22 @@ impl DomNode {
             .unwrap_or_default()
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn id(&self) -> String {
         self.attr("id").unwrap_or_default()
     }
 
-    #[qjs(set, rename = "id")]
+    #[qjs(set, rename = "id", configurable)]
     fn set_id(&self, value: JsString) {
         self.set_attr_raw("id", &value);
     }
 
-    #[qjs(get)]
+    #[qjs(get, configurable)]
     fn class_name(&self) -> String {
         self.attr("class").unwrap_or_default()
     }
 
-    #[qjs(set, rename = "className")]
+    #[qjs(set, rename = "className", configurable)]
     fn set_class_name(&self, value: JsString) {
         self.set_attr_raw("class", &value);
     }
@@ -707,7 +920,11 @@ impl DomNode {
         DomNode::wrap_list(&ctx, &self.doc, ids)
     }
 
-    fn get_elements_by_class_name<'js>(&self, ctx: Ctx<'js>, names: JsString) -> Result<Value<'js>> {
+    fn get_elements_by_class_name<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        names: JsString,
+    ) -> Result<Value<'js>> {
         let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
         let doc = self.doc.borrow();
         let ids: Vec<_> = doc

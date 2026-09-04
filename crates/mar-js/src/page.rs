@@ -4,7 +4,7 @@
 use crate::dom::SharedDoc;
 use crate::natives;
 use crate::net::NetworkProvider;
-use crate::state::{ConsoleMessage, Limits, PageState, ScriptError, Shared, shared};
+use crate::state::{ConsoleMessage, Limits, Navigation, PageState, ScriptError, Shared, shared};
 use mar_dom::{Document, LocalName, NodeId};
 use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Persistent, Runtime};
 use std::rc::Rc;
@@ -29,8 +29,9 @@ pub struct PageOutcome {
     pub title: String,
     pub console: Vec<ConsoleMessage>,
     pub errors: Vec<ScriptError>,
-    /// A `location.href = ...` the page asked for but we did not follow.
-    pub requested_navigation: Option<String>,
+    /// A `location.href = ...` or a form submission the page asked for but
+    /// we did not follow.
+    pub requested_navigation: Option<Navigation>,
     pub cookies: String,
     /// `document.cookie = ...` assignments, verbatim and in order, for a host
     /// that keeps a real cookie jar.
@@ -48,6 +49,39 @@ pub struct PageOutcome {
     pub wall_ms: u128,
     /// True when the loop stopped on a limit rather than on quiescence.
     pub truncated: bool,
+}
+
+impl<N: NetworkProvider + 'static> Drop for Page<N> {
+    fn drop(&mut self) {
+        // The handles hold JS objects; they have to go while the runtime
+        // that owns those objects is still here to free them.
+        self.doc.clear_handles();
+    }
+}
+
+/// Every `<script type="importmap">` in the document, merged.
+///
+/// Read before any script runs, as a browser does: a map added later by a
+/// script is ignored there too.
+fn import_map_of(doc: &Document, base: &Url) -> crate::modules::ImportMap {
+    let mut merged = crate::modules::ImportMap::default();
+    let root = doc.root();
+    for id in doc.descendants(root) {
+        let Some(el) = doc.element(id) else { continue };
+        if el.local_name().as_ref() != "script" {
+            continue;
+        }
+        let is_map = el
+            .attr(&LocalName::from("type"))
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("importmap"));
+        if !is_map {
+            continue;
+        }
+        if let Some(map) = crate::modules::ImportMap::parse(&doc.text_content(id), base) {
+            merged.merge(map);
+        }
+    }
+    merged
 }
 
 /// One `<script>` found in the document.
@@ -109,9 +143,11 @@ impl<N: NetworkProvider + 'static> Page<N> {
         // An `import` is resolved and fetched by the host, like every other
         // subresource. QuickJS asks for it synchronously, part-way through the
         // module that imported it, which is exactly what a blocking provider
-        // and a virtual clock are built for.
+        // and a virtual clock are built for. The page's import map, if it
+        // wrote one, is what gives a bare specifier somewhere to resolve to.
+        let import_map = import_map_of(&doc.borrow(), &url);
         runtime.set_loader(
-            crate::modules::UrlResolver::new(url.clone()),
+            crate::modules::UrlResolver::with_import_map(url.clone(), import_map),
             crate::modules::UrlLoader::new(net.clone(), state.clone(), url.clone()),
         );
 
@@ -453,8 +489,8 @@ impl<N: NetworkProvider + 'static> Page<N> {
                 let origin = source_url.unwrap_or_else(|| page_url.to_string());
                 self.eval_module(&script.body, &origin);
             } else {
-                let origin = source_url
-                    .unwrap_or_else(|| format!("inline script #{}", script.id.as_u32()));
+                let origin =
+                    source_url.unwrap_or_else(|| format!("inline script #{}", script.id.as_u32()));
                 self.eval_script(&script.body, &origin);
             }
 
@@ -476,25 +512,28 @@ impl<N: NetworkProvider + 'static> Page<N> {
         self.context.with(|ctx| {
             let declared = Module::declare(ctx.clone(), origin_owned.clone(), source).catch(&ctx);
             match declared {
-                Ok(module) => match module.eval().catch(&ctx) {
-                    // The body of a module runs inside a promise. A throw on
-                    // its first line rejects that promise instead of raising
-                    // here, so the promise has to be watched or the failure is
-                    // silent — and a dead application module then looks exactly
-                    // like a page that deliberately rendered nothing.
-                    Ok((_, promise)) => {
-                        let watch: Result<rquickjs::Function, _> =
-                            ctx.globals().get("__mar_watch_module");
-                        if let Ok(watch) = watch {
-                            let _ = watch.call::<_, ()>((promise, origin_owned.clone()));
+                Ok(module) => {
+                    crate::modules::set_import_meta(&module, &origin_owned);
+                    match module.eval().catch(&ctx) {
+                        // The body of a module runs inside a promise. A throw on
+                        // its first line rejects that promise instead of raising
+                        // here, so the promise has to be watched or the failure is
+                        // silent — and a dead application module then looks exactly
+                        // like a page that deliberately rendered nothing.
+                        Ok((_, promise)) => {
+                            let watch: Result<rquickjs::Function, _> =
+                                ctx.globals().get("__mar_watch_module");
+                            if let Ok(watch) = watch {
+                                let _ = watch.call::<_, ()>((promise, origin_owned.clone()));
+                            }
+                        }
+                        Err(e) => {
+                            state
+                                .borrow_mut()
+                                .record_error(origin_owned, format!("{e}"));
                         }
                     }
-                    Err(e) => {
-                        state
-                            .borrow_mut()
-                            .record_error(origin_owned, format!("{e}"));
-                    }
-                },
+                }
                 Err(e) => {
                     state
                         .borrow_mut()

@@ -203,9 +203,16 @@ fn install_timers(api: &Object<'_>, state: &Shared) -> Result<()> {
     let st = state.clone();
     api.set(
         "clear_timer",
-        Func::from(move |id: Option<u32>| {
-            if let Some(id) = id {
-                st.borrow_mut().timers.cancel(id);
+        // Anything a page passes: `clearTimeout(-1)`, `clearTimeout(1.5)` and
+        // `clearTimeout(undefined)` are all silently ignored by a browser, and
+        // a conversion error here throws out of whatever was cancelling.
+        Func::from(move |id: Option<rquickjs::Coerced<f64>>| {
+            if let Some(id) = id.map(|c| c.0)
+                && id.is_finite()
+                && id >= 0.0
+                && id <= u32::MAX as f64
+            {
+                st.borrow_mut().timers.cancel(id as u32);
             }
         }),
     )?;
@@ -415,6 +422,44 @@ fn install_document(
         Func::from(move || mar_dom::document_html(&d.borrow())),
     )?;
 
+    // A script the page inserted at run time: a webpack chunk, a tag
+    // manager, a lazily loaded widget. Run the way a parser-inserted script
+    // runs — global, sloppy, named for its URL, and `document.currentScript`
+    // pointing at its element — with a throw recorded rather than raised.
+    let st = state.clone();
+    api.set(
+        "run_script",
+        Func::from(hr_run(
+            move |ctx, source: String, origin: String, node: rquickjs::function::Opt<u32>| {
+                use rquickjs::CatchResultExt;
+                let previous = st.borrow().current_script;
+                st.borrow_mut().current_script = node.0.and_then(mar_dom::NodeId::from_u32);
+                let mut options = rquickjs::context::EvalOptions::default();
+                options.global = true;
+                options.strict = false;
+                options.filename = Some(origin.clone());
+                let outcome = ctx.eval_with_options::<(), _>(source, options).catch(&ctx);
+                st.borrow_mut().current_script = previous;
+                if let Err(e) = outcome {
+                    st.borrow_mut().record_error(origin, format!("{e}"));
+                }
+                Ok(())
+            },
+        )),
+    )?;
+
+    // The same for a module. The promise for its body comes back so the
+    // prelude can watch it, exactly as it watches the parser's modules.
+    api.set(
+        "run_module",
+        Func::from(hr_module(move |ctx, source: String, origin: String| {
+            let module = rquickjs::Module::declare(ctx.clone(), origin.clone(), source)?;
+            crate::modules::set_import_meta(&module, &origin);
+            let (_, promise) = module.eval()?;
+            Ok(promise.into_value())
+        })),
+    )?;
+
     let st = state.clone();
     api.set(
         "cookie_get",
@@ -431,6 +476,18 @@ fn install_document(
     api.set(
         "ready_state",
         Func::from(move || st.borrow().ready_state.to_string()),
+    )?;
+
+    // The prelude builds the DOM's interfaces and hands their prototypes
+    // back, so a node comes out of the bridge as the interface it is.
+    let d = doc.clone();
+    api.set(
+        "register_prototypes",
+        Func::from(hr_protos(
+            move |ctx, kinds: Object<'_>, tags: Object<'_>| {
+                d.register_prototypes(&ctx, kinds, tags)
+            },
+        )),
     )?;
 
     let st = state.clone();
@@ -487,15 +544,26 @@ fn install_location(api: &Object<'_>, state: &Shared) -> Result<()> {
     let st = state.clone();
     api.set(
         "navigate",
-        Func::from(move |target: String| {
-            // Record the intent; the caller decides whether to follow it. A
-            // page cannot make us fetch something behind its own back.
-            let mut s = st.borrow_mut();
-            if s.requested_navigation.is_none() {
-                let resolved = s.url.join(&target).map(|u| u.to_string()).unwrap_or(target);
-                s.requested_navigation = Some(resolved);
-            }
-        }),
+        Func::from(
+            move |target: String,
+                  method: rquickjs::function::Opt<String>,
+                  body: rquickjs::function::Opt<String>| {
+                // Record the intent; the caller decides whether to follow it. A
+                // page cannot make us fetch something behind its own back.
+                let mut s = st.borrow_mut();
+                if s.requested_navigation.is_none() {
+                    let resolved = s.url.join(&target).map(|u| u.to_string()).unwrap_or(target);
+                    s.requested_navigation = Some(crate::state::Navigation {
+                        url: resolved,
+                        method: method
+                            .0
+                            .map(|m| m.to_ascii_uppercase())
+                            .unwrap_or_else(|| "GET".to_owned()),
+                        body: body.0,
+                    });
+                }
+            },
+        ),
     )?;
 
     let st = state.clone();
@@ -617,7 +685,11 @@ fn install_network<N: NetworkProvider + 'static>(
     api.set(
         "request_start",
         Func::from(
-            move |method: String, url: String, headers: Object<'_>, body: Option<String>| -> Result<u32> {
+            move |method: String,
+                  url: String,
+                  headers: Object<'_>,
+                  body: Option<String>|
+                  -> Result<u32> {
                 let (id, resolved, request, at_cap) = {
                     let mut s = st.borrow_mut();
                     let id = s.next_request_id;
@@ -635,7 +707,9 @@ fn install_network<N: NetworkProvider + 'static>(
                     let at_cap = s.inflight >= MAX_INFLIGHT;
                     let Some(resolved) = s.url.join(&url).ok() else {
                         s.inflight += 1;
-                        let _ = s.responses_tx.send((id, Err(format!("invalid URL: {url}"))));
+                        let _ = s
+                            .responses_tx
+                            .send((id, Err(format!("invalid URL: {url}"))));
                         return Ok(id);
                     };
                     if let Some(reason) = refused {
@@ -839,6 +913,27 @@ fn install_url(api: &Object<'_>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+fn hr_protos<F>(f: F) -> F
+where
+    F: for<'js> Fn(Ctx<'js>, Object<'js>, Object<'js>) -> Result<()>,
+{
+    f
+}
+
+fn hr_run<F>(f: F) -> F
+where
+    F: for<'js> Fn(Ctx<'js>, String, String, rquickjs::function::Opt<u32>) -> Result<()>,
+{
+    f
+}
+
+fn hr_module<F>(f: F) -> F
+where
+    F: for<'js> Fn(Ctx<'js>, String, String) -> Result<Value<'js>>,
+{
+    f
 }
 
 fn hr_iv<F>(f: F) -> F

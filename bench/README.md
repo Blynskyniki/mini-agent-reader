@@ -35,6 +35,29 @@ runs, which is what these numbers are for.
 python3 bench/real.py
 ```
 
+## `corpus.py` — does it read the real web?
+
+`corpus.json` is 453 live URLs: the top of the Tranco list with
+infrastructure, parked, adult and duplicate hosts removed, plus the Russian
+web and a set of client-rendered applications. Sites behind a bot check are
+kept on purpose; hosts that resolve to nothing were dropped, because they
+measure the network and not the engine.
+
+Every page is reduced the same way in both engines — the settled document
+with script, style, template and noscript subtrees removed, whitespace
+collapsed — and mar's text is compared with Chrome's on the same URL in the
+same session. A page "reads" at 60% of Chrome's text or more.
+
+```bash
+python3 bench/corpus.py --chrome                          # Chrome too, ~7 min
+python3 bench/corpus.py --chrome-from bench/corpus_results.json   # reuse it
+python3 bench/corpus.py --chrome-from ... -- --no-impersonate     # rustls handshake
+```
+
+Run the whole corpus at `--concurrency 6`, which is what Chrome gets. A page
+that reads on its own and not in the batch is usually the batch: one proxy,
+six pages of subresources at once, and a budget of fifteen seconds.
+
 ## Reading the results
 
 `chrome-headless-shell` is Chromium's lightest path: no interface, no GPU

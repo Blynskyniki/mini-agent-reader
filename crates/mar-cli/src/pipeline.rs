@@ -2,7 +2,7 @@
 
 use mar_dom::{Document, LocalName, NodeId, StrTendril};
 use mar_extract::{MarkdownOptions, Reading};
-use mar_js::{Limits, Page};
+use mar_js::{Limits, Navigation, Page};
 use mar_net::{ClientConfig, HttpClient, PageNetwork, ResourceKind};
 use serde::Serialize;
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ impl Default for RenderOptions {
         RenderOptions {
             javascript: true,
             external_scripts: true,
-            max_external_scripts: 12,
+            max_external_scripts: 48,
             follow_client_navigation: true,
             limits: Limits::default(),
             markdown: MarkdownOptions::default(),
@@ -113,9 +113,8 @@ impl Renderer {
     pub fn render(&self, url: &str, options: &RenderOptions) -> anyhow::Result<Rendered> {
         let started = Instant::now();
         self.following_navigation(url, options, |target| {
-            let mut rendered = self.render_once(target, options, started)?;
+            let (mut rendered, next) = self.render_once(target, options, started)?;
             rendered.report.url = url.to_owned();
-            let next = rendered.report.requested_navigation.clone();
             Ok((rendered, next))
         })
     }
@@ -129,11 +128,11 @@ impl Renderer {
         &self,
         url: &str,
         options: &RenderOptions,
-        mut once: impl FnMut(&str) -> anyhow::Result<(T, Option<String>)>,
+        mut once: impl FnMut(&Navigation) -> anyhow::Result<(T, Option<Navigation>)>,
     ) -> anyhow::Result<T> {
-        let mut target = url.to_owned();
+        let mut target = Navigation::get(url);
         let mut hops = 0usize;
-        let mut seen = vec![(target.clone(), self.client.cookie_fingerprint(&target))];
+        let mut seen = vec![(target.clone(), self.client.cookie_fingerprint(&target.url))];
         // Every hop is a whole page, so without this the budget multiplies by
         // the hop limit and `--timeout-ms 15000` means a minute.
         let deadline = Instant::now() + Duration::from_millis(options.limits.wall_ms);
@@ -157,10 +156,10 @@ impl Renderer {
             // challenge page computes something, sets a cookie and reloads, and
             // the second fetch is a different request carrying a different jar.
             // What makes a repeat pointless is repeating it unchanged.
-            let fingerprint = self.client.cookie_fingerprint(&next);
+            let fingerprint = self.client.cookie_fingerprint(&next.url);
             if seen
                 .iter()
-                .any(|(url, seen_at)| *url == next && *seen_at == fingerprint)
+                .any(|(nav, seen_at)| *nav == next && *seen_at == fingerprint)
             {
                 return Ok(value);
             }
@@ -172,12 +171,15 @@ impl Renderer {
 
     fn render_once(
         &self,
-        url: &str,
+        navigation: &Navigation,
         options: &RenderOptions,
         started: Instant,
-    ) -> anyhow::Result<Rendered> {
+    ) -> anyhow::Result<(Rendered, Option<Navigation>)> {
+        let url = navigation.url.as_str();
         let fetch_start = Instant::now();
-        let mut fetched = self.client.get_document(url)?;
+        let mut fetched =
+            self.client
+                .fetch_document(url, &navigation.method, navigation.body.as_deref())?;
         let mut document = mar_dom::parse_html(&fetched.body).document;
         let mut hops = 0;
         while hops < MAX_META_REFRESH_HOPS {
@@ -208,11 +210,7 @@ impl Renderer {
         if let Some(reason) = Self::describe_block(fetched.status, fetched.body.len())
             && !fetched.is_readable_as_html()
         {
-            return Err(anyhow::anyhow!(
-                "{} returned {}",
-                fetched.final_url,
-                reason
-            ));
+            return Err(anyhow::anyhow!("{} returned {}", fetched.final_url, reason));
         }
         if !fetched.is_readable_as_html() {
             return Err(anyhow::anyhow!(
@@ -258,12 +256,15 @@ impl Renderer {
         if !options.javascript {
             report.total_ms = started.elapsed().as_millis();
             let html = mar_dom::document_html(&document);
-            return Ok(Rendered {
-                document,
-                report,
-                source_html: fetched.body,
-                html,
-            });
+            return Ok((
+                Rendered {
+                    document,
+                    report,
+                    source_html: fetched.body,
+                    html,
+                },
+                None,
+            ));
         }
 
         let render_start = Instant::now();
@@ -312,7 +313,13 @@ impl Renderer {
         // already set, and one that writes it expects the next request to carry
         // it. The jar lives in the client, so the page borrows it on the way in
         // and hands its writes back on the way out.
-        page.state().borrow_mut().cookies = self.client.cookies_for(base.as_str());
+        {
+            let mut state = page.state().borrow_mut();
+            state.cookies = self.client.cookies_for(base.as_str());
+            // What the handshake claims and what `navigator.userAgent` says
+            // must agree, or the disagreement is the fingerprint.
+            state.user_agent = self.client.config().user_agent.clone();
+        }
         let outcome = page.run();
         for raw in &outcome.cookie_writes {
             self.client.apply_script_cookie(base.as_str(), raw);
@@ -324,7 +331,7 @@ impl Renderer {
         report.subresource_requests = outcome.requests;
         report.virtual_ms = outcome.virtual_ms;
         report.truncated = outcome.truncated;
-        report.requested_navigation = outcome.requested_navigation.clone();
+        report.requested_navigation = outcome.requested_navigation.as_ref().map(|n| n.url.clone());
         report.errors = outcome
             .errors
             .iter()
@@ -342,12 +349,15 @@ impl Renderer {
         let document = page.document().snapshot();
         report.total_ms = started.elapsed().as_millis();
 
-        Ok(Rendered {
-            document,
-            report,
-            source_html: fetched.body,
-            html: outcome.html,
-        })
+        Ok((
+            Rendered {
+                document,
+                report,
+                source_html: fetched.body,
+                html: outcome.html,
+            },
+            outcome.requested_navigation,
+        ))
     }
 
     /// Statuses that mean "we know who you are and you are not welcome".
@@ -383,16 +393,19 @@ impl Renderer {
         }
         let mut reading = mar_extract::read(&rendered.document, &markdown);
 
-        // A settled page with nothing in it is usually a client render that
-        // failed part way: React hydrates, throws somewhere inside, and leaves
-        // a root emptier than the server-rendered markup it replaced. The
-        // markup that arrived is still there to read, so read that instead.
-        // Only when the settled page came out near-empty, so the normal path
-        // pays nothing.
-        if options.javascript && reading.length < EMPTY_ARTICLE_CHARS {
+        // A settled page with less in it than arrived is usually a client
+        // render that failed part way: React hydrates, finds a mismatch,
+        // throws somewhere inside its second attempt, and leaves a root
+        // emptier than the server-rendered markup it replaced. The markup
+        // that arrived is still there to read, so read that instead — when
+        // the scripts left nothing, and also when they left much less than
+        // the server sent, which is the same failure caught half-way.
+        if options.javascript && report.scripts_run > 0 {
             let original = mar_dom::parse_html(&rendered.source_html).document;
             let from_source = mar_extract::read(&original, &markdown);
-            if from_source.length > reading.length {
+            let emptied =
+                reading.length < EMPTY_ARTICLE_CHARS || reading.length * 2 < from_source.length;
+            if emptied && from_source.length > reading.length {
                 reading = from_source;
                 report.scripts_emptied_the_page = true;
             }
@@ -424,9 +437,11 @@ impl Renderer {
     ) -> anyhow::Result<String> {
         let started = Instant::now();
         self.following_navigation(url, options, |target| {
-            let fetched = self.client.get_document(target)?;
+            let fetched =
+                self.client
+                    .fetch_document(&target.url, &target.method, target.body.as_deref())?;
             let base = Url::parse(&fetched.final_url)
-                .or_else(|_| Url::parse(target))
+                .or_else(|_| Url::parse(&target.url))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             let mut document = mar_dom::parse_html(&fetched.body).document;
@@ -436,8 +451,7 @@ impl Renderer {
                     &base,
                     options.max_external_scripts,
                     started
-                        + Duration::from_millis(options.limits.wall_ms)
-                            .mul_f32(SCRIPT_FETCH_SHARE),
+                        + Duration::from_millis(options.limits.wall_ms).mul_f32(SCRIPT_FETCH_SHARE),
                 );
             }
 
@@ -452,7 +466,11 @@ impl Renderer {
             };
             let mut page = Page::with_document(document, base.clone(), limits, net)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            page.state().borrow_mut().cookies = self.client.cookies_for(base.as_str());
+            {
+                let mut state = page.state().borrow_mut();
+                state.cookies = self.client.cookies_for(base.as_str());
+                state.user_agent = self.client.config().user_agent.clone();
+            }
 
             let mut requested = None;
             if options.javascript {
@@ -495,10 +513,6 @@ impl Renderer {
                     return None;
                 }
                 let src = el.attr(&LocalName::from("src"))?;
-                // A script with a body as well as a src is unusual; leave it.
-                if !doc.text_content(id).trim().is_empty() {
-                    return None;
-                }
                 let module = el
                     .attr(&LocalName::from("type"))
                     .is_some_and(|t| t.eq_ignore_ascii_case("module"));
@@ -526,6 +540,12 @@ impl Renderer {
             let page_host = base.host_str().unwrap_or_default();
             if !mar_net::same_site(host, page_host) && mar_net::is_tracker(host) {
                 continue;
+            }
+            // Whatever sat between the tags is not the script: a `src` wins
+            // over the element's content in a browser, and a stray `&#160;`
+            // left there by a template is otherwise run as the program.
+            while let Some(child) = doc.node(id).first_child {
+                doc.detach(child);
             }
             let Ok(fetched) = self.client_execute(&absolute, base) else {
                 continue;
@@ -573,7 +593,9 @@ impl Renderer {
                 _ => None,
             };
             let Some(url) = url else { continue };
-            let Ok(absolute) = base.join(url) else { continue };
+            let Ok(absolute) = base.join(url) else {
+                continue;
+            };
             let host = absolute.host_str().unwrap_or_default();
             if !mar_net::same_site(host, base.host_str().unwrap_or_default())
                 && mar_net::is_tracker(host)
@@ -599,7 +621,7 @@ const PREFETCH_CONCURRENCY: usize = 8;
 
 /// A ceiling on the prefetch list. A page listing more chunks than this is
 /// going to be cut off by the budget long before the list runs out.
-const MAX_PREFETCH: usize = 96;
+const MAX_PREFETCH: usize = 192;
 
 /// How much of a page's budget may go on fetching its scripts before the rest
 /// has to be left unfetched. Half: enough for a dozen bundles on a normal
@@ -619,7 +641,7 @@ const MIN_SCRIPT_MS: u64 = 500;
 const MAX_META_REFRESH_HOPS: usize = 3;
 
 /// Script-driven navigations followed before giving up.
-const MAX_NAVIGATION_HOPS: usize = 3;
+const MAX_NAVIGATION_HOPS: usize = 5;
 
 /// The URL a `<meta http-equiv="refresh">` points at, when it fires promptly.
 ///

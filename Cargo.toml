@@ -48,3 +48,8 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# QuickJS with one parser change: `for (f() in o)` parses, as it does in V8,
+# and throws at run time instead. See vendor/rquickjs-sys/README-mar.md.
+[patch.crates-io]
+rquickjs-sys = { path = "vendor/rquickjs-sys" }

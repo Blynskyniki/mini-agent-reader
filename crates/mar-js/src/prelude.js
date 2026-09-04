@@ -70,6 +70,12 @@
   };
   globalThis.console = console;
 
+  // What to record for a caught exception. QuickJS keeps only the frames in
+  // `.stack`, so recording that alone loses the message — and the message is
+  // the part that says what went wrong.
+  const describeError = (e) =>
+    e instanceof Error ? format([e]) : String((e && e.stack) || e);
+
   // -- timers -------------------------------------------------------------
 
   // Extra arguments to setTimeout are passed on to the callback, which some
@@ -79,10 +85,16 @@
   const asFn = (fn) =>
     typeof fn === 'function' ? fn : () => globalThis.eval(String(fn));
 
+  // A delay is whatever the page passed: `"100"`, `null`, `undefined`, and
+  // a browser reads them all as a number of milliseconds or zero.
+  const delayOf = (delay) => {
+    const n = Number(delay);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
   globalThis.setTimeout = (fn, delay, ...args) =>
-    native.set_timeout(wrapArgs(asFn(fn), args), delay);
+    native.set_timeout(wrapArgs(asFn(fn), args), delayOf(delay));
   globalThis.setInterval = (fn, delay, ...args) =>
-    native.set_interval(wrapArgs(asFn(fn), args), delay);
+    native.set_interval(wrapArgs(asFn(fn), args), delayOf(delay));
   globalThis.clearTimeout = (id) => native.clear_timer(id);
   globalThis.clearInterval = (id) => native.clear_timer(id);
   globalThis.requestAnimationFrame = (fn) =>
@@ -115,6 +127,14 @@
       this._stopped = false;
       this._stoppedImmediate = false;
     }
+    // `document.createEvent('Event')` followed by `initEvent` is how a decade
+    // of code still fires its own events.
+    initEvent(type, bubbles = false, cancelable = false) {
+      this.type = String(type);
+      this.bubbles = !!bubbles;
+      this.cancelable = !!cancelable;
+      return this;
+    }
     preventDefault() {
       if (this.cancelable) this.defaultPrevented = true;
     }
@@ -141,6 +161,10 @@
       super(type, init);
       this.detail = init.detail ?? null;
     }
+    initCustomEvent(type, bubbles, cancelable, detail = null) {
+      this.initEvent(type, bubbles, cancelable);
+      this.detail = detail;
+    }
   }
 
   class MessageEvent extends Event {
@@ -156,6 +180,10 @@
       super(type, init);
       this.detail = init.detail ?? 0;
       this.view = globalThis;
+    }
+    initUIEvent(type, bubbles, cancelable, _view, detail = 0) {
+      this.initEvent(type, bubbles, cancelable);
+      this.detail = detail;
     }
   }
 
@@ -182,6 +210,16 @@
       this.buttons = init.buttons ?? 0;
       this.relatedTarget = init.relatedTarget ?? null;
       modifierFlags(this, init);
+    }
+    initMouseEvent(type, bubbles, cancelable, _view, detail, screenX, screenY, clientX, clientY,
+      ctrlKey, altKey, shiftKey, metaKey, button, relatedTarget) {
+      this.initEvent(type, bubbles, cancelable);
+      Object.assign(this, {
+        detail: detail ?? 0, screenX: screenX ?? 0, screenY: screenY ?? 0,
+        clientX: clientX ?? 0, clientY: clientY ?? 0, pageX: clientX ?? 0, pageY: clientY ?? 0,
+        ctrlKey: !!ctrlKey, altKey: !!altKey, shiftKey: !!shiftKey, metaKey: !!metaKey,
+        button: button ?? 0, relatedTarget: relatedTarget ?? null,
+      });
     }
   }
 
@@ -278,14 +316,14 @@
         else if (entry.handler && typeof entry.handler.handleEvent === 'function')
           entry.handler.handleEvent(event);
       } catch (e) {
-        native.record_error('listener:' + event.type, String((e && e.stack) || e));
+        native.record_error('listener:' + event.type, describeError(e));
       }
     }
     if (typeof inline === 'function' && !event._stoppedImmediate) {
       try {
         inline.call(target, event);
       } catch (e) {
-        native.record_error('on' + event.type, String((e && e.stack) || e));
+        native.record_error('on' + event.type, describeError(e));
       }
     }
   }
@@ -336,6 +374,12 @@
     }
   };
 
+  // A node is an EventTarget, and a polyfill that patches
+  // `EventTarget.prototype.addEventListener` expects the patch to reach every
+  // node through the prototype chain.
+  Object.setPrototypeOf(NodeProto, globalThis.EventTarget.prototype);
+  define(NodeProto, 'constructor', { value: Node, writable: true });
+
   // -- element extras ------------------------------------------------------
 
   // classList over the class attribute. Reads are live; writes go straight back.
@@ -343,17 +387,19 @@
     constructor(el) {
       Object.defineProperty(this, '_el', { value: el });
     }
+    // Read the attribute, not `className`: on an SVG element `className` is
+    // an SVGAnimatedString, and the token list is over the attribute anyway.
     get _tokens() {
-      return (this._el.className || '').split(/\s+/).filter(Boolean);
+      return (this._el.getAttribute('class') || '').split(/\s+/).filter(Boolean);
     }
     _write(tokens) {
-      this._el.className = tokens.join(' ');
+      this._el.setAttribute('class', tokens.join(' '));
     }
     get length() {
       return this._tokens.length;
     }
     get value() {
-      return this._el.className || '';
+      return this._el.getAttribute('class') || '';
     }
     item(i) {
       return this._tokens[i] ?? null;
@@ -396,6 +442,7 @@
     }
   }
 
+  globalThis.DOMTokenList = DOMTokenList;
   define(NodeProto, 'classList', {
     get() {
       return new DOMTokenList(this);
@@ -419,35 +466,41 @@
     return out;
   }
 
+  // The methods live on a prototype, because rrweb and its relatives wrap
+  // `CSSStyleDeclaration.prototype.setProperty` to watch style changes, and
+  // an instance-only method leaves them wrapping `undefined`.
+  const styleRead = (el) => parseStyle(el.getAttribute('style'));
+  const styleWrite = (el, map) =>
+    el.setAttribute('style', [...map].map(([k, v]) => `${k}: ${v}`).join('; '));
+  class CSSStyleDeclaration {
+    getPropertyValue(p) { return styleRead(this._el).get(dashed(String(p)).toLowerCase()) || ''; }
+    getPropertyPriority() { return ''; }
+    setProperty(p, v, _priority) {
+      const map = styleRead(this._el);
+      const key = dashed(String(p)).toLowerCase();
+      if (v == null || v === '') map.delete(key); else map.set(key, String(v));
+      styleWrite(this._el, map);
+    }
+    removeProperty(p) {
+      const map = styleRead(this._el);
+      const key = dashed(String(p)).toLowerCase();
+      const old = map.get(key) || '';
+      map.delete(key);
+      styleWrite(this._el, map);
+      return old;
+    }
+    item(i) { return [...styleRead(this._el).keys()][i] ?? ''; }
+    get length() { return styleRead(this._el).size; }
+    get cssText() { return this._el.getAttribute('style') || ''; }
+    set cssText(v) { this._el.setAttribute('style', String(v)); }
+    get parentRule() { return null; }
+    [Symbol.iterator]() { return styleRead(this._el).keys(); }
+  }
+  globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
   function styleProxy(el) {
-    const read = () => parseStyle(el.getAttribute('style'));
-    const write = (map) =>
-      el.setAttribute(
-        'style',
-        [...map].map(([k, v]) => `${k}: ${v}`).join('; ')
-      );
-    const api = {
-      getPropertyValue: (p) => read().get(dashed(String(p)).toLowerCase()) || '',
-      setProperty: (p, v) => {
-        const map = read();
-        map.set(dashed(String(p)).toLowerCase(), String(v));
-        write(map);
-      },
-      removeProperty: (p) => {
-        const map = read();
-        const key = dashed(String(p)).toLowerCase();
-        const old = map.get(key) || '';
-        map.delete(key);
-        write(map);
-        return old;
-      },
-      get cssText() {
-        return el.getAttribute('style') || '';
-      },
-      set cssText(v) {
-        el.setAttribute('style', String(v));
-      },
-    };
+    const read = () => styleRead(el);
+    const api = new CSSStyleDeclaration();
+    define(api, '_el', { value: el });
     return new Proxy(api, {
       get(target, prop) {
         if (prop in target) return target[prop];
@@ -504,12 +557,54 @@
     ['lang', 'lang'],
     ['dir', 'dir'],
     ['alt', 'alt'],
-    ['name', 'name'],
     ['type', 'type'],
     ['placeholder', 'placeholder'],
     ['rel', 'rel'],
     ['target', 'target'],
-    ['content', 'content'],
+    ['nonce', 'nonce'],
+    ['slot', 'slot'],
+    ['role', 'role'],
+    ['accessKey', 'accesskey'],
+    ['htmlFor', 'for'],
+    ['autocomplete', 'autocomplete'],
+    ['enctype', 'enctype'],
+    ['method', 'method'],
+    ['pattern', 'pattern'],
+    ['step', 'step'],
+    ['min', 'min'],
+    ['max', 'max'],
+    ['label', 'label'],
+    ['charset', 'charset'],
+    ['crossOrigin', 'crossorigin'],
+    ['integrity', 'integrity'],
+    ['referrerPolicy', 'referrerpolicy'],
+    ['loading', 'loading'],
+    ['sizes', 'sizes'],
+    ['srcset', 'srcset'],
+    ['media', 'media'],
+    ['as', 'as'],
+    ['hreflang', 'hreflang'],
+    ['download', 'download'],
+    ['coords', 'coords'],
+    ['shape', 'shape'],
+    ['useMap', 'usemap'],
+    ['wrap', 'wrap'],
+    ['headers', 'headers'],
+    ['abbr', 'abbr'],
+    ['scope', 'scope'],
+    ['axis', 'axis'],
+    ['cite', 'cite'],
+    ['dateTime', 'datetime'],
+    ['httpEquiv', 'http-equiv'],
+    ['scheme', 'scheme'],
+    ['poster', 'poster'],
+    ['preload', 'preload'],
+    ['kind', 'kind'],
+    ['srclang', 'srclang'],
+    ['inputMode', 'inputmode'],
+    ['enterKeyHint', 'enterkeyhint'],
+    ['popover', 'popover'],
+    ['popoverTarget', 'popovertarget'],
   ]) {
     define(NodeProto, prop, {
       get() {
@@ -520,6 +615,51 @@
       },
     });
   }
+
+  define(NodeProto, 'name', {
+    get() { return this.getAttribute('name') ?? ''; },
+    set(v) {
+      this.setAttribute('name', String(v));
+      if (this.tagName === 'IFRAME' && globalThis.__mar_name_the_document) globalThis.__mar_name_the_document();
+    },
+  });
+
+  // ARIA reflects the same way: `el.ariaLabel` is `aria-label`.
+  for (const prop of [
+    'ariaLabel', 'ariaHidden', 'ariaExpanded', 'ariaSelected', 'ariaChecked', 'ariaDisabled',
+    'ariaCurrent', 'ariaLive', 'ariaPressed', 'ariaHasPopup', 'ariaModal', 'ariaBusy',
+    'ariaAtomic', 'ariaRelevant', 'ariaLevel', 'ariaValueNow', 'ariaValueMin', 'ariaValueMax',
+    'ariaValueText', 'ariaOrientation', 'ariaSort', 'ariaMultiSelectable', 'ariaRequired',
+    'ariaInvalid', 'ariaReadOnly', 'ariaPlaceholder', 'ariaRoleDescription', 'ariaDescription',
+    'ariaKeyShortcuts', 'ariaAutoComplete', 'ariaColCount', 'ariaColIndex', 'ariaRowCount',
+    'ariaRowIndex', 'ariaPosInSet', 'ariaSetSize',
+  ]) {
+    const attr = 'aria-' + prop.slice(4).toLowerCase();
+    define(NodeProto, prop, {
+      get() { return this.getAttribute(attr); },
+      set(v) { if (v == null) this.removeAttribute(attr); else this.setAttribute(attr, String(v)); },
+    });
+  }
+
+  // `script.text`, `option.text` and `a.text` are the element's text, which
+  // is how WordPress reads the JSON it embedded for its own module.
+  define(NodeProto, 'text', {
+    get() { return this.textContent; },
+    set(v) { this.textContent = String(v); },
+  });
+
+  // A <template>'s content is a fragment of its own, and it is that fragment
+  // a page clones. Every other element reflects the attribute of that name,
+  // which is what <meta content> is.
+  define(NodeProto, 'content', {
+    get() {
+      if (this.tagName === 'TEMPLATE') return this.templateContent;
+      return this.getAttribute('content') ?? '';
+    },
+    set(v) {
+      if (this.tagName !== 'TEMPLATE') this.setAttribute('content', String(v));
+    },
+  });
 
   // URL-valued attributes resolve against the document, matching the DOM.
   for (const [prop, attr] of [
@@ -587,10 +727,24 @@
   const compiled = new Map();
   for (const prop of [
     'onclick', 'ondblclick', 'onchange', 'oninput', 'onsubmit', 'onreset',
-    'onload', 'onerror', 'onfocus', 'onblur',
     'onkeydown', 'onkeyup', 'onkeypress',
     'onmousedown', 'onmouseup', 'onmouseover', 'onmouseout', 'onmousemove',
-    'oncontextmenu', 'onscroll', 'ontouchstart', 'ontouchend',
+    'oncontextmenu', 'onscroll', 'ontouchstart', 'ontouchend', 'ontouchmove', 'ontouchcancel',
+    'onmouseenter', 'onmouseleave', 'onwheel', 'onauxclick',
+    'onpointerdown', 'onpointerup', 'onpointermove', 'onpointerover', 'onpointerout',
+    'onpointerenter', 'onpointerleave', 'onpointercancel',
+    'onanimationstart', 'onanimationend', 'onanimationiteration', 'ontransitionend',
+    'ontransitionstart', 'ontransitionrun', 'ontransitioncancel',
+    'ondragstart', 'ondrag', 'ondragend', 'ondragenter', 'ondragover', 'ondragleave', 'ondrop',
+    'onabort', 'oncanplay', 'oncanplaythrough', 'onplay', 'onplaying', 'onpause', 'onended',
+    'ontimeupdate', 'onloadeddata', 'onloadedmetadata', 'onloadstart', 'onprogress',
+    'onvolumechange', 'onwaiting', 'onseeking', 'onseeked', 'onstalled', 'onsuspend',
+    'ontoggle', 'onclose', 'oncancel', 'onselect', 'oninvalid', 'onbeforeinput',
+    'onfocusin', 'onfocusout', 'onresize', 'oncopy', 'oncut', 'onpaste', 'onsearch',
+    'oncompositionstart', 'oncompositionend', 'oncompositionupdate', 'onselectstart',
+    'onselectionchange', 'onvisibilitychange', 'onreadystatechange', 'onslotchange',
+    'onformdata', 'onbeforetoggle', 'onscrollend', 'onsecuritypolicyviolation',
+    'onload', 'onerror', 'onfocus', 'onblur',
   ]) {
     define(NodeProto, prop, {
       get() {
@@ -641,7 +795,15 @@
       const key = keyOf(this);
       if (values.has(key)) return values.get(key);
       if (this.tagName === 'TEXTAREA') return this.textContent;
-      return this.getAttribute('value') ?? '';
+      if (this.tagName === 'SELECT') {
+        const chosen = this.querySelector('option[selected]') ?? this.querySelector('option');
+        return chosen ? chosen.value : '';
+      }
+      if (this.tagName === 'OPTION') return this.getAttribute('value') ?? this.textContent.trim();
+      const raw = this.getAttribute('value');
+      // A checkbox or radio with no value attribute submits "on".
+      if (raw == null && this.tagName === 'INPUT' && /^(checkbox|radio)$/i.test(this.getAttribute('type') ?? '')) return 'on';
+      return raw ?? '';
     },
     set(v) {
       values.set(keyOf(this), String(v));
@@ -879,6 +1041,31 @@
 
 
   method(NodeProto, 'scrollIntoView', () => {});
+  method(NodeProto, 'scrollIntoViewIfNeeded', () => {});
+  method(NodeProto, 'scrollTo', () => {});
+  method(NodeProto, 'scroll', () => {});
+  method(NodeProto, 'scrollBy', () => {});
+
+  // The lists the DOM hands back are arrays here, which covers indexing,
+  // `length`, `forEach` and iteration; `item()` and `namedItem()` are what a
+  // NodeList and an HTMLCollection have on top, and a page calls them.
+  const collection = (list) => {
+    define(list, 'item', { value: (i) => list[i] ?? null, enumerable: false, writable: true });
+    define(list, 'namedItem', {
+      value: (n) => list.find((e) => e && e.nodeType === 1 && (e.id === n || e.getAttribute('name') === n)) ?? null,
+      enumerable: false,
+      writable: true,
+    });
+    return list;
+  };
+  for (const name of ['querySelectorAll', 'getElementsByTagName', 'getElementsByClassName']) {
+    const original = NodeProto[name];
+    method(NodeProto, name, function (...args) { return collection(original.apply(this, args)); });
+  }
+  for (const name of ['childNodes', 'children']) {
+    const original = Object.getOwnPropertyDescriptor(NodeProto, name);
+    define(NodeProto, name, { get() { return collection(original.get.call(this)); } });
+  }
   method(NodeProto, 'focus', function () {
     activeElement = this;
   });
@@ -887,9 +1074,6 @@
   });
   method(NodeProto, 'click', function () {
     dispatchEvent.call(this, new Event('click', { bubbles: true, cancelable: true }));
-  });
-  method(NodeProto, 'submit', function () {
-    dispatchEvent.call(this, new Event('submit', { bubbles: true, cancelable: true }));
   });
   // Sizes follow the same rule as rectangles: zero for the page, and the
   // synthetic tile for a client that is measuring. A client clips a click
@@ -962,15 +1146,168 @@
 
   const toNode = (n) => (n instanceof Node ? n : document.createTextNode(String(n)));
 
-  define(NodeProto, 'attributes', {
-    get() {
-      const el = this;
-      const names = el.getAttributeNames();
-      const list = names.map((name) => ({ name, value: el.getAttribute(name) }));
-      list.getNamedItem = (n) => list.find((a) => a.name === n) ?? null;
-      return list;
+  // An attribute as a node of its own. jQuery 1.x reads
+  // `el.attributes[name].expando` while it boots, React 19 removes attributes
+  // by node during hydration, and both want a NamedNodeMap that answers by
+  // index and by name. A plain array answers by index only, and the first
+  // named read is a TypeError that takes the library down with it.
+  class Attr {
+    constructor(owner, name, value) {
+      define(this, 'ownerElement', { value: owner ?? null, writable: true });
+      define(this, '_name', { value: String(name), writable: true });
+      define(this, '_value', { value: value == null ? '' : String(value), writable: true });
+    }
+    get name() { return this._name; }
+    get localName() { return this._name; }
+    get nodeName() { return this._name; }
+    get prefix() { return null; }
+    get namespaceURI() { return null; }
+    get specified() { return true; }
+    get nodeType() { return 2; }
+    get value() {
+      const owner = this.ownerElement;
+      return owner ? owner.getAttribute(this._name) ?? this._value : this._value;
+    }
+    set value(v) {
+      this._value = String(v);
+      if (this.ownerElement) this.ownerElement.setAttribute(this._name, this._value);
+    }
+    get nodeValue() { return this.value; }
+    set nodeValue(v) { this.value = v; }
+    get textContent() { return this.value; }
+    set textContent(v) { this.value = v; }
+    cloneNode() { return new Attr(null, this._name, this.value); }
+    toString() { return '[object Attr]'; }
+  }
+  globalThis.Attr = Attr;
+
+  class NamedNodeMap {
+    constructor(el) { define(this, '_el', { value: el }); }
+    get _names() { return this._el.getAttributeNames(); }
+    get length() { return this._names.length; }
+    item(i) {
+      const n = this._names[i];
+      return n === undefined ? null : new Attr(this._el, n, this._el.getAttribute(n));
+    }
+    getNamedItem(n) {
+      n = String(n).toLowerCase();
+      return this._el.hasAttribute(n) ? new Attr(this._el, n, this._el.getAttribute(n)) : null;
+    }
+    getNamedItemNS(_ns, n) { return this.getNamedItem(n); }
+    setNamedItem(attr) {
+      const old = this.getNamedItem(attr.name);
+      this._el.setAttribute(attr.name, attr.value);
+      attr.ownerElement = this._el;
+      return old;
+    }
+    setNamedItemNS(attr) { return this.setNamedItem(attr); }
+    removeNamedItem(n) {
+      const old = this.getNamedItem(n);
+      if (!old) throw new globalThis.DOMException(`No attribute named ${n}`, 'NotFoundError');
+      this._el.removeAttribute(n);
+      return old;
+    }
+    removeNamedItemNS(_ns, n) { return this.removeNamedItem(n); }
+    [Symbol.iterator]() {
+      const el = this._el;
+      return this._names.map((n) => new Attr(el, n, el.getAttribute(n)))[Symbol.iterator]();
+    }
+    forEach(fn, thisArg) { let i = 0; for (const a of this) fn.call(thisArg, a, i++, this); }
+  }
+  globalThis.NamedNodeMap = NamedNodeMap;
+  const isIndex = (p) => typeof p === 'string' && /^\d+$/.test(p);
+  const namedNodeMapHandler = {
+    get(map, prop, receiver) {
+      if (typeof prop === 'symbol' || prop in map) return Reflect.get(map, prop, receiver);
+      if (isIndex(prop)) return map.item(Number(prop)) ?? undefined;
+      return map.getNamedItem(prop) ?? undefined;
     },
+    has(map, prop) {
+      if (typeof prop === 'symbol' || prop in map) return true;
+      if (isIndex(prop)) return Number(prop) < map.length;
+      return map._el.hasAttribute(String(prop).toLowerCase());
+    },
+    ownKeys(map) { return [...map._names.map((_, i) => String(i)), 'length']; },
+    getOwnPropertyDescriptor(map, prop) {
+      if (isIndex(prop) && Number(prop) < map.length) {
+        return { value: map.item(Number(prop)), enumerable: true, configurable: true };
+      }
+      if (prop === 'length') return { value: map.length, enumerable: false, configurable: true };
+      return Reflect.getOwnPropertyDescriptor(map, prop);
+    },
+  };
+  define(NodeProto, 'attributes', {
+    get() { return new Proxy(new NamedNodeMap(this), namedNodeMapHandler); },
   });
+  method(NodeProto, 'getAttributeNode', function (name) { return this.attributes.getNamedItem(name); });
+  method(NodeProto, 'getAttributeNodeNS', function (_ns, name) { return this.attributes.getNamedItem(name); });
+  method(NodeProto, 'setAttributeNode', function (attr) { return this.attributes.setNamedItem(attr); });
+  method(NodeProto, 'setAttributeNodeNS', function (attr) { return this.attributes.setNamedItem(attr); });
+  method(NodeProto, 'removeAttributeNode', function (attr) {
+    const name = attr && attr.name;
+    if (name == null || !this.hasAttribute(name)) {
+      throw new globalThis.DOMException('The node is not an attribute of this element', 'NotFoundError');
+    }
+    this.removeAttribute(name);
+    attr.ownerElement = null;
+    return attr;
+  });
+  method(NodeProto, 'hasAttributes', function () { return this.getAttributeNames().length > 0; });
+  method(NodeProto, 'getAttributeNS', function (_ns, name) { return this.getAttribute(name); });
+  method(NodeProto, 'setAttributeNS', function (_ns, name, value) { this.setAttribute(name, value); });
+  method(NodeProto, 'hasAttributeNS', function (_ns, name) { return this.hasAttribute(name); });
+  method(NodeProto, 'removeAttributeNS', function (_ns, name) { this.removeAttribute(name); });
+  method(NodeProto, 'toggleAttribute', NodeProto.toggleAttribute);
+
+  // Identity and order. `isEqualNode` is how react-helmet decides whether a
+  // tag it is about to insert is already there; `compareDocumentPosition` is
+  // how a stylesheet manager sorts what it inserted.
+  method(NodeProto, 'isSameNode', function (other) { return !!other && keyOf(other) === keyOf(this); });
+  method(NodeProto, 'isEqualNode', function (other) {
+    if (!other || other.nodeType !== this.nodeType) return false;
+    if (this.nodeType === 1) {
+      if (this.tagName !== other.tagName) return false;
+      const mine = this.getAttributeNames();
+      if (mine.length !== other.getAttributeNames().length) return false;
+      for (const name of mine) if (this.getAttribute(name) !== other.getAttribute(name)) return false;
+    } else if (this.nodeType === 3 || this.nodeType === 8) {
+      return this.data === other.data;
+    }
+    const a = this.childNodes, b = other.childNodes;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!a[i].isEqualNode(b[i])) return false;
+    return true;
+  });
+  // The arena root stands in for `document`, and the bindings hide it as a
+  // parent; walking up therefore stops at <html>, which is one short.
+  const parentOf = (n) => {
+    const p = n.parentNode;
+    if (p) return p;
+    const root = native.document_element();
+    return root && n.nodeType === 1 && keyOf(n) === keyOf(root) ? native.root() : null;
+  };
+  method(NodeProto, 'getRootNode', function () {
+    let n = this;
+    for (let up = parentOf(n); up; up = parentOf(n)) n = up;
+    return n;
+  });
+  method(NodeProto, 'compareDocumentPosition', function (other) {
+    if (!other || typeof other.nodeType !== 'number') throw new TypeError('compareDocumentPosition: not a node');
+    if (keyOf(other) === keyOf(this)) return 0;
+    const chain = (n) => { const out = [n]; for (let up = parentOf(n); up; up = parentOf(up)) out.push(up); return out; };
+    const a = chain(this), b = chain(other);
+    const ka = a.map(keyOf), kb = b.map(keyOf);
+    if (ka[ka.length - 1] !== kb[kb.length - 1]) return 1 | 32 | (ka[0] < kb[0] ? 4 : 2);
+    if (ka.includes(kb[0])) return 2 | 8;
+    if (kb.includes(ka[0])) return 4 | 16;
+    let i = ka.length - 1, j = kb.length - 1;
+    while (i > 0 && j > 0 && ka[i - 1] === kb[j - 1]) { i--; j--; }
+    const siblings = a[i].childNodes.map(keyOf);
+    return siblings.indexOf(ka[i - 1]) < siblings.indexOf(kb[j - 1]) ? 4 : 2;
+  });
+  method(NodeProto, 'lookupNamespaceURI', (prefix) => (prefix == null || prefix === '' ? 'http://www.w3.org/1999/xhtml' : null));
+  method(NodeProto, 'lookupPrefix', () => null);
+  method(NodeProto, 'isDefaultNamespace', (ns) => ns === 'http://www.w3.org/1999/xhtml');
 
   define(NodeProto, 'namespaceURI', { get: () => 'http://www.w3.org/1999/xhtml' });
   define(NodeProto, 'isConnected', {
@@ -988,35 +1325,92 @@
   // constantly and a missing global is a ReferenceError that stops a script
   // dead. Membership is decided by what a node is, because handles share one
   // prototype and a prototype chain could not tell them apart.
-  const domInterface = (name, holds) => {
+  // Each interface gets a prototype of its own, chained the way the DOM
+  // chains them, and the bridge hands a node out with the prototype for its
+  // tag. A page that patches `HTMLTemplateElement.prototype` then reaches
+  // templates and nothing else, and `div.constructor.name` says what it is.
+  const domInterface = (name, holds, parent = NodeProto) => {
     const ctor = function () {
       throw new TypeError(`Illegal constructor: ${name}`);
     };
     define(ctor, 'name', { value: name });
     define(ctor, Symbol.hasInstance, { value: holds });
-    ctor.prototype = NodeProto;
+    ctor.prototype = Object.create(parent, {
+      constructor: { value: ctor, writable: true, configurable: true },
+    });
+    define(ctor.prototype, Symbol.toStringTag, { value: name });
     globalThis[name] = ctor;
+    return ctor;
   };
   const isType = (type) => (v) => !!v && v.nodeType === type;
   // `EventTarget` is not in this list: it is defined above as a real class,
   // because a page that writes `class Bus extends EventTarget` has to be able
   // to construct one.
-  domInterface('Element', isType(1));
-  domInterface('HTMLElement', isType(1));
-  domInterface('Text', isType(3));
-  domInterface('Comment', isType(8));
-  domInterface('CharacterData', (v) => !!v && (v.nodeType === 3 || v.nodeType === 8));
-  domInterface('Document', isType(9));
-  domInterface('HTMLDocument', isType(9));
-  domInterface('DocumentFragment', isType(11));
+  const Element = domInterface('Element', isType(1));
+  const HTMLElement = domInterface('HTMLElement', isType(1), Element.prototype);
+  // `new Text('x')` and `new DocumentFragment()` are ordinary code, so these
+  // three construct; the rest of the DOM's interfaces throw as they should.
+  const constructible = (name, make, holds, parent) => {
+    const ctor = function (...args) {
+      const node = make(...args);
+      Object.setPrototypeOf(node, ctor.prototype);
+      return node;
+    };
+    define(ctor, 'name', { value: name });
+    define(ctor, Symbol.hasInstance, { value: holds });
+    ctor.prototype = Object.create(parent, {
+      constructor: { value: ctor, writable: true, configurable: true },
+    });
+    define(ctor.prototype, Symbol.toStringTag, { value: name });
+    globalThis[name] = ctor;
+    return ctor;
+  };
+  const CharacterData = domInterface('CharacterData', (v) => !!v && (v.nodeType === 3 || v.nodeType === 8));
+  constructible('Text', (data = '') => native.create_text_node(String(data)), isType(3), CharacterData.prototype);
+  constructible('Comment', (data = '') => native.create_comment(String(data)), isType(8), CharacterData.prototype);
+  const shadowHosts = new Map();
+  const DocumentFragment = constructible('DocumentFragment', () => native.create_fragment(),
+    (v) => !!v && v.nodeType === 11 && !shadowHosts.has(keyOf(v)), NodeProto);
+  const Document = domInterface('Document', isType(9));
+  domInterface('HTMLDocument', isType(9), Document.prototype);
+  domInterface('XMLDocument', () => false, Document.prototype);
   domInterface('DocumentType', isType(10));
-  // Nothing here attaches shadow trees, so nothing is in one. The global still
-  // has to exist: a library walking up from a node tests the root against it,
-  // and an undefined right-hand side of `instanceof` is a TypeError.
-  domInterface('ShadowRoot', () => false);
-  // Nothing here parses SVG into SVG-aware nodes, so nothing is one.
-  domInterface('SVGElement', () => false);
-  domInterface('SVGSVGElement', () => false);
+  // A shadow root is a fragment that knows its host.
+  domInterface('ShadowRoot', (v) => !!v && v.nodeType === 11 && shadowHosts.has(keyOf(v)), DocumentFragment.prototype);
+  // Nothing here parses SVG into SVG-aware nodes, but an element with an SVG
+  // tag name is still what a script means by one.
+  const SVG_TAGS = ['svg', 'path', 'circle', 'rect', 'g', 'line', 'polyline', 'polygon', 'ellipse',
+    'tspan', 'defs', 'use', 'symbol', 'clippath', 'mask', 'pattern', 'lineargradient',
+    'radialgradient', 'stop', 'filter', 'foreignobject', 'marker', 'desc', 'fecolormatrix',
+    'fegaussianblur', 'feoffset', 'feblend', 'femerge', 'femergenode', 'feflood', 'fecomposite',
+    'animate', 'animatetransform', 'text'];
+  const isSvg = (v) => !!v && v.nodeType === 1 && SVG_TAGS.includes(String(v.tagName).toLowerCase());
+  const SVGElement = domInterface('SVGElement', isSvg, Element.prototype);
+  const SVGGraphicsElement = domInterface('SVGGraphicsElement', isSvg, SVGElement.prototype);
+  const SVGSVGElement = domInterface('SVGSVGElement', (v) => isSvg(v) && v.tagName === 'SVG', SVGGraphicsElement.prototype);
+  define(SVGElement.prototype, 'className', {
+    get() { const v = this.getAttribute('class') ?? ''; return { baseVal: v, animVal: v }; },
+    set(v) { this.setAttribute('class', String(v && v.baseVal !== undefined ? v.baseVal : v)); },
+  });
+  define(SVGElement.prototype, 'ownerSVGElement', { get() { return this.closest('svg'); } });
+  define(SVGElement.prototype, 'viewportElement', { get() { return this.closest('svg'); } });
+  method(SVGGraphicsElement.prototype, 'getBBox', function () {
+    const r = this.getBoundingClientRect();
+    return { x: 0, y: 0, width: r.width, height: r.height };
+  });
+  method(SVGGraphicsElement.prototype, 'getCTM', () => null);
+  method(SVGGraphicsElement.prototype, 'getScreenCTM', () => null);
+  method(SVGSVGElement.prototype, 'createSVGPoint', () => ({ x: 0, y: 0, matrixTransform() { return this; } }));
+  method(SVGSVGElement.prototype, 'createSVGMatrix', () => new globalThis.DOMMatrix());
+  method(SVGSVGElement.prototype, 'createSVGRect', () => ({ x: 0, y: 0, width: 0, height: 0 }));
+  method(SVGSVGElement.prototype, 'getElementById', function (id) { return this.querySelector(`[id="${String(id).replace(/"/g, '\\"')}"]`); });
+  define(SVGSVGElement.prototype, 'viewBox', {
+    get() {
+      const [x = 0, y = 0, w = 0, h = 0] = (this.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
+      const box = { x, y, width: w, height: h };
+      return { baseVal: box, animVal: box };
+    },
+  });
 
   // One interface per tag, because that is how scripts ask. React's scheduler
   // alone tests HTMLDivElement, HTMLBRElement, HTMLBodyElement and ShadowRoot,
@@ -1043,18 +1437,37 @@
     HTMLTimeElement: 'TIME', HTMLTitleElement: 'TITLE', HTMLTrackElement: 'TRACK',
     HTMLUListElement: 'UL', HTMLVideoElement: 'VIDEO',
   };
+  const anyOf = (...tags) => (v) => !!v && v.nodeType === 1 && tags.includes(v.tagName);
+  const HTMLMediaElement = domInterface('HTMLMediaElement', anyOf('AUDIO', 'VIDEO'), HTMLElement.prototype);
+  const tagPrototypes = {};
   for (const [name, tag] of Object.entries(TAG_INTERFACES)) {
-    domInterface(name, (v) => !!v && v.nodeType === 1 && v.tagName === tag);
+    const parent = tag === 'AUDIO' || tag === 'VIDEO' ? HTMLMediaElement.prototype : HTMLElement.prototype;
+    const ctor = domInterface(name, (v) => !!v && v.nodeType === 1 && v.tagName === tag, parent);
+    tagPrototypes[tag.toLowerCase()] = ctor.prototype;
   }
   // Interfaces one tag name cannot answer for.
-  const anyOf = (...tags) => (v) => !!v && v.nodeType === 1 && tags.includes(v.tagName);
-  domInterface('HTMLHeadingElement', anyOf('H1', 'H2', 'H3', 'H4', 'H5', 'H6'));
-  domInterface('HTMLTableCellElement', anyOf('TD', 'TH'));
-  domInterface('HTMLTableSectionElement', anyOf('THEAD', 'TBODY', 'TFOOT'));
-  domInterface('HTMLQuoteElement', anyOf('BLOCKQUOTE', 'Q'));
-  domInterface('HTMLModElement', anyOf('INS', 'DEL'));
-  domInterface('HTMLMediaElement', anyOf('AUDIO', 'VIDEO'));
-  domInterface('HTMLUnknownElement', () => false);
+  for (const [name, tags] of [
+    ['HTMLHeadingElement', ['H1', 'H2', 'H3', 'H4', 'H5', 'H6']],
+    ['HTMLTableCellElement', ['TD', 'TH']],
+    ['HTMLTableSectionElement', ['THEAD', 'TBODY', 'TFOOT']],
+    ['HTMLQuoteElement', ['BLOCKQUOTE', 'Q']],
+    ['HTMLModElement', ['INS', 'DEL']],
+  ]) {
+    const ctor = domInterface(name, anyOf(...tags), HTMLElement.prototype);
+    for (const tag of tags) tagPrototypes[tag.toLowerCase()] = ctor.prototype;
+  }
+  domInterface('HTMLUnknownElement', () => false, HTMLElement.prototype);
+  for (const tag of SVG_TAGS) tagPrototypes[tag] = tag === 'svg' ? SVGSVGElement.prototype : SVGGraphicsElement.prototype;
+  // Hand the bridge the map, and give the document — wrapped before any of
+  // this existed — the prototype it would have been created with.
+  native.register_prototypes({
+    element: HTMLElement.prototype,
+    document: globalThis.HTMLDocument.prototype,
+    fragment: DocumentFragment.prototype,
+    text: globalThis.Text.prototype,
+    comment: globalThis.Comment.prototype,
+    doctype: globalThis.DocumentType.prototype,
+  }, tagPrototypes);
 
   // The constructible ones. `new Image()` is how half the web preloads a
   // picture, and it is a plain `document.createElement` underneath.
@@ -1068,7 +1481,7 @@
     define(ctor, Symbol.hasInstance, {
       value: (v) => !!v && v.nodeType === 1 && v.tagName === tag.toUpperCase(),
     });
-    ctor.prototype = NodeProto;
+    ctor.prototype = tagPrototypes[tag] ?? HTMLElement.prototype;
     globalThis[name] = ctor;
   };
   elementConstructor('Image', 'img', (el, [w, h]) => {
@@ -1089,6 +1502,9 @@
     ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
     PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
     DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+    DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2,
+    DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8,
+    DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
   })) {
     define(Node, name, { value });
     define(NodeProto, name, { value });
@@ -1100,6 +1516,11 @@
 
   const documentNode = native.root();
   const document = documentNode;
+  Object.setPrototypeOf(document, globalThis.HTMLDocument.prototype);
+  // Methods go on the prototype, because that is where a consent manager
+  // looks for `createElement` to wrap it, and an own method on the instance
+  // leaves it wrapping `undefined`.
+  const DocumentProto = globalThis.Document.prototype;
 
   define(document, 'documentElement', { get: () => native.document_element() });
   define(document, 'body', { get: () => native.body() });
@@ -1135,21 +1556,21 @@
   define(document, 'documentURI', { get: () => location.href });
   define(document, 'location', { get: () => location, set: (v) => native.navigate(String(v)) });
 
-  method(document, 'createElement', (n) => native.create_element(n));
-  method(document, 'createElementNS', (_ns, n) => native.create_element(n));
-  method(document, 'createTextNode', (t) => native.create_text_node(String(t)));
-  method(document, 'createComment', (t) => native.create_comment(String(t)));
-  method(document, 'createDocumentFragment', () => native.create_fragment());
-  method(document, 'getElementById', (id) => native.get_element_by_id(String(id)));
-  method(document, 'write', (...s) => {
+  method(DocumentProto, 'createElement', (n) => native.create_element(n));
+  method(DocumentProto, 'createElementNS', (_ns, n) => native.create_element(n));
+  method(DocumentProto, 'createTextNode', (t) => native.create_text_node(String(t)));
+  method(DocumentProto, 'createComment', (t) => native.create_comment(String(t)));
+  method(DocumentProto, 'createDocumentFragment', () => native.create_fragment());
+  method(DocumentProto, 'getElementById', (id) => native.get_element_by_id(String(id)));
+  method(DocumentProto, 'write', (...s) => {
     // document.write after parsing would replace the page in a real browser.
     // Appending is the safer reading of what the script intended.
     const body = native.body();
     if (body) body.insertAdjacentHTML('beforeend', s.join(''));
   });
-  method(document, 'writeln', (...s) => document.write(...s, '\n'));
-  method(document, 'open', () => document);
-  method(document, 'close', () => {});
+  method(DocumentProto, 'writeln', (...s) => document.write(...s, '\n'));
+  method(DocumentProto, 'open', () => document);
+  method(DocumentProto, 'close', () => {});
   // DOMPurify and every other sanitiser start by asking for a blank document
   // to parse into, and fall over on the spot when this is missing. There is
   // one document here, so the "new" one is a detached subtree of it — which is
@@ -1160,30 +1581,21 @@
       createHTMLDocument(title) {
         const doc = native.create_element('html');
         doc.innerHTML = '<head></head><body></body>';
-        const head = doc.querySelector('head');
-        const body = doc.querySelector('body');
         if (title !== undefined) {
           const el = native.create_element('title');
           el.textContent = String(title);
-          head.appendChild(el);
+          doc.querySelector('head').appendChild(el);
         }
-        define(doc, 'head', { get: () => head, configurable: true });
-        define(doc, 'body', { get: () => body, configurable: true });
-        define(doc, 'documentElement', { get: () => doc, configurable: true });
-        method(doc, 'createElement', (n) => native.create_element(n));
-        method(doc, 'createTextNode', (t) => native.create_text_node(String(t)));
-        method(doc, 'createDocumentFragment', () => native.create_fragment());
-        method(doc, 'getElementById', (id) => doc.querySelector(`[id="${String(id).replace(/"/g, '\\"')}"]`));
-        return doc;
+        return globalThis.__mar_document_like(doc);
       },
       createDocument() { return this.createHTMLDocument(); },
       createDocumentType: (name) => ({ name, publicId: '', systemId: '' }),
     }),
   });
 
-  method(document, 'importNode', (n, deep) => n.cloneNode(deep));
-  method(document, 'adoptNode', (n) => n);
-  method(document, 'createRange', () => ({
+  method(DocumentProto, 'importNode', (n, deep) => n.cloneNode(deep));
+  method(DocumentProto, 'adoptNode', (n) => n);
+  method(DocumentProto, 'createRange', () => ({
     setStart() {}, setEnd() {}, selectNodeContents() {},
     cloneContents: () => native.create_fragment(),
     createContextualFragment(html) {
@@ -1194,7 +1606,7 @@
       return f;
     },
   }));
-  method(document, 'createTreeWalker', (root) => {
+  method(DocumentProto, 'createTreeWalker', (root) => {
     const nodes = [];
     (function walk(n) {
       for (const c of n.childNodes) {
@@ -1209,10 +1621,10 @@
       previousNode: () => (--i >= 0 ? nodes[i] : null),
     };
   });
-  method(document, 'elementFromPoint', () => null);
-  method(document, 'hasFocus', () => true);
-  method(document, 'execCommand', () => false);
-  method(document, 'evaluate', () => ({ iterateNext: () => null, snapshotLength: 0 }));
+  method(DocumentProto, 'elementFromPoint', () => null);
+  method(DocumentProto, 'hasFocus', () => true);
+  method(DocumentProto, 'execCommand', () => false);
+  method(DocumentProto, 'evaluate', () => ({ iterateNext: () => null, snapshotLength: 0 }));
   globalThis.document = document;
 
   // -- window --------------------------------------------------------------
@@ -1237,11 +1649,16 @@
   globalThis.location = location;
 
   const [innerWidth, innerHeight] = native.viewport();
-  const ua = native.user_agent();
+  // Read on demand, not once: the host sets the user agent to whatever its
+  // handshake claimed, and it does so after this prelude has run. A page
+  // that hashes `navigator.userAgent` and a server that checks the hash
+  // against the header must see the same string.
+  const ua = () => native.user_agent();
+  const chromeMajor = () => (/Chrome\/(\d+)/.exec(ua()) || [, '140'])[1];
 
   globalThis.navigator = {
-    userAgent: ua,
-    appVersion: ua.replace('Mozilla/', ''),
+    get userAgent() { return ua(); },
+    get appVersion() { return ua().replace('Mozilla/', ''); },
     platform: 'MacIntel',
     vendor: 'Google Inc.',
     language: 'en-US',
@@ -1261,11 +1678,34 @@
     sendBeacon: () => true,
     clipboard: { writeText: () => Promise.resolve() },
     permissions: { query: () => Promise.resolve({ state: 'prompt' }) },
-    serviceWorker: { register: () => Promise.reject(new Error('unsupported')) },
-    userAgentData: {
-      brands: [{ brand: 'Chromium', version: '140' }],
-      mobile: false,
-      platform: 'macOS',
+    serviceWorker: {
+      controller: null, oncontrollerchange: null, onmessage: null, onmessageerror: null,
+      register: () => Promise.reject(new globalThis.DOMException('service workers are not available here', 'SecurityError')),
+      getRegistration: () => Promise.resolve(undefined),
+      getRegistrations: () => Promise.resolve([]),
+      ready: new Promise(() => {}),
+      startMessages() {},
+      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+    },
+    get userAgentData() {
+      const version = chromeMajor();
+      return {
+        brands: [
+          { brand: 'Chromium', version },
+          { brand: 'Google Chrome', version },
+          { brand: 'Not=A?Brand', version: '24' },
+        ],
+        mobile: false,
+        platform: 'macOS',
+        getHighEntropyValues: () => Promise.resolve({
+          architecture: 'x86', bitness: '64', model: '', platform: 'macOS',
+          platformVersion: '15.0.0', uaFullVersion: `${version}.0.0.0`, fullVersionList: [
+            { brand: 'Chromium', version: `${version}.0.0.0` },
+            { brand: 'Google Chrome', version: `${version}.0.0.0` },
+          ],
+        }),
+        toJSON() { return { brands: this.brands, mobile: false, platform: 'macOS' }; },
+      };
     },
   };
 
@@ -1434,7 +1874,7 @@
             rootBounds: null,
           }], this);
         } catch (e) {
-          native.record_error('IntersectionObserver', String((e && e.stack) || e));
+          native.record_error('IntersectionObserver', describeError(e));
         }
       }, 0);
     }
@@ -1459,7 +1899,7 @@
             this
           );
         } catch (e) {
-          native.record_error('MutationObserver', String((e && e.stack) || e));
+          native.record_error('MutationObserver', describeError(e));
         }
       }, 0);
     }
@@ -1606,8 +2046,37 @@
     });
   };
 
-  globalThis.XMLHttpRequest = class XMLHttpRequest {
+  // zone.js patches `addEventListener` on `XMLHttpRequestEventTarget`'s
+  // prototype and reads `readyState === DONE` off the instance; without the
+  // class and the constants, Angular's HttpClient never sees a response.
+  class XMLHttpRequestEventTarget extends globalThis.EventTarget {
     constructor() {
+      super();
+      this._listeners = {};
+    }
+    addEventListener(t, fn) { (this._listeners[String(t)] ||= []).push(fn); }
+    removeEventListener(t, fn) {
+      const l = this._listeners[String(t)];
+      if (l) this._listeners[String(t)] = l.filter((f) => f !== fn);
+    }
+    dispatchEvent(ev) { this._fire(ev.type, ev); return !ev.defaultPrevented; }
+    _fire(type, ev) {
+      ev = ev || new Event(type);
+      ev.target = this;
+      for (const fn of (this._listeners[type] || []).slice()) {
+        try { (fn.handleEvent || fn).call(this, ev); } catch (e) { native.record_error('xhr:' + type, describeError(e)); }
+      }
+      const inline = this['on' + type];
+      if (typeof inline === 'function') {
+        try { inline.call(this, ev); } catch (e) { native.record_error('xhr:on' + type, describeError(e)); }
+      }
+    }
+  }
+  globalThis.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
+  globalThis.XMLHttpRequestUpload = class XMLHttpRequestUpload extends XMLHttpRequestEventTarget {};
+  globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarget {
+    constructor() {
+      super();
       this.readyState = 0;
       this.status = 0;
       this.statusText = '';
@@ -1617,10 +2086,9 @@
       this.responseURL = '';
       this.timeout = 0;
       this.withCredentials = false;
-      this.upload = { addEventListener() {}, removeEventListener() {} };
+      this.upload = new globalThis.XMLHttpRequestUpload();
       this._headers = {};
       this._responseHeaders = {};
-      this._listeners = {};
     }
     open(method, url, async = true) {
       this._method = method;
@@ -1636,22 +2104,6 @@
     }
     overrideMimeType() {}
     abort() { this.readyState = 0; this._fire('abort'); }
-    addEventListener(t, fn) { (this._listeners[t] ||= []).push(fn); }
-    removeEventListener(t, fn) {
-      const l = this._listeners[t];
-      if (l) this._listeners[t] = l.filter((f) => f !== fn);
-    }
-    _fire(type) {
-      const ev = new Event(type);
-      ev.target = this;
-      for (const fn of this._listeners[type] || []) {
-        try { fn.call(this, ev); } catch (e) { native.record_error('xhr:' + type, String(e)); }
-      }
-      const inline = this['on' + type];
-      if (typeof inline === 'function') {
-        try { inline.call(this, ev); } catch (e) { native.record_error('xhr:on' + type, String(e)); }
-      }
-    }
     send(body) {
       // A synchronous XHR blocks the page in a browser too, so it blocks here.
       // Everything else goes through the asynchronous path and overlaps.
@@ -1685,6 +2137,11 @@
       this._fire('loadend');
     }
   };
+
+  for (const [name, value] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {
+    define(globalThis.XMLHttpRequest, name, { value, enumerable: true });
+    define(globalThis.XMLHttpRequest.prototype, name, { value, enumerable: true });
+  }
 
   globalThis.WebSocket = class WebSocket {
     constructor(url) {
@@ -2332,10 +2789,11 @@
   globalThis.DOMParser = class DOMParser {
     parseFromString(html) {
       // Parse into a detached subtree of the live document. Callers read it
-      // with the same node API as the page itself.
+      // with the same node API as the page itself, and a sanitiser reads
+      // `.body` off it, so it answers as a document does.
       const holder = native.create_element('html');
       holder.innerHTML = String(html);
-      return holder;
+      return globalThis.__mar_document_like(holder);
     }
   };
   globalThis.XMLSerializer = class XMLSerializer {
@@ -2420,7 +2878,18 @@
     subtle: {},
   };
 
-  globalThis.CSS = { supports: () => false, escape: (s) => String(s).replace(/[^\w-]/g, '\\$&') };
+  // A page asks `CSS.supports` to decide whether the browser is too old to
+  // serve, and sends it to a "please update" page on a no. Nothing here lays
+  // out, so no answer is checked against anything; yes is the answer that
+  // gets the page.
+  globalThis.CSS = {
+    supports: () => true,
+    escape: (s) => String(s).replace(/[^\w-]/g, '\\$&'),
+    registerProperty() {},
+    px: (v) => ({ value: v, unit: 'px' }),
+    number: (v) => ({ value: v, unit: 'number' }),
+    highlights: new Map(),
+  };
   globalThis.customElements = {
     define() {}, get: () => undefined,
     whenDefined: () => Promise.resolve(), upgrade() {},
@@ -2661,13 +3130,36 @@
   // Thrown by name from more DOM code than one would expect, and caught by
   // name too: `e instanceof DOMException` on an undefined global is a
   // TypeError raised inside a catch block, which is the worst place for one.
+  const DOM_EXCEPTION_CODES = {
+    IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5,
+    NoModificationAllowedError: 7, NotFoundError: 8, NotSupportedError: 9, InUseAttributeError: 10,
+    InvalidStateError: 11, SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+    InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18, NetworkError: 19,
+    AbortError: 20, URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
+    InvalidNodeTypeError: 24, DataCloneError: 25,
+  };
   globalThis.DOMException = class DOMException extends Error {
     constructor(message = '', name = 'Error') {
-      super(message);
-      this.name = name;
-      this.code = 0;
+      super(String(message));
+      // Own data properties, not assignments: core-js installs accessors for
+      // `name` and `code` on the prototype before it constructs one of these
+      // to probe it, and an assignment through a getter-only accessor throws.
+      define(this, 'name', { value: String(name), writable: true });
+      define(this, 'code', { value: DOM_EXCEPTION_CODES[String(name)] ?? 0, writable: true });
     }
   };
+  for (const [name, code] of Object.entries({
+    INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3, WRONG_DOCUMENT_ERR: 4,
+    INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6, NO_MODIFICATION_ALLOWED_ERR: 7,
+    NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9, INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11,
+    SYNTAX_ERR: 12, INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+    VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18, NETWORK_ERR: 19, ABORT_ERR: 20,
+    URL_MISMATCH_ERR: 21, QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24,
+    DATA_CLONE_ERR: 25,
+  })) {
+    define(globalThis.DOMException, name, { value: code });
+    define(globalThis.DOMException.prototype, name, { value: code });
+  }
 
   // `localStorage instanceof Storage` is how a page tells a real storage area
   // from a stub someone else installed.
@@ -2718,11 +3210,11 @@
       const event = { type: 'abort', target: this, currentTarget: this };
       for (const fn of this._listeners.slice()) {
         try { (fn.handleEvent || fn).call(this, event); }
-        catch (e) { native.record_error('abort listener', String((e && e.stack) || e)); }
+        catch (e) { native.record_error('abort listener', describeError(e)); }
       }
       if (typeof this.onabort === 'function') {
         try { this.onabort(event); }
-        catch (e) { native.record_error('onabort', String((e && e.stack) || e)); }
+        catch (e) { native.record_error('onabort', describeError(e)); }
       }
     }
     static abort(reason) { const s = new AbortSignal(); s._abort(reason); return s; }
@@ -3198,11 +3690,11 @@
         event.target = this;
         for (const fn of this._listeners.slice()) {
           try { (fn.handleEvent || fn).call(this, event); }
-          catch (e) { native.record_error('MessagePort', String((e && e.stack) || e)); }
+          catch (e) { native.record_error('MessagePort', describeError(e)); }
         }
         if (typeof this.onmessage === 'function') {
           try { this.onmessage(event); }
-          catch (e) { native.record_error('MessagePort', String((e && e.stack) || e)); }
+          catch (e) { native.record_error('MessagePort', describeError(e)); }
         }
       }
       addEventListener(type, fn) { if (type === 'message' && fn) this._listeners.push(fn); }
@@ -3296,8 +3788,8 @@
       nextSibling() { const n = this.currentNode?.nextSibling ?? null; if (n) this.currentNode = n; return n; }
       previousSibling() { const n = this.currentNode?.previousSibling ?? null; if (n) this.currentNode = n; return n; }
     });
-    method(document, 'createNodeIterator', (root, show, filter) => new NodeIterator(root, show, filter));
-    method(document, 'createTreeWalker', (root, show, filter) => new globalThis.TreeWalker(root, show, filter));
+    method(DocumentProto, 'createNodeIterator', (root, show, filter) => new NodeIterator(root, show, filter));
+    method(DocumentProto, 'createTreeWalker', (root, show, filter) => new globalThis.TreeWalker(root, show, filter));
 
     // Ranges, as far as a page without selection can go.
     class AbstractRange {
@@ -3336,7 +3828,7 @@
       surroundContents() {}
       cloneContents() { return native.create_fragment(); }
     });
-    method(document, 'createRange', () => new globalThis.Range());
+    method(DocumentProto, 'createRange', () => new globalThis.Range());
     named('Selection', class Selection {
       constructor() { this.rangeCount = 0; this.isCollapsed = true; this.type = 'None'; }
       getRangeAt() { throw new globalThis.DOMException('no range', 'IndexSizeError'); }
@@ -3345,7 +3837,7 @@
     });
     const selection = new globalThis.Selection();
     globalThis.getSelection = () => selection;
-    method(document, 'getSelection', () => selection);
+    method(DocumentProto, 'getSelection', () => selection);
 
     // Small shapes something reads off an element or an event.
     named('ValidityState', class ValidityState {});
@@ -3404,11 +3896,1020 @@
     }
   })();
 
+
+  // -- what the corpus asked for ---------------------------------------------
+
+  // Each of these is a name some real page called and did not find. Most
+  // are a shape and a plausible answer, because a plausible answer is what
+  // lets the page get on with rendering; none of them draws, lays out or
+  // reaches a device, because nothing here can.
+
+  // A canvas that answers. Lottie, web-animations and a fingerprinting
+  // script all open a 2D context at import time and set a property on it,
+  // so `null` — which is what a headless machine without a GPU may return
+  // for WebGL — is not enough for '2d'.
+  const canvasContexts = new Map();
+  const noop = () => {};
+  const imageData = (w, h) => ({
+    width: w | 0, height: h | 0, colorSpace: 'srgb',
+    data: new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)),
+  });
+  const identityMatrix = () => ({
+    a: 1, b: 0, c: 0, d: 1, e: 0, f: 0, m11: 1, m12: 0, m21: 0, m22: 1, m41: 0, m42: 0,
+    is2D: true, isIdentity: true,
+  });
+  const gradient = () => ({ addColorStop: noop });
+  const context2d = (canvas) => {
+    const ctx = {
+      canvas,
+      fillStyle: '#000000', strokeStyle: '#000000', lineWidth: 1, lineCap: 'butt',
+      lineJoin: 'miter', miterLimit: 10, lineDashOffset: 0, font: '10px sans-serif',
+      textAlign: 'start', textBaseline: 'alphabetic', direction: 'ltr', letterSpacing: '0px',
+      wordSpacing: '0px', fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal',
+      textRendering: 'auto', globalAlpha: 1, globalCompositeOperation: 'source-over',
+      imageSmoothingEnabled: true, imageSmoothingQuality: 'low', filter: 'none',
+      shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0,
+      measureText: (text) => {
+        const width = String(text).length * 6;
+        return {
+          width, actualBoundingBoxLeft: 0, actualBoundingBoxRight: width,
+          actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2,
+          fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2,
+          emHeightAscent: 8, emHeightDescent: 2, hangingBaseline: 8,
+          alphabeticBaseline: 0, ideographicBaseline: -2,
+        };
+      },
+      getImageData: (_x, _y, w, h) => imageData(w, h),
+      createImageData: (w, h) => imageData(typeof w === 'object' ? w.width : w, typeof w === 'object' ? w.height : h),
+      createLinearGradient: gradient, createRadialGradient: gradient, createConicGradient: gradient,
+      createPattern: () => null,
+      getContextAttributes: () => ({ alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }),
+      getTransform: identityMatrix, getLineDash: () => [],
+      isPointInPath: () => false, isPointInStroke: () => false, isContextLost: () => false,
+    };
+    for (const name of [
+      'fillRect', 'strokeRect', 'clearRect', 'beginPath', 'closePath', 'moveTo', 'lineTo',
+      'bezierCurveTo', 'quadraticCurveTo', 'arc', 'arcTo', 'ellipse', 'rect', 'roundRect',
+      'fill', 'stroke', 'clip', 'fillText', 'strokeText', 'drawImage', 'putImageData',
+      'save', 'restore', 'scale', 'rotate', 'translate', 'transform', 'setTransform',
+      'resetTransform', 'setLineDash', 'drawFocusIfNeeded', 'reset',
+    ]) ctx[name] = noop;
+    return ctx;
+  };
+  method(NodeProto, 'getContext', function (kind) {
+    if (this.tagName !== 'CANVAS') return null;
+    if (String(kind) !== '2d') return null;
+    const key = keyOf(this);
+    if (!canvasContexts.has(key)) canvasContexts.set(key, context2d(this));
+    return canvasContexts.get(key);
+  });
+  // One transparent pixel, which is what an unpainted canvas holds.
+  const BLANK_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+  method(NodeProto, 'toDataURL', () => BLANK_PNG);
+  method(NodeProto, 'toBlob', (callback) => {
+    setTimeout(() => { if (typeof callback === 'function') callback(new Blob([''], { type: 'image/png' })); }, 0);
+  });
+  method(NodeProto, 'captureStream', () => ({ getTracks: () => [], getVideoTracks: () => [], getAudioTracks: () => [], addTrack: noop, removeTrack: noop }));
+  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
+  globalThis.Path2D = class Path2D {
+    addPath() {} closePath() {} moveTo() {} lineTo() {} bezierCurveTo() {} quadraticCurveTo() {}
+    arc() {} arcTo() {} ellipse() {} rect() {} roundRect() {}
+  };
+  globalThis.DOMMatrixReadOnly = class DOMMatrixReadOnly {
+    constructor() { Object.assign(this, identityMatrix()); }
+    multiply() { return new globalThis.DOMMatrix(); }
+    translate() { return new globalThis.DOMMatrix(); }
+    scale() { return new globalThis.DOMMatrix(); }
+    inverse() { return new globalThis.DOMMatrix(); }
+    toString() { return 'matrix(1, 0, 0, 1, 0, 0)'; }
+    toJSON() { return { ...this }; }
+  };
+  globalThis.DOMMatrix = class DOMMatrix extends globalThis.DOMMatrixReadOnly {};
+  globalThis.WebKitCSSMatrix = globalThis.DOMMatrix;
+
+  // The size of a picture, canvas or frame. `canvas.width = 1` is how a page
+  // sizes the canvas it is about to measure with.
+  const SIZED_NUMERIC = ['IMG', 'CANVAS', 'VIDEO', 'INPUT'];
+  const SIZED_STRING = ['IFRAME', 'EMBED', 'OBJECT', 'TABLE', 'TD', 'TH', 'COL', 'COLGROUP', 'HR', 'PRE'];
+  for (const prop of ['width', 'height']) {
+    define(NodeProto, prop, {
+      get() {
+        if (SIZED_NUMERIC.includes(this.tagName)) {
+          const raw = parseInt(this.getAttribute(prop) ?? '', 10);
+          if (!isNaN(raw)) return raw;
+          return this.tagName === 'CANVAS' ? (prop === 'width' ? 300 : 150) : 0;
+        }
+        if (SIZED_STRING.includes(this.tagName)) return this.getAttribute(prop) ?? '';
+        return undefined;
+      },
+      set(v) { this.setAttribute(prop, String(v)); },
+    });
+  }
+  define(NodeProto, 'naturalWidth', { get() { return this.tagName === 'IMG' ? this.width : undefined; } });
+  define(NodeProto, 'naturalHeight', { get() { return this.tagName === 'IMG' ? this.height : undefined; } });
+  define(NodeProto, 'complete', { get() { return this.tagName === 'IMG' ? true : undefined; } });
+  define(NodeProto, 'currentSrc', {
+    get() { return ['IMG', 'VIDEO', 'AUDIO'].includes(this.tagName) ? this.src : undefined; },
+  });
+  method(NodeProto, 'decode', () => Promise.resolve());
+  // Media that never plays. The promise from `play()` resolves, because a
+  // rejection is what a page treats as "autoplay was blocked" and reacts to.
+  method(NodeProto, 'canPlayType', () => '');
+  method(NodeProto, 'play', () => Promise.resolve());
+  method(NodeProto, 'pause', noop);
+  method(NodeProto, 'load', noop);
+  method(NodeProto, 'requestPictureInPicture', () => Promise.reject(new globalThis.DOMException('no picture', 'NotSupportedError')));
+  method(NodeProto, 'requestFullscreen', () => Promise.reject(new globalThis.DOMException('no fullscreen', 'NotSupportedError')));
+  for (const [prop, value] of [
+    ['paused', true], ['ended', false], ['muted', false], ['volume', 1], ['currentTime', 0],
+    ['duration', NaN], ['playbackRate', 1], ['videoWidth', 0], ['videoHeight', 0],
+    ['networkState', 0], ['seeking', false], ['autoplay', false], ['loop', false],
+    ['controls', false], ['playsInline', false], ['defaultMuted', false],
+  ]) {
+    define(NodeProto, prop, {
+      get() { return ['VIDEO', 'AUDIO'].includes(this.tagName) ? value : undefined; },
+      set: noop,
+    });
+  }
+  define(NodeProto, 'buffered', { get: () => ({ length: 0, start: () => 0, end: () => 0 }) });
+  define(NodeProto, 'played', { get: () => ({ length: 0, start: () => 0, end: () => 0 }) });
+  define(NodeProto, 'seekable', { get: () => ({ length: 0, start: () => 0, end: () => 0 }) });
+  define(NodeProto, 'textTracks', { get: () => [] });
+
+  // A frame with a window in it. Akamai's mPulse snippet, tag managers and
+  // ad loaders all open one, write into its document and expect the script
+  // they wrote to load there; nothing loads, but the document they write
+  // into exists, so the writer does not throw.
+  const frameWindows = new Map();
+  const frameWindow = (iframe) => {
+    const key = keyOf(iframe);
+    if (frameWindows.has(key)) return frameWindows.get(key);
+    const doc = document.implementation.createHTMLDocument('');
+    define(doc, 'defaultView', { get: () => win, configurable: true });
+    const win = {
+      frameElement: iframe, parent: globalThis, top: globalThis, opener: null,
+      navigator: globalThis.navigator, screen: globalThis.screen, history: globalThis.history,
+      localStorage: globalThis.localStorage, sessionStorage: globalThis.sessionStorage,
+      performance: globalThis.performance, console: globalThis.console, name: '',
+      closed: false, length: 0, innerWidth: 0, innerHeight: 0, outerWidth: 0, outerHeight: 0,
+      devicePixelRatio: 1, scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
+      location: {
+        href: 'about:blank', protocol: 'about:', host: '', hostname: '', port: '',
+        pathname: 'blank', search: '', hash: '', origin: 'null',
+        assign: noop, replace: noop, reload: noop, toString: () => 'about:blank',
+      },
+      postMessage: noop, addEventListener: noop, removeEventListener: noop,
+      dispatchEvent: () => true, focus: noop, blur: noop, close: noop, open: () => null,
+      alert: noop, confirm: () => false, prompt: () => null, print: noop, stop: noop,
+      scrollTo: noop, scrollBy: noop, scroll: noop,
+      setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout,
+      setInterval: globalThis.setInterval, clearInterval: globalThis.clearInterval,
+      requestAnimationFrame: globalThis.requestAnimationFrame,
+      cancelAnimationFrame: globalThis.cancelAnimationFrame,
+      requestIdleCallback: globalThis.requestIdleCallback, queueMicrotask: globalThis.queueMicrotask,
+      getComputedStyle: globalThis.getComputedStyle, matchMedia: globalThis.matchMedia,
+      eval: (source) => globalThis.eval(String(source)),
+      fetch: globalThis.fetch, XMLHttpRequest: globalThis.XMLHttpRequest, URL: globalThis.URL,
+      Blob: globalThis.Blob, Image: globalThis.Image, Event: globalThis.Event,
+      CustomEvent: globalThis.CustomEvent, Node: globalThis.Node, Element: globalThis.Element,
+      HTMLElement: globalThis.HTMLElement, Promise, Object, Array, Function, String, Number,
+      Boolean, Date, RegExp, Error, TypeError, RangeError, JSON, Math, Symbol, Map, Set, WeakMap,
+      WeakSet, Proxy, Reflect, ArrayBuffer, DataView, Uint8Array, Int32Array, Float64Array,
+      parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent,
+      encodeURI, decodeURI, btoa: globalThis.btoa, atob: globalThis.atob,
+    };
+    win.self = win; win.window = win; win.globalThis = win; win.frames = win;
+    win.document = doc;
+    define(doc, 'domain', { get: () => location.hostname, set: noop });
+    define(doc, 'location', { get: () => win.location });
+    frameWindows.set(key, win);
+    return win;
+  };
+  define(NodeProto, 'contentWindow', {
+    get() { return this.tagName === 'IFRAME' ? frameWindow(this) : undefined; },
+  });
+  define(NodeProto, 'contentDocument', {
+    get() { return this.tagName === 'IFRAME' ? frameWindow(this).document : undefined; },
+  });
+  method(NodeProto, 'getSVGDocument', () => null);
+
+  // A stylesheet object per <style> and per stylesheet <link>: anchor-js and
+  // its relatives insert their rules through it rather than by writing text.
+  const sheets = new Map();
+  define(NodeProto, 'sheet', {
+    get() {
+      const isSheet = this.tagName === 'STYLE'
+        || (this.tagName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(this.getAttribute('rel') ?? ''));
+      if (!isSheet) return undefined;
+      const key = keyOf(this);
+      if (!sheets.has(key)) {
+        const sheet = new globalThis.CSSStyleSheet();
+        sheet.ownerNode = this;
+        sheet.href = this.tagName === 'LINK' ? this.href : null;
+        sheet.media = { mediaText: this.getAttribute('media') ?? '', length: 0, item: () => null, appendMedium: noop, deleteMedium: noop };
+        sheet.title = this.getAttribute('title');
+        sheet.type = 'text/css';
+        sheet.parentStyleSheet = null;
+        if (this.tagName === 'STYLE') sheet.replaceSync(this.textContent);
+        sheets.set(key, sheet);
+      }
+      return sheets.get(key);
+    },
+  });
+
+  // Forms and their controls.
+  define(NodeProto, 'elements', {
+    get() {
+      if (this.tagName !== 'FORM' && this.tagName !== 'FIELDSET') return undefined;
+      const list = this.querySelectorAll('input, select, textarea, button, fieldset, output, object');
+      list.namedItem = (n) => list.find((e) => e.getAttribute('name') === n || e.id === n) ?? null;
+      for (const el of list) {
+        const name = el.getAttribute('name');
+        if (name && !(name in list)) list[name] = el;
+      }
+      return list;
+    },
+  });
+  define(NodeProto, 'options', {
+    get() {
+      if (this.tagName !== 'SELECT' && this.tagName !== 'DATALIST') return undefined;
+      const list = this.querySelectorAll('option');
+      list.item = (i) => list[i] ?? null;
+      list.namedItem = (n) => list.find((o) => o.id === n || o.getAttribute('name') === n) ?? null;
+      list.selectedIndex = list.findIndex((o) => o.hasAttribute('selected'));
+      return list;
+    },
+  });
+  define(NodeProto, 'selectedOptions', {
+    get() { return this.tagName === 'SELECT' ? this.querySelectorAll('option[selected]') : undefined; },
+  });
+  define(NodeProto, 'selectedIndex', {
+    get() {
+      if (this.tagName !== 'SELECT') return undefined;
+      const options = this.querySelectorAll('option');
+      const chosen = options.findIndex((o) => o.hasAttribute('selected'));
+      return chosen >= 0 ? chosen : (options.length ? 0 : -1);
+    },
+    set(index) {
+      if (this.tagName !== 'SELECT') return;
+      this.querySelectorAll('option').forEach((o, i) => {
+        if (i === Number(index)) o.setAttribute('selected', ''); else o.removeAttribute('selected');
+      });
+    },
+  });
+  define(NodeProto, 'multiple', {
+    get() { return this.hasAttribute('multiple'); },
+    set(v) { if (v) this.setAttribute('multiple', ''); else this.removeAttribute('multiple'); },
+  });
+  define(NodeProto, 'form', {
+    get() { return this.nodeType === 1 ? (this.closest('form') ?? null) : null; },
+  });
+  define(NodeProto, 'labels', { get() { return this.id ? document.querySelectorAll(`label[for="${this.id}"]`) : []; } });
+  define(NodeProto, 'files', { get() { return this.tagName === 'INPUT' ? [] : undefined; } });
+  define(NodeProto, 'validity', {
+    get: () => ({ valid: true, valueMissing: false, typeMismatch: false, patternMismatch: false,
+      tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false,
+      stepMismatch: false, badInput: false, customError: false }),
+  });
+  define(NodeProto, 'validationMessage', { get: () => '' });
+  define(NodeProto, 'willValidate', { get() { return ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(this.tagName); } });
+  method(NodeProto, 'checkValidity', () => true);
+  method(NodeProto, 'reportValidity', () => true);
+  method(NodeProto, 'setCustomValidity', noop);
+  method(NodeProto, 'select', noop);
+  method(NodeProto, 'setSelectionRange', noop);
+  method(NodeProto, 'setRangeText', noop);
+  method(NodeProto, 'stepUp', noop);
+  method(NodeProto, 'stepDown', noop);
+  method(NodeProto, 'reset', function () {
+    dispatchEvent.call(this, new Event('reset', { bubbles: true, cancelable: true }));
+  });
+  define(NodeProto, 'valueAsNumber', {
+    get() { const n = parseFloat(this.value); return isNaN(n) ? NaN : n; },
+    set(v) { this.value = String(v); },
+  });
+  define(NodeProto, 'defaultValue', {
+    get() { return this.getAttribute('value') ?? ''; },
+    set(v) { this.setAttribute('value', String(v)); },
+  });
+  define(NodeProto, 'defaultChecked', {
+    get() { return this.hasAttribute('checked'); },
+    set(v) { if (v) this.setAttribute('checked', ''); else this.removeAttribute('checked'); },
+  });
+  define(NodeProto, 'indeterminate', { get: () => false, set: noop });
+  define(NodeProto, 'selectionStart', { get: () => 0, set: noop });
+  define(NodeProto, 'selectionEnd', { get: () => 0, set: noop });
+  define(NodeProto, 'selectionDirection', { get: () => 'none', set: noop });
+  define(NodeProto, 'maxLength', {
+    get() { const n = parseInt(this.getAttribute('maxlength') ?? '', 10); return isNaN(n) ? -1 : n; },
+    set(v) { this.setAttribute('maxlength', String(v | 0)); },
+  });
+  define(NodeProto, 'minLength', {
+    get() { const n = parseInt(this.getAttribute('minlength') ?? '', 10); return isNaN(n) ? -1 : n; },
+    set(v) { this.setAttribute('minlength', String(v | 0)); },
+  });
+  define(NodeProto, 'size', {
+    get() { const n = parseInt(this.getAttribute('size') ?? '', 10); return isNaN(n) ? 20 : n; },
+    set(v) { this.setAttribute('size', String(v | 0)); },
+  });
+  define(NodeProto, 'rows', {
+    get() { const n = parseInt(this.getAttribute('rows') ?? '', 10); return isNaN(n) ? 2 : n; },
+    set(v) { this.setAttribute('rows', String(v | 0)); },
+  });
+  define(NodeProto, 'cols', {
+    get() { const n = parseInt(this.getAttribute('cols') ?? '', 10); return isNaN(n) ? 20 : n; },
+    set(v) { this.setAttribute('cols', String(v | 0)); },
+  });
+  define(NodeProto, 'open', {
+    get() { return this.hasAttribute('open'); },
+    set(v) { if (v) this.setAttribute('open', ''); else this.removeAttribute('open'); },
+  });
+  method(NodeProto, 'showModal', function () { this.setAttribute('open', ''); });
+  method(NodeProto, 'show', function () { this.setAttribute('open', ''); });
+  method(NodeProto, 'close', function () { this.removeAttribute('open'); });
+  method(NodeProto, 'showPopover', noop);
+  method(NodeProto, 'hidePopover', noop);
+  method(NodeProto, 'togglePopover', () => false);
+
+  // Focus order, visibility and the properties around them.
+  const FOCUSABLE = /^(A|AREA|BUTTON|INPUT|SELECT|TEXTAREA|IFRAME|SUMMARY|DETAILS)$/;
+  define(NodeProto, 'tabIndex', {
+    get() {
+      const raw = parseInt(this.getAttribute('tabindex') ?? '', 10);
+      if (!isNaN(raw)) return raw;
+      return FOCUSABLE.test(this.tagName) ? 0 : -1;
+    },
+    set(v) { this.setAttribute('tabindex', String(v | 0)); },
+  });
+  method(NodeProto, 'checkVisibility', function () {
+    if (this.nodeType !== 1) return false;
+    const style = cascade.for(this);
+    return style.display !== 'none' && style.visibility !== 'hidden' && !this.hasAttribute('hidden');
+  });
+  define(NodeProto, 'inert', {
+    get() { return this.hasAttribute('inert'); },
+    set(v) { if (v) this.setAttribute('inert', ''); else this.removeAttribute('inert'); },
+  });
+  define(NodeProto, 'autofocus', {
+    get() { return this.hasAttribute('autofocus'); },
+    set(v) { if (v) this.setAttribute('autofocus', ''); else this.removeAttribute('autofocus'); },
+  });
+  define(NodeProto, 'draggable', {
+    get() { return this.getAttribute('draggable') === 'true' || this.tagName === 'A' || this.tagName === 'IMG'; },
+    set(v) { this.setAttribute('draggable', v ? 'true' : 'false'); },
+  });
+  define(NodeProto, 'spellcheck', {
+    get() { return this.getAttribute('spellcheck') !== 'false'; },
+    set(v) { this.setAttribute('spellcheck', v ? 'true' : 'false'); },
+  });
+  define(NodeProto, 'translate', {
+    get() { return this.getAttribute('translate') !== 'no'; },
+    set(v) { this.setAttribute('translate', v ? 'yes' : 'no'); },
+  });
+  define(NodeProto, 'contentEditable', {
+    get() { return this.getAttribute('contenteditable') ?? 'inherit'; },
+    set(v) { this.setAttribute('contenteditable', String(v)); },
+  });
+  define(NodeProto, 'isContentEditable', {
+    get() { return this.nodeType === 1 && !!this.closest('[contenteditable=""], [contenteditable="true"]'); },
+  });
+  // A shadow root is a fragment attached to a host. Its content is not the
+  // page's content — a screen reader announcer in a shadow root is exactly
+  // what a reader should not read — but Next.js attaches one to every page
+  // it routes, and without the method the router never finishes mounting.
+  const shadowRoots = new Map();
+  method(NodeProto, 'attachShadow', function (init = {}) {
+    if (this.nodeType !== 1) throw new globalThis.DOMException('not an element', 'NotSupportedError');
+    const key = keyOf(this);
+    if (shadowRoots.has(key)) throw new globalThis.DOMException('Shadow root cannot be created on a host which already hosts a shadow tree', 'NotSupportedError');
+    const root = native.create_fragment();
+    shadowRoots.set(key, root);
+    shadowHosts.set(keyOf(root), this);
+    define(root, 'mode', { value: init.mode === 'closed' ? 'closed' : 'open' });
+    define(root, 'delegatesFocus', { value: !!init.delegatesFocus });
+    define(root, 'slotAssignment', { value: init.slotAssignment ?? 'named' });
+    define(root, 'adoptedStyleSheets', { value: [], writable: true });
+    method(root, 'getElementById', (id) => root.querySelector(`[id="${String(id).replace(/"/g, '\\"')}"]`));
+    return root;
+  });
+  define(NodeProto, 'shadowRoot', {
+    get() { const root = shadowRoots.get(keyOf(this)); return root && root.mode === 'open' ? root : null; },
+  });
+  // `host` already means the URL's host on a link; a shadow root is the one
+  // node for which it means something else.
+  const urlHost = Object.getOwnPropertyDescriptor(NodeProto, 'host');
+  define(NodeProto, 'host', {
+    get() {
+      if (this.nodeType === 11) return shadowHosts.get(keyOf(this)) ?? null;
+      return urlHost.get.call(this);
+    },
+    set(v) { if (this.nodeType !== 11) urlHost.set.call(this, v); },
+  });
+  define(NodeProto, 'assignedSlot', { get: () => null });
+  define(NodeProto, 'part', { get() { return new DOMTokenList(this); } });
+  define(NodeProto, 'elementTiming', { get: () => '' });
+  method(NodeProto, 'getAnimations', () => []);
+  method(NodeProto, 'attributeStyleMap', () => ({}));
+
+  // Animations that are already over. A component that awaits `finished`
+  // before revealing its content gets to reveal it.
+  class Animation {
+    constructor(effect = null, timeline = null) {
+      this.effect = effect; this.timeline = timeline; this.id = '';
+      this.playState = 'finished'; this.playbackRate = 1; this.startTime = 0;
+      this.currentTime = 0; this.pending = false; this.replaceState = 'active';
+      this.onfinish = null; this.oncancel = null; this.onremove = null;
+      this.ready = Promise.resolve(this);
+      this.finished = Promise.resolve(this);
+      setTimeout(() => { if (typeof this.onfinish === 'function') this.onfinish(new Event('finish')); }, 0);
+    }
+    play() {} pause() {} cancel() {} finish() {} reverse() {} commitStyles() {} persist() {}
+    updatePlaybackRate() {} addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
+  }
+  globalThis.Animation = Animation;
+  globalThis.KeyframeEffect = class KeyframeEffect {
+    constructor(target, keyframes, options) { this.target = target; this._keyframes = keyframes; this._options = options; }
+    getKeyframes() { return Array.isArray(this._keyframes) ? this._keyframes : []; }
+    setKeyframes() {} getTiming() { return { duration: 0, delay: 0, iterations: 1 }; } getComputedTiming() { return this.getTiming(); }
+  };
+  globalThis.AnimationEffect = globalThis.KeyframeEffect;
+  globalThis.DocumentTimeline = class DocumentTimeline { get currentTime() { return native.now(); } };
+  method(NodeProto, 'animate', function (keyframes, options) {
+    return new Animation(new globalThis.KeyframeEffect(this, keyframes, options), null);
+  });
+
+  // A script the page inserts runs, the way it does in a browser. Webpack
+  // loads every lazy chunk this way, a tag manager loads everything this
+  // way, and a page whose inserted scripts never ran is a page whose
+  // application never started. Scripts the parser saw have already run;
+  // scripts that arrived through innerHTML never run, as the spec says.
+  const startedScripts = new Set();
+  const markStarted = (root) => {
+    if (!root || (root.nodeType !== 1 && root.nodeType !== 11)) return;
+    if (root.tagName === 'SCRIPT') startedScripts.add(keyOf(root));
+    for (const s of root.querySelectorAll('script')) startedScripts.add(keyOf(s));
+  };
+  markStarted(document.documentElement);
+  const JS_TYPES = /^(text|application)\/(x-)?(java|ecma)script$|^module$|^text\/jsx?$/i;
+  const fireScriptEvent = (el, type) => {
+    try { fireOn(el, Object.assign(new Event(type), { target: el })); }
+    catch (e) { native.record_error('script:' + type, describeError(e)); }
+  };
+  const runModuleSource = (source, origin) => {
+    let promise;
+    try { promise = native.run_module(String(source), String(origin)); }
+    catch (e) { native.record_error(origin, 'module compile failed: ' + describeError(e)); return; }
+    Promise.resolve(promise).catch((e) => native.record_error(origin, describeError(e)));
+  };
+  const startScript = (el) => {
+    startedScripts.add(keyOf(el));
+    const type = (el.getAttribute('type') || '').trim();
+    if (type && !JS_TYPES.test(type)) return;
+    if (el.hasAttribute('nomodule')) return;
+    const isModule = /^module$/i.test(type);
+    const src = el.getAttribute('src');
+    if (src != null && src.trim() !== '') {
+      let url;
+      try { url = new URL(src, location.href).href; } catch { fireScriptEvent(el, 'error'); return; }
+      requestAsync('GET', url, { Accept: '*/*' }, null).then((raw) => {
+        if (!raw || !raw.ok) { fireScriptEvent(el, 'error'); return; }
+        if (isModule) runModuleSource(raw.body, raw.url || url);
+        else native.run_script(String(raw.body ?? ''), raw.url || url, keyOf(el));
+        fireScriptEvent(el, 'load');
+      });
+      return;
+    }
+    const body = el.textContent;
+    if (!body.trim()) return;
+    if (isModule) runModuleSource(body, location.href);
+    else native.run_script(body, `inline script #${keyOf(el)}`, keyOf(el));
+  };
+  const scriptsWithin = (node) => {
+    if (!node || typeof node !== 'object' || (node.nodeType !== 1 && node.nodeType !== 11)) return [];
+    const found = node.nodeType === 1 && node.tagName === 'SCRIPT' ? [node] : [];
+    for (const s of node.querySelectorAll('script')) found.push(s);
+    return found;
+  };
+  const afterInsert = (candidates) => {
+    for (const s of candidates) {
+      if (!startedScripts.has(keyOf(s)) && s.isConnected) startScript(s);
+    }
+  };
+  const hookInsert = (name, pick) => {
+    const original = NodeProto[name];
+    method(NodeProto, name, function (...args) {
+      const candidates = pick(args).flatMap(scriptsWithin);
+      const result = original.apply(this, args);
+      if (candidates.length) afterInsert(candidates);
+      return result;
+    });
+  };
+  hookInsert('appendChild', (args) => [args[0]]);
+  hookInsert('insertBefore', (args) => [args[0]]);
+  hookInsert('replaceChild', (args) => [args[0]]);
+  hookInsert('append', (args) => args);
+  hookInsert('prepend', (args) => args);
+  // Markup that arrives as text brings scripts that must not run.
+  const markupSetter = (name) => {
+    const original = Object.getOwnPropertyDescriptor(NodeProto, name);
+    define(NodeProto, name, {
+      get: original.get,
+      set(v) { original.set.call(this, v); markStarted(name === 'outerHTML' ? this.parentNode : this); },
+    });
+  };
+  markupSetter('innerHTML');
+  markupSetter('outerHTML');
+  const nativeInsertAdjacentHTML = NodeProto.insertAdjacentHTML;
+  method(NodeProto, 'insertAdjacentHTML', function (position, html) {
+    const result = nativeInsertAdjacentHTML.call(this, position, html);
+    markStarted(this.parentNode || this);
+    return result;
+  });
+  // `s.src = url` on a script already in the tree starts it too.
+  const srcReflect = Object.getOwnPropertyDescriptor(NodeProto, 'src');
+  define(NodeProto, 'src', {
+    get: srcReflect.get,
+    set(v) {
+      srcReflect.set.call(this, v);
+      if (this.tagName === 'SCRIPT' && this.isConnected && !startedScripts.has(keyOf(this))) startScript(this);
+    },
+  });
+  globalThis.HTMLScriptElement.supports = (type) => type === 'classic' || type === 'module' || type === 'importmap';
+
+  // A submitted form navigates. `submit()` goes without an event, as the
+  // spec has it; `requestSubmit()` asks the page first.
+  const formData = (form, submitter) => {
+    const pairs = [];
+    for (const el of form.querySelectorAll('input, select, textarea, button')) {
+      const name = el.getAttribute('name');
+      if (!name || el.hasAttribute('disabled')) continue;
+      const tag = el.tagName;
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (tag === 'BUTTON' || (tag === 'INPUT' && (type === 'submit' || type === 'image' || type === 'button' || type === 'reset'))) {
+        if (submitter && keyOf(submitter) === keyOf(el)) pairs.push([name, el.value]);
+        continue;
+      }
+      if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio') && !el.checked) continue;
+      if (tag === 'INPUT' && type === 'file') continue;
+      if (tag === 'SELECT') {
+        for (const o of el.querySelectorAll('option[selected]')) pairs.push([name, o.value]);
+        if (!el.querySelector('option[selected]') && !el.hasAttribute('multiple')) {
+          const first = el.querySelector('option');
+          if (first) pairs.push([name, first.value]);
+        }
+        continue;
+      }
+      pairs.push([name, el.value]);
+    }
+    return pairs;
+  };
+  const submitForm = (form, submitter) => {
+    const method = String(submitter?.getAttribute('formmethod') || form.getAttribute('method') || 'get').toLowerCase();
+    const action = submitter?.getAttribute('formaction') || form.getAttribute('action') || location.href;
+    let url;
+    try { url = new URL(action, location.href); } catch { return; }
+    const body = new URLSearchParams(formData(form, submitter)).toString();
+    if (method === 'post') {
+      native.navigate(url.href, 'POST', body);
+    } else {
+      url.search = body ? '?' + body : '';
+      native.navigate(url.href);
+    }
+  };
+  method(NodeProto, 'submit', function () {
+    if (this.tagName === 'FORM') submitForm(this, null);
+  });
+  method(NodeProto, 'requestSubmit', function (submitter) {
+    if (this.tagName !== 'FORM') return;
+    const event = new Event('submit', { bubbles: true, cancelable: true });
+    event.submitter = submitter ?? null;
+    if (dispatchEvent.call(this, event)) submitForm(this, submitter ?? null);
+  });
+
+  // The document's remaining surface.
+  method(DocumentProto, 'createEvent', (kind) => {
+    const k = String(kind).toLowerCase();
+    const Ctor = k.startsWith('mouse') ? MouseEvent : k.startsWith('keyboard') ? KeyboardEvent
+      : k.startsWith('custom') ? CustomEvent : k.startsWith('ui') ? UIEvent : Event;
+    return new Ctor('');
+  });
+  method(DocumentProto, 'createAttribute', (name) => new Attr(null, String(name).toLowerCase(), ''));
+  method(DocumentProto, 'createAttributeNS', (_ns, name) => new Attr(null, String(name), ''));
+  method(DocumentProto, 'createCDATASection', (text) => native.create_text_node(String(text)));
+  method(DocumentProto, 'getElementsByName', (name) =>
+    document.querySelectorAll(`[name="${String(name).replace(/["\\]/g, '\\$&')}"]`));
+  method(DocumentProto, 'elementsFromPoint', () => []);
+  method(DocumentProto, 'caretRangeFromPoint', () => null);
+  method(DocumentProto, 'caretPositionFromPoint', () => null);
+  method(DocumentProto, 'hasStorageAccess', () => Promise.resolve(true));
+  method(DocumentProto, 'requestStorageAccess', () => Promise.resolve());
+  method(DocumentProto, 'exitFullscreen', () => Promise.resolve());
+  method(DocumentProto, 'exitPictureInPicture', () => Promise.resolve());
+  method(DocumentProto, 'exitPointerLock', noop);
+  method(DocumentProto, 'queryCommandSupported', () => false);
+  method(DocumentProto, 'queryCommandEnabled', () => false);
+  method(DocumentProto, 'queryCommandState', () => false);
+  method(DocumentProto, 'queryCommandValue', () => '');
+  method(DocumentProto, 'getAnimations', () => []);
+  method(DocumentProto, 'startViewTransition', (update) => {
+    const done = Promise.resolve().then(() => (typeof update === 'function' ? update() : undefined));
+    return { ready: done, updateCallbackDone: done, finished: done, skipTransition: noop };
+  });
+  define(document, 'visibilityState', { get: () => 'visible' });
+  define(document, 'prerendering', { get: () => false });
+  define(document, 'fullscreenElement', { get: () => null });
+  define(document, 'fullscreenEnabled', { get: () => false });
+  define(document, 'pointerLockElement', { get: () => null });
+  define(document, 'pictureInPictureElement', { get: () => null });
+  define(document, 'pictureInPictureEnabled', { get: () => false });
+  define(document, 'contentType', { get: () => 'text/html' });
+  define(document, 'inputEncoding', { get: () => 'UTF-8' });
+  define(document, 'designMode', { get: () => 'off', set: noop });
+  define(document, 'lastModified', { get: () => '01/01/1970 00:00:00' });
+  define(document, 'doctype', {
+    get() { for (const c of document.childNodes) if (c.nodeType === 10) return c; return null; },
+  });
+  define(document, 'embeds', { get: () => document.querySelectorAll('embed') });
+  define(document, 'plugins', { get: () => document.querySelectorAll('embed') });
+  define(document, 'anchors', { get: () => document.querySelectorAll('a[name]') });
+  define(document, 'applets', { get: () => [] });
+  define(document, 'styleSheets', {
+    get() {
+      const list = [...document.querySelectorAll('style, link[rel~="stylesheet"]')].map((el) => el.sheet);
+      list.item = (i) => list[i] ?? null;
+      return list;
+    },
+  });
+  let adoptedStyleSheets = [];
+  define(document, 'adoptedStyleSheets', {
+    get: () => adoptedStyleSheets,
+    set: (v) => { adoptedStyleSheets = Array.from(v); },
+  });
+  define(document, 'timeline', { get: () => new globalThis.DocumentTimeline() });
+  define(document, 'rootElement', { get: () => null });
+  define(document, 'featurePolicy', { get: () => ({ allowsFeature: () => false, features: () => [], allowedFeatures: () => [] }) });
+
+  // A detached <html> element dressed as a document: what `DOMParser` and
+  // `createHTMLDocument` hand back, and what a frame's window holds. One
+  // arena, so a "new" document is a subtree of the page's own.
+  const escapeAttr = (v) => String(v).replace(/["\\]/g, '\\$&');
+  globalThis.__mar_document_like = (holder) => {
+    if (holder.__mar_is_document) return holder;
+    define(holder, '__mar_is_document', { value: true });
+    define(holder, 'nodeType', { get: () => 9 });
+    define(holder, 'nodeName', { get: () => '#document' });
+    define(holder, 'documentElement', { get: () => holder });
+    define(holder, 'head', { get: () => holder.querySelector('head') });
+    define(holder, 'body', {
+      get: () => holder.querySelector('body'),
+      set(v) { const old = holder.querySelector('body'); if (old) old.replaceWith(v); else holder.appendChild(v); },
+    });
+    define(holder, 'title', {
+      get: () => holder.querySelector('title')?.textContent ?? '',
+      set(v) {
+        let t = holder.querySelector('title');
+        if (!t) { t = native.create_element('title'); (holder.querySelector('head') || holder).appendChild(t); }
+        t.textContent = String(v);
+      },
+    });
+    define(holder, 'defaultView', { get: () => null, configurable: true });
+    define(holder, 'readyState', { get: () => 'complete' });
+    define(holder, 'implementation', { get: () => document.implementation });
+    define(holder, 'doctype', { get: () => null });
+    define(holder, 'characterSet', { get: () => 'UTF-8' });
+    define(holder, 'contentType', { get: () => 'text/html' });
+    define(holder, 'compatMode', { get: () => 'CSS1Compat' });
+    define(holder, 'URL', { get: () => 'about:blank' });
+    define(holder, 'documentURI', { get: () => 'about:blank' });
+    define(holder, 'referrer', { get: () => '' });
+    define(holder, 'cookie', { get: () => '', set: noop });
+    define(holder, 'currentScript', { get: () => null });
+    define(holder, 'activeElement', { get: () => holder.querySelector('body') });
+    define(holder, 'hidden', { get: () => true });
+    define(holder, 'visibilityState', { get: () => 'hidden' });
+    define(holder, 'scripts', { get: () => holder.querySelectorAll('script') });
+    define(holder, 'forms', { get: () => holder.querySelectorAll('form') });
+    define(holder, 'images', { get: () => holder.querySelectorAll('img') });
+    define(holder, 'links', { get: () => holder.querySelectorAll('a[href], area[href]') });
+    define(holder, 'styleSheets', { get: () => [] });
+    define(holder, 'fonts', { get: () => document.fonts });
+    for (const name of ['createElement', 'createElementNS', 'createTextNode', 'createComment',
+      'createDocumentFragment', 'createRange', 'createTreeWalker', 'createNodeIterator',
+      'createEvent', 'createAttribute', 'createAttributeNS', 'importNode', 'adoptNode',
+      'createCDATASection', 'createExpression', 'evaluate']) {
+      if (typeof document[name] === 'function') method(holder, name, document[name]);
+    }
+    method(holder, 'getElementById', (id) => holder.querySelector(`[id="${escapeAttr(id)}"]`));
+    method(holder, 'getElementsByName', (n) => holder.querySelectorAll(`[name="${escapeAttr(n)}"]`));
+    method(holder, 'open', () => holder);
+    method(holder, 'close', noop);
+    method(holder, 'write', (...parts) => {
+      const body = holder.querySelector('body') || holder;
+      body.insertAdjacentHTML('beforeend', parts.join(''));
+    });
+    method(holder, 'writeln', (...parts) => holder.write(...parts, '\n'));
+    method(holder, 'hasFocus', () => false);
+    method(holder, 'elementFromPoint', () => null);
+    method(holder, 'elementsFromPoint', () => []);
+    method(holder, 'execCommand', () => false);
+    method(holder, 'getSelection', () => null);
+    Object.setPrototypeOf(holder, globalThis.HTMLDocument.prototype);
+    return holder;
+  };
+
+  // Fonts that are already loaded. Google's home page asks `document.fonts`
+  // to load a face before it does anything else, and Vue's transition group
+  // waits on `ready`.
+  globalThis.FontFace = class FontFace {
+    constructor(family, source, descriptors = {}) {
+      this.family = String(family); this.status = 'loaded';
+      Object.assign(this, { style: 'normal', weight: 'normal', stretch: 'normal', display: 'auto',
+        unicodeRange: 'U+0-10FFFF', variant: 'normal', featureSettings: 'normal' }, descriptors);
+      this.loaded = Promise.resolve(this);
+    }
+    load() { return Promise.resolve(this); }
+  };
+  const fontFaceSet = {
+    status: 'loaded', size: 0,
+    onloading: null, onloadingdone: null, onloadingerror: null,
+    check: () => true,
+    load: () => Promise.resolve([]),
+    add() { return this; }, delete: () => false, clear: noop, has: () => false,
+    forEach: noop, values: () => [][Symbol.iterator](), keys: () => [][Symbol.iterator](),
+    entries: () => [][Symbol.iterator](), [Symbol.iterator]: () => [][Symbol.iterator](),
+    addEventListener: noop, removeEventListener: noop, dispatchEvent: () => true,
+  };
+  fontFaceSet.ready = Promise.resolve(fontFaceSet);
+  globalThis.FontFaceSet = class FontFaceSet {};
+  Object.setPrototypeOf(fontFaceSet, globalThis.FontFaceSet.prototype);
+  define(document, 'fonts', { get: () => fontFaceSet });
+
+  // The window's own handler properties, so `window.onload = f` runs `f`
+  // when the load event fires and `'onhashchange' in window` says yes.
+  const windowHandlers = new Map();
+  for (const prop of [
+    'onload', 'onerror', 'onunhandledrejection', 'onrejectionhandled', 'onresize', 'onscroll',
+    'onscrollend', 'onhashchange', 'onpopstate', 'onmessage', 'onmessageerror', 'onbeforeunload',
+    'onunload', 'onpagehide', 'onpageshow', 'onfocus', 'onblur', 'ononline', 'onoffline',
+    'onstorage', 'onlanguagechange', 'onorientationchange', 'onbeforeprint', 'onafterprint',
+    'onsubmit', 'onchange', 'onclick', 'ondblclick', 'onauxclick', 'oninput', 'onkeydown',
+    'onkeyup', 'onkeypress', 'onmousedown', 'onmouseup', 'onmousemove', 'onmouseover',
+    'onmouseout', 'onmouseenter', 'onmouseleave', 'onwheel', 'oncontextmenu', 'ontouchstart',
+    'ontouchmove', 'ontouchend', 'ontouchcancel', 'onpointerdown', 'onpointerup',
+    'onpointermove', 'onpointerover', 'onpointerout', 'onpointerenter', 'onpointerleave',
+    'onpointercancel', 'onselect', 'onselectstart', 'onselectionchange', 'onreset',
+    'onabort', 'oncanplay', 'onplay', 'onpause', 'onended', 'ontimeupdate', 'onprogress',
+    'ondragstart', 'ondrag', 'ondragend', 'ondragenter', 'ondragover', 'ondragleave', 'ondrop',
+    'onanimationstart', 'onanimationend', 'onanimationiteration', 'ontransitionend',
+    'ontransitionstart', 'onbeforeinput', 'oncopy', 'oncut', 'onpaste', 'ontoggle',
+    'onsecuritypolicyviolation', 'ondevicemotion', 'ondeviceorientation', 'ongamepadconnected',
+    'ongamepaddisconnected', 'onappinstalled', 'onbeforeinstallprompt', 'onpagereveal',
+    'onpageswap', 'onbeforematch', 'oncontextlost', 'oncontextrestored', 'onformdata',
+    'onsearch', 'onwebkitanimationend', 'onwebkittransitionend',
+  ]) {
+    define(globalThis, prop, {
+      get: () => windowHandlers.get(prop) ?? null,
+      set: (v) => { windowHandlers.set(prop, typeof v === 'function' ? v : null); },
+      enumerable: true,
+    });
+  }
+  // And the window is an EventTarget, through `Window.prototype`, for the
+  // polyfill that reads `addEventListener` off the prototype chain.
+  // Named access: `window.sidebar` is the element with id "sidebar", and
+  // `window.frameName` is that frame's window. They sit on an object below
+  // `Window.prototype`, as the spec puts them, so a page's own `var sidebar`
+  // shadows the element rather than colliding with it.
+  const namedProperties = Object.create(globalThis.EventTarget.prototype);
+  const nameElement = (name, resolve) => {
+    if (!name || name in globalThis || Object.prototype.hasOwnProperty.call(namedProperties, name)) return;
+    define(namedProperties, name, {
+      get: resolve,
+      set(v) { define(this, name, { value: v, writable: true, enumerable: true }); },
+      enumerable: false,
+    });
+  };
+  const nameTheDocument = () => {
+    for (const el of document.querySelectorAll('[id]')) {
+      const id = el.id;
+      nameElement(id, () => document.getElementById(id) ?? undefined);
+    }
+    for (const el of document.querySelectorAll('iframe[name], form[name], img[name], embed[name], object[name]')) {
+      const name = el.getAttribute('name');
+      if (el.tagName === 'IFRAME') {
+        nameElement(name, () => {
+          const frame = document.querySelector(`iframe[name="${name.replace(/"/g, '\\"')}"]`);
+          return frame ? frame.contentWindow : undefined;
+        });
+      } else {
+        nameElement(name, () => document.querySelector(`[name="${name.replace(/"/g, '\\"')}"]`) ?? undefined);
+      }
+    }
+  };
+  globalThis.__mar_name_the_document = nameTheDocument;
+  const Window = function Window() { throw new TypeError('Illegal constructor: Window'); };
+  Window.prototype = Object.create(namedProperties, {
+    constructor: { value: Window, writable: true, configurable: true },
+  });
+  define(globalThis, 'Window', { value: Window, writable: true });
+  try { Object.setPrototypeOf(globalThis, Window.prototype); } catch (e) { /* keep Object.prototype */ }
+  nameTheDocument();
+
+  // Odds and ends a page reads off the platform.
+  Object.assign(navigator, {
+    connection: { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, type: 'wifi',
+      onchange: null, addEventListener: noop, removeEventListener: noop },
+    locks: {
+      request: (name, options, callback) => {
+        const run = typeof options === 'function' ? options : callback;
+        return Promise.resolve().then(() => (typeof run === 'function' ? run({ name: String(name), mode: 'exclusive' }) : undefined));
+      },
+      query: () => Promise.resolve({ held: [], pending: [] }),
+    },
+    mediaDevices: {
+      enumerateDevices: () => Promise.resolve([]),
+      getUserMedia: () => Promise.reject(new globalThis.DOMException('no devices', 'NotFoundError')),
+      getDisplayMedia: () => Promise.reject(new globalThis.DOMException('no devices', 'NotFoundError')),
+      getSupportedConstraints: () => ({}),
+      ondevicechange: null, addEventListener: noop, removeEventListener: noop,
+    },
+    geolocation: {
+      getCurrentPosition: (_ok, fail) => {
+        if (typeof fail === 'function') setTimeout(() => fail({ code: 1, message: 'User denied Geolocation', PERMISSION_DENIED: 1, POSITION_UNAVAILABLE: 2, TIMEOUT: 3 }), 0);
+      },
+      watchPosition: (_ok, fail) => {
+        if (typeof fail === 'function') setTimeout(() => fail({ code: 1, message: 'User denied Geolocation', PERMISSION_DENIED: 1, POSITION_UNAVAILABLE: 2, TIMEOUT: 3 }), 0);
+        return 1;
+      },
+      clearWatch: noop,
+    },
+    storage: {
+      estimate: () => Promise.resolve({ quota: 2 ** 33, usage: 0, usageDetails: {} }),
+      persist: () => Promise.resolve(false), persisted: () => Promise.resolve(false),
+      getDirectory: () => Promise.reject(new globalThis.DOMException('no origin private file system', 'NotSupportedError')),
+    },
+    credentials: {
+      get: () => Promise.resolve(null), store: () => Promise.resolve(), create: () => Promise.resolve(null),
+      preventSilentAccess: () => Promise.resolve(),
+    },
+    share: () => Promise.reject(new globalThis.DOMException('no share target', 'AbortError')),
+    canShare: () => false,
+    vibrate: () => false,
+    getBattery: () => Promise.resolve({ charging: true, level: 1, chargingTime: 0, dischargingTime: Infinity,
+      onchargingchange: null, onlevelchange: null, addEventListener: noop, removeEventListener: noop }),
+    getGamepads: () => [],
+    scheduling: { isInputPending: () => false },
+    mediaSession: { metadata: null, playbackState: 'none', setActionHandler: noop, setPositionState: noop },
+    wakeLock: { request: () => Promise.reject(new globalThis.DOMException('no wake lock', 'NotAllowedError')) },
+    mediaCapabilities: { decodingInfo: () => Promise.resolve({ supported: false, smooth: false, powerEfficient: false }),
+      encodingInfo: () => Promise.resolve({ supported: false, smooth: false, powerEfficient: false }) },
+    userActivation: { hasBeenActive: false, isActive: false },
+    appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko', productSub: '20030107', vendorSub: '',
+    pdfViewerEnabled: false, globalPrivacyControl: false,
+    requestMediaKeySystemAccess: () => Promise.reject(new globalThis.DOMException('no keys', 'NotSupportedError')),
+    registerProtocolHandler: noop, unregisterProtocolHandler: noop,
+    setAppBadge: () => Promise.resolve(), clearAppBadge: () => Promise.resolve(),
+  });
+  globalThis.visualViewport = {
+    width: innerWidth, height: innerHeight, offsetLeft: 0, offsetTop: 0, pageLeft: 0, pageTop: 0,
+    scale: 1, onresize: null, onscroll: null, onscrollend: null,
+    addEventListener: noop, removeEventListener: noop, dispatchEvent: () => true,
+  };
+  globalThis.scheduler = {
+    postTask: (callback, options = {}) => new Promise((resolve, reject) => {
+      setTimeout(() => { try { resolve(callback()); } catch (e) { reject(e); } }, options.delay ?? 0);
+    }),
+    yield: () => Promise.resolve(),
+  };
+  globalThis.PerformanceObserver.supportedEntryTypes = [
+    'element', 'event', 'first-input', 'largest-contentful-paint', 'layout-shift',
+    'long-animation-frame', 'longtask', 'mark', 'measure', 'navigation', 'paint',
+    'resource', 'visibility-state',
+  ];
+  const timeOrigin = Date.now();
+  performance.timeOrigin = timeOrigin;
+  performance.timing = {
+    navigationStart: timeOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0,
+    redirectEnd: 0, fetchStart: timeOrigin + 1, domainLookupStart: timeOrigin + 1,
+    domainLookupEnd: timeOrigin + 2, connectStart: timeOrigin + 2, secureConnectionStart: timeOrigin + 3,
+    connectEnd: timeOrigin + 5, requestStart: timeOrigin + 5, responseStart: timeOrigin + 20,
+    responseEnd: timeOrigin + 30, domLoading: timeOrigin + 31, domInteractive: timeOrigin + 50,
+    domContentLoadedEventStart: timeOrigin + 50, domContentLoadedEventEnd: timeOrigin + 51,
+    domComplete: timeOrigin + 60, loadEventStart: timeOrigin + 60, loadEventEnd: timeOrigin + 61,
+    toJSON() { return { ...this }; },
+  };
+  performance.navigation = { type: 0, redirectCount: 0, TYPE_NAVIGATE: 0, TYPE_RELOAD: 1, TYPE_BACK_FORWARD: 2, TYPE_RESERVED: 255, toJSON() { return { type: 0, redirectCount: 0 }; } };
+  performance.memory = { usedJSHeapSize: 10_000_000, totalJSHeapSize: 20_000_000, jsHeapSizeLimit: 2_000_000_000 };
+  performance.eventCounts = new Map();
+  performance.toJSON = () => ({ timeOrigin });
+  performance.setResourceTimingBufferSize = noop;
+  performance.clearResourceTimings = noop;
+  performance.addEventListener = noop;
+  performance.removeEventListener = noop;
+  const navigationEntry = {
+    name: location.href, entryType: 'navigation', startTime: 0, duration: 61, initiatorType: 'navigation',
+    nextHopProtocol: 'h2', workerStart: 0, redirectStart: 0, redirectEnd: 0, fetchStart: 1,
+    domainLookupStart: 1, domainLookupEnd: 2, connectStart: 2, secureConnectionStart: 3, connectEnd: 5,
+    requestStart: 5, responseStart: 20, responseEnd: 30, transferSize: 0, encodedBodySize: 0,
+    decodedBodySize: 0, unloadEventStart: 0, unloadEventEnd: 0, domInteractive: 50,
+    domContentLoadedEventStart: 50, domContentLoadedEventEnd: 51, domComplete: 60, loadEventStart: 60,
+    loadEventEnd: 61, type: 'navigate', redirectCount: 0, activationStart: 0, serverTiming: [],
+    toJSON() { return { ...this }; },
+  };
+  performance.getEntriesByType = (type) => (type === 'navigation' ? [navigationEntry] : []);
+  performance.getEntries = () => [navigationEntry];
+  performance.getEntriesByName = (name) => (name === location.href ? [navigationEntry] : []);
+  globalThis.PerformanceNavigationTiming = class PerformanceNavigationTiming {};
+  globalThis.PerformanceResourceTiming = class PerformanceResourceTiming {};
+  globalThis.PerformancePaintTiming = class PerformancePaintTiming {};
+  globalThis.Notification = class Notification {
+    constructor(title, options = {}) { this.title = String(title); Object.assign(this, options); }
+    static get permission() { return 'default'; }
+    static requestPermission(callback) {
+      if (typeof callback === 'function') setTimeout(() => callback('default'), 0);
+      return Promise.resolve('default');
+    }
+    static get maxActions() { return 0; }
+    close() {} addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
+  };
+  // An IndexedDB that declines. A bare `indexedDB` is a ReferenceError
+  // without this, and a request that never answers leaves a page waiting; a
+  // request that fails is the state a browser with storage disabled reports,
+  // and every library has a path for it.
+  const idbRequest = () => {
+    const request = {
+      readyState: 'pending', result: undefined, error: null, source: null, transaction: null,
+      onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null,
+      _listeners: [],
+      addEventListener(type, fn) { this._listeners.push([type, fn]); },
+      removeEventListener(type, fn) { this._listeners = this._listeners.filter(([t, f]) => t !== type || f !== fn); },
+      dispatchEvent() { return true; },
+    };
+    setTimeout(() => {
+      request.readyState = 'done';
+      request.error = new globalThis.DOMException('IndexedDB is not available here', 'UnknownError');
+      const event = new Event('error', { bubbles: true, cancelable: true });
+      event.target = request;
+      for (const [type, fn] of request._listeners) if (type === 'error') { try { (fn.handleEvent || fn).call(request, event); } catch (e) { native.record_error('indexedDB', describeError(e)); } }
+      if (typeof request.onerror === 'function') { try { request.onerror(event); } catch (e) { native.record_error('indexedDB', describeError(e)); } }
+    }, 0);
+    return request;
+  };
+  globalThis.indexedDB = {
+    open: idbRequest, deleteDatabase: idbRequest,
+    databases: () => Promise.resolve([]),
+    cmp: (a, b) => (a < b ? -1 : a > b ? 1 : 0),
+  };
+  globalThis.IDBFactory = class IDBFactory {};
+  globalThis.IDBRequest = class IDBRequest {};
+  globalThis.IDBOpenDBRequest = class IDBOpenDBRequest {};
+  globalThis.IDBDatabase = class IDBDatabase {};
+  globalThis.IDBTransaction = class IDBTransaction {};
+  globalThis.IDBObjectStore = class IDBObjectStore {};
+  globalThis.IDBIndex = class IDBIndex {};
+  globalThis.IDBCursor = class IDBCursor {};
+  globalThis.IDBKeyRange = class IDBKeyRange {
+    static only() { return new IDBKeyRange(); } static bound() { return new IDBKeyRange(); }
+    static lowerBound() { return new IDBKeyRange(); } static upperBound() { return new IDBKeyRange(); }
+  };
+
+  globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
+  globalThis.ResizeObserverEntry = class ResizeObserverEntry {};
+  globalThis.ResizeObserverSize = class ResizeObserverSize {};
+  globalThis.MediaQueryListEvent = class MediaQueryListEvent extends Event {};
+  globalThis.ScreenOrientation = class ScreenOrientation {};
+  Object.assign(screen.orientation, { lock: () => Promise.reject(new globalThis.DOMException('no lock', 'NotSupportedError')), unlock: noop, addEventListener: noop, removeEventListener: noop, onchange: null });
+  globalThis.matchMedia = ((real) => (query) => {
+    const list = real(query);
+    return Object.setPrototypeOf(list, globalThis.MediaQueryList.prototype);
+  })(globalThis.matchMedia);
+  globalThis.onorientationchange = null;
+  globalThis.orientation = 0;
+  globalThis.status = '';
+  globalThis.defaultStatus = '';
+  globalThis.toolbar = { visible: false };
+  globalThis.menubar = { visible: false };
+  globalThis.locationbar = { visible: false };
+  globalThis.personalbar = { visible: false };
+  globalThis.scrollbars = { visible: false };
+  globalThis.statusbar = { visible: false };
+  globalThis.screenX = 0; globalThis.screenY = 0; globalThis.screenLeft = 0; globalThis.screenTop = 0;
+  globalThis.getScreenDetails = () => Promise.reject(new globalThis.DOMException('no screens', 'NotAllowedError'));
+  globalThis.queryLocalFonts = () => Promise.resolve([]);
+  globalThis.showOpenFilePicker = () => Promise.reject(new globalThis.DOMException('no picker', 'AbortError'));
+  globalThis.showSaveFilePicker = globalThis.showOpenFilePicker;
+  globalThis.showDirectoryPicker = globalThis.showOpenFilePicker;
+  globalThis.createImageBitmap = () => Promise.resolve({ width: 0, height: 0, close: noop });
+  globalThis.ImageBitmap = class ImageBitmap {};
+  globalThis.captureEvents = noop;
+  globalThis.releaseEvents = noop;
+  globalThis.find = () => false;
+  globalThis.getDigitalGoodsService = undefined;
+
   // -- error reporting -----------------------------------------------------
 
   globalThis.onerror = null;
   globalThis.onunhandledrejection = null;
-  globalThis.reportError = (e) => native.record_error('reportError', String((e && e.stack) || e));
+  globalThis.reportError = (e) => native.record_error('reportError', describeError(e));
 
   // A module's body runs inside a promise, so throwing from it rejects that
   // promise rather than raising where the host called `eval`. Without this the
@@ -3422,20 +4923,23 @@
 
   // Signal that parsing is done, in the order a browser uses.
   globalThis.__mar_fire_ready = function () {
+    // Elements the scripts added while parsing get their names on the window
+    // before the listeners that might use them run.
+    try { globalThis.__mar_name_the_document(); } catch (e) { /* nothing to name */ }
     try {
       dispatchEvent.call(document, new Event('DOMContentLoaded', { bubbles: true }));
     } catch (e) {
-      native.record_error('DOMContentLoaded', String((e && e.stack) || e));
+      native.record_error('DOMContentLoaded', describeError(e));
     }
     try {
       dispatchEvent.call(globalThis, new Event('load'));
     } catch (e) {
-      native.record_error('load', String((e && e.stack) || e));
+      native.record_error('load', describeError(e));
     }
     try {
       dispatchEvent.call(document, new Event('readystatechange'));
     } catch (e) {
-      native.record_error('readystatechange', String((e && e.stack) || e));
+      native.record_error('readystatechange', describeError(e));
     }
   };
 

@@ -40,6 +40,26 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+  browser-tls:
+    name: browser-tls (BoringSSL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: browser-tls
+
+      # BoringSSL is built from source, which needs cmake and a C++ compiler;
+      # the runner has both.
+      - name: Clippy with the feature
+        run: cargo clippy --workspace --all-targets --features mar-cli/browser-tls -- -D warnings
+
+      - name: Test with the feature
+        run: cargo test --workspace --features mar-cli/browser-tls
+
   cdp:
     name: CDP against puppeteer-core
     runs-on: ubuntu-latest

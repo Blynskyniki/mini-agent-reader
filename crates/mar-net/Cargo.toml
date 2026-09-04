@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Chrome's TLS handshake and HTTP/2 through BoringSSL, so a site that decides
+# from the handshake alone sees a browser. Builds BoringSSL from source: needs
+# cmake and a C++ compiler (and NASM on Windows), and adds several minutes.
+browser-tls = ["dep:wreq", "dep:wreq-util", "dep:tokio", "dep:futures-util", "dep:webpki-root-certs"]
+
 [dependencies]
 mar-js.workspace = true
 ureq.workspace = true
@@ -12,3 +18,8 @@ webpki-roots.workspace = true
 url.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+wreq = { version = "6.0.0-rc.31", default-features = false, features = ["tokio-rt", "webpki-roots", "cookies", "gzip", "brotli", "zstd", "deflate", "stream", "socks"], optional = true }
+wreq-util = { version = "3.0.0-rc.14", default-features = false, features = ["emulation"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
+webpki-root-certs = { version = "1", optional = true }

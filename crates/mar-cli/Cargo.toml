@@ -8,6 +8,11 @@ license.workspace = true
 name = "mar"
 path = "src/main.rs"
 
+[features]
+default = []
+# See crates/mar-net/Cargo.toml.
+browser-tls = ["mar-net/browser-tls"]
+
 [dependencies]
 mar-dom.workspace = true
 mar-js.workspace = true

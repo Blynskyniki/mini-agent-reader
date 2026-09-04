@@ -25,17 +25,23 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            features: mar-cli/browser-tls
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             # Cross-compiling needs the matching linker and C toolchain, since
-            # QuickJS is C.
+            # QuickJS is C. BoringSSL is not cross-compiled here, so this
+            # artifact speaks rustls' handshake.
             cross: true
+            features: ""
           - target: x86_64-apple-darwin
             os: macos-latest
+            features: mar-cli/browser-tls
           - target: aarch64-apple-darwin
             os: macos-latest
+            features: mar-cli/browser-tls
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            features: mar-cli/browser-tls
 
     steps:
       - uses: actions/checkout@v4
@@ -56,8 +62,15 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
+      # BoringSSL's assembly is assembled by NASM on Windows; the other
+      # runners have cmake and a C++ compiler already.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        run: choco install nasm -y --no-progress
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin mar
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} --bin mar ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
