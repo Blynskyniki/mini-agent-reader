@@ -127,8 +127,8 @@ A page "reads" at 60% of Chrome's text or more.
 | | reads | of what Chrome read |
 |---|---|---|
 | Chrome | 342 / 453 | — |
-| mar, rustls handshake | 267 | 78% |
-| mar, `browser-tls` | 276 | 81% |
+| mar, rustls handshake | 274 | 80% |
+| mar, `browser-tls` | 282 | 82% |
 
 Most of the rest is a bot check that decides on the browser itself rather than
 on the handshake. Runs differ by a few pages either way: one proxy, six pages
