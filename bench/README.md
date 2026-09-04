@@ -44,9 +44,12 @@ kept on purpose; hosts that resolve to nothing were dropped, because they
 measure the network and not the engine.
 
 Every page is reduced the same way in both engines — the settled document
-with script, style, template and noscript subtrees removed, whitespace
-collapsed — and mar's text is compared with Chrome's on the same URL in the
-same session. A page "reads" at 60% of Chrome's text or more.
+with script, style, template and noscript subtrees removed, consent dialogs
+removed by the ids and classes their vendors use, whitespace collapsed — and
+mar's text is compared with Chrome's on the same URL in the same session. A
+page "reads" at 60% of Chrome's text or more. Chrome is driven two at a time:
+the headless shell hangs on a few sites in every batch, more of them the more
+of it runs at once, and a hung run is retried alone before it counts as empty.
 
 ```bash
 python3 bench/corpus.py --chrome                          # Chrome too, ~7 min

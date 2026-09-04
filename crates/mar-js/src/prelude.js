@@ -54,11 +54,20 @@
     return value;
   }
 
+  // What a page writes to console.error is the nearest thing to a reason it
+  // has for rendering nothing, so the first few lines go into the report
+  // alongside the exceptions. The rest stay in the log.
+  let consoleReported = 0;
+  const reportConsole = (text) => {
+    if (consoleReported >= 20) return;
+    consoleReported += 1;
+    native.record_error('console.error', text.length > 600 ? text.slice(0, 600) + '…' : text);
+  };
   const console = {
     log: (...a) => native.log_log(format(a)),
     info: (...a) => native.log_info(format(a)),
     warn: (...a) => native.log_warn(format(a)),
-    error: (...a) => native.log_error(format(a)),
+    error: (...a) => { const text = format(a); native.log_error(text); reportConsole(text); },
     debug: (...a) => native.log_debug(format(a)),
     trace: (...a) => native.log_debug(format(a)),
     dir: (...a) => native.log_log(format(a)),
@@ -67,7 +76,7 @@
     groupCollapsed: (...a) => native.log_log(format(a)),
     groupEnd: () => {},
     assert: (cond, ...a) => {
-      if (!cond) native.log_error('Assertion failed: ' + format(a));
+      if (!cond) { const text = 'Assertion failed: ' + format(a); native.log_error(text); reportConsole(text); }
     },
     count: () => {},
     time: () => {},
@@ -511,6 +520,13 @@
         if (prop in target) return target[prop];
         if (typeof prop !== 'string') return undefined;
         return read().get(dashed(prop).toLowerCase()) || '';
+      },
+      // Every CSS property is a property of the declaration whether or not
+      // it is set, so `'transform' in el.style` is how gsap and its like
+      // find the name to animate — and what to call it when prefixed.
+      has(target, prop) {
+        if (prop in target) return true;
+        return typeof prop === 'string' && /^(-?[a-z][a-z0-9]*(-[a-z0-9]+)*|[A-Za-z][A-Za-z0-9]*)$/.test(prop);
       },
       set(target, prop, value) {
         if (prop === 'cssText') {
@@ -1108,7 +1124,11 @@
   define(NodeProto, 'offsetParent', {
     get() { return this.nodeType === 1 ? (this.parentElement ?? null) : null; },
   });
-  for (const p of ['scrollTop', 'scrollLeft', 'offsetLeft']) {
+  define(NodeProto, 'scrollTop', {
+    get() { return this.tagName === 'HTML' || this.tagName === 'BODY' ? globalThis.scrollY : 0; },
+    set: () => {},
+  });
+  for (const p of ['scrollLeft', 'offsetLeft']) {
     define(NodeProto, p, { get: () => 0, set: () => {} });
   }
   define(NodeProto, 'offsetParent', { get: () => null });
@@ -1934,34 +1954,68 @@
   // viewport before it clicks. One record is delivered per observed target,
   // reporting what this engine does know — an element is visible exactly when
   // the spatial index has given it a box.
+  // Everything a page observes comes into view. A browser reports an
+  // element when it scrolls in; here nothing scrolls, and a reader wants
+  // what the page would show a person who scrolled — lazy sections, images
+  // behind a placeholder, the next page of a feed. Each observed target is
+  // reported once, and an observer that keeps re-observing a sentinel to
+  // load forever is cut off after a fixed number of sightings, so a page
+  // cannot spend its budget on page fifty of its feed.
+  const IO_SIGHTINGS = 48;
+  const viewportRect = () => ({
+    x: 0, y: 0, left: 0, top: 0, right: innerWidth, bottom: innerHeight,
+    width: innerWidth, height: innerHeight, toJSON() { return { ...this }; },
+  });
   globalThis.IntersectionObserver = class IntersectionObserver {
-    constructor(cb) {
+    constructor(cb, options = {}) {
+      if (typeof cb !== 'function') throw new TypeError("Failed to construct 'IntersectionObserver': parameter 1 is not of type 'Function'.");
       this._cb = cb;
-      this.root = null;
-      this.rootMargin = '0px';
-      this.thresholds = [0];
+      this._seen = new Set();
+      this._sightings = 0;
+      this._pending = [];
+      this.root = options.root ?? null;
+      this.rootMargin = options.rootMargin ?? '0px';
+      const t = options.threshold ?? 0;
+      this.thresholds = (Array.isArray(t) ? t : [t]).map(Number);
     }
     observe(target) {
+      if (!target || target.nodeType !== 1) throw new TypeError("Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.");
+      const key = keyOf(target);
+      if (this._seen.has(key)) return;
+      this._seen.add(key);
+      this._pending.push(target);
+      if (this._pending.length > 1) return;
       setTimeout(() => {
-        const seen = spatial.enabled;
-        const rect = seen ? spatial.rect(target) : zeroRect();
-        try {
-          this._cb([{
-            target,
+        const targets = this._pending.splice(0);
+        const entries = [];
+        for (const el of targets) {
+          if (!this._seen.has(keyOf(el))) continue;
+          // Past the cap nothing is reported at all: a sentinel that is
+          // re-observed after every sighting would otherwise spin forever.
+          if (this._sightings >= IO_SIGHTINGS) continue;
+          this._sightings += 1;
+          const seen = true;
+          spatial.open();
+          let rect;
+          try { rect = spatial.rect(el); } finally { spatial.close(); }
+          entries.push({
+            target: el,
             time: native.now(),
             isIntersecting: seen,
+            isVisible: seen,
             intersectionRatio: seen ? 1 : 0,
             boundingClientRect: rect,
             intersectionRect: seen ? rect : zeroRect(),
-            rootBounds: null,
-          }], this);
-        } catch (e) {
-          native.record_error('IntersectionObserver', describeError(e));
+            rootBounds: viewportRect(),
+          });
         }
+        if (!entries.length) return;
+        try { this._cb(entries, this); }
+        catch (e) { native.record_error('IntersectionObserver', describeError(e)); }
       }, 0);
     }
-    unobserve() {}
-    disconnect() {}
+    unobserve(target) { if (target) this._seen.delete(keyOf(target)); }
+    disconnect() { this._seen.clear(); this._pending.length = 0; }
     takeRecords() { return []; }
   };
   globalThis.ResizeObserver = inertObserver();
@@ -5394,6 +5448,38 @@
       native.record_error('readystatechange', describeError(e));
     }
   };
+
+  // A person reading the page scrolls to the end of it. The host calls this
+  // once the page has settled: the window's scroll position moves down the
+  // estimated height of the document in a few steps, each announced with a
+  // `scroll` event, so a feed that loads its next page on scroll and a
+  // section that renders when it comes near get to do so before the page
+  // is read. Returns whether anything was listening, so the host knows
+  // whether another settle is worth its while.
+  globalThis.__mar_scroll_through = function () {
+    const listening = ['scroll', 'scrollend', 'wheel', 'touchmove'].some((type) =>
+      (listenerList(globalThis, type, false)?.length || 0) > 0 ||
+      (listenerList(document, type, false)?.length || 0) > 0 ||
+      typeof globalThis['on' + type] === 'function' || typeof document['on' + type] === 'function');
+    if (!listening) return false;
+    const height = Math.max(
+      document.documentElement ? document.documentElement.scrollHeight : 0,
+      document.body ? document.body.scrollHeight : 0,
+      innerHeight * 3,
+    );
+    const stops = [];
+    for (let y = innerHeight; y < height; y += innerHeight) stops.push(Math.round(y));
+    stops.push(Math.max(0, Math.round(height - innerHeight)));
+    for (const y of [...new Set(stops)].sort((a, b) => a - b)) {
+      globalThis.scrollY = globalThis.pageYOffset = y;
+      for (const type of ['scroll', 'scrollend']) {
+        try { dispatchEvent.call(document, new Event(type, { bubbles: true })); }
+        catch (e) { native.record_error('scroll', describeError(e)); }
+      }
+    }
+    return true;
+  };
+  globalThis.__mar_describe_error = describeError;
 
   // -- looking built in ----------------------------------------------------
 

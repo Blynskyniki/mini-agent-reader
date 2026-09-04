@@ -121,14 +121,16 @@ Speed is worth nothing on a page that comes out blank, so there is a second
 harness: `bench/corpus.json`, 453 live sites — the top of the Tranco list with
 infrastructure, parked and duplicate hosts removed, plus the Russian web and a
 set of client-rendered applications — read by `chrome-headless-shell` and by
-`mar` in the same session, reduced to visible text the same way, and compared.
-A page "reads" at 60% of Chrome's text or more.
+`mar` in the same session, reduced to visible text the same way — script, style
+and consent dialogs removed, since a cookie banner is text a browser shows and a
+reader never wants — and compared. A page "reads" at 60% of Chrome's text or
+more.
 
 | | reads | of what Chrome read |
 |---|---|---|
-| Chrome | 342 / 453 | — |
-| mar, rustls handshake | 274 | 80% |
-| mar, `browser-tls` | 282 | 82% |
+| Chrome | 336 / 453 | — |
+| mar, rustls handshake | 278 | 83% |
+| mar, `browser-tls` | 285 | 85% |
 
 Most of the rest is a bot check that decides on the browser itself rather than
 on the handshake. Runs differ by a few pages either way: one proxy, six pages
@@ -217,9 +219,14 @@ the DOM uses — which is more than the inline-attribute shortcut this class of
 engine usually takes. The numbers are plausible, not true: nothing here knows
 where anything sits.
 
-`IntersectionObserver` delivers one record per observed target rather than never
-firing, for the same reason: a script that waits for the callback before
-rendering cannot survive silence. A CDP client that clicks is a separate matter
+`IntersectionObserver` brings every observed target into view, once, rather
+than never firing, for the same reason: a script that waits for the callback
+before rendering cannot survive silence, and a reader wants what a person who
+scrolled would see — the lazy section, the image behind its placeholder. An
+observer that re-observes a sentinel to load the next page forever is cut off
+after a fixed number of sightings. Once the page has settled it is also
+scrolled to its end, step by step, with `scroll` events, and settled again, so
+a feed that loads on scroll gets its say. A CDP client that clicks is a separate matter
 again — it needs boxes that differ per element so a coordinate maps back to what
 it hit, so while a client is measuring it gets tiles from an imaginary grid
 instead of the page's own numbers. Two rulers, for two different questions.

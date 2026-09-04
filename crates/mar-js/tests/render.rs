@@ -1164,3 +1164,121 @@ fn a_template_parsed_from_markup_owns_its_content() {
         out.html
     );
 }
+
+#[test]
+fn a_page_that_dies_in_a_promise_says_so() {
+    // The nearest thing a silent page has to a reason: an unhandled rejection
+    // and what it wrote to console.error both reach the report; a rejection
+    // the page does catch does not.
+    let out = render(
+        r#"<!doctype html><html><body><div id="root"></div>
+        <script>
+          const caught = Promise.reject(new Error('handled later'));
+          setTimeout(() => caught.catch(() => {}), 0);
+          Promise.reject(new TypeError('boot failed: no config'));
+          (async () => { throw new Error('async boot failed'); })();
+          console.error('hydration mismatch', { at: 'root' });
+          console.log('not an error');
+        </script></body></html>"#,
+    );
+    let sources: Vec<&str> = out.errors.iter().map(|e| e.source.as_str()).collect();
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|s| **s == "unhandledrejection")
+            .count(),
+        2,
+        "two unhandled rejections, the caught one excluded: {:?}",
+        out.errors
+    );
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.source == "unhandledrejection"
+                && e.message.contains("boot failed: no config")),
+        "{:?}",
+        out.errors
+    );
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.source == "unhandledrejection" && e.message.contains("async boot failed")),
+        "{:?}",
+        out.errors
+    );
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.source == "console.error" && e.message.contains("hydration mismatch")),
+        "{:?}",
+        out.errors
+    );
+    assert!(
+        !out.errors
+            .iter()
+            .any(|e| e.message.contains("handled later")),
+        "{:?}",
+        out.errors
+    );
+    assert!(
+        !out.errors
+            .iter()
+            .any(|e| e.message.contains("not an error")),
+        "{:?}",
+        out.errors
+    );
+}
+
+#[test]
+fn lazy_content_comes_into_view_and_a_feed_loads_on_scroll() {
+    // What a person would see after scrolling: a section that renders when
+    // observed, and a feed that appends a page per scroll — but not forever.
+    let out = render(
+        r#"<!doctype html><html><body>
+        <section id="lazy">placeholder</section>
+        <ul id="feed"><li>item 1</li></ul>
+        <script>
+          const io = new IntersectionObserver((entries) => {
+            for (const e of entries) if (e.isIntersecting) e.target.textContent = 'rendered when seen ' + e.intersectionRatio;
+          }, { threshold: [0, 0.5] });
+          io.observe(document.getElementById('lazy'));
+          let pages = 1;
+          window.addEventListener('scroll', () => {
+            if (window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 200 && pages < 3) {
+              pages += 1;
+              const li = document.createElement('li');
+              li.textContent = 'item ' + pages + ' at ' + document.documentElement.scrollTop;
+              document.getElementById('feed').appendChild(li);
+            }
+          });
+          // A sentinel re-observed after every sighting must not load forever.
+          let sightings = 0;
+          const sentinel = document.createElement('div');
+          document.body.appendChild(sentinel);
+          const forever = new IntersectionObserver((entries, observer) => {
+            sightings += 1;
+            observer.unobserve(sentinel);
+            observer.observe(sentinel);
+          });
+          forever.observe(sentinel);
+          document.addEventListener('scrollend', () => { document.body.dataset.sightings = String(sightings); });
+        </script></body></html>"#,
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert!(out.html.contains("rendered when seen 1"), "{}", out.html);
+    assert!(out.html.contains("item 2 at"), "{}", out.html);
+    assert!(out.html.contains("item 3 at"), "{}", out.html);
+    assert!(!out.html.contains("item 4"), "{}", out.html);
+    let sightings: usize = out
+        .html
+        .split("data-sightings=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        sightings > 0 && sightings <= 48,
+        "sightings capped: {sightings} in {}",
+        out.html
+    );
+}

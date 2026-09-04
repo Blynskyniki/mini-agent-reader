@@ -29,22 +29,60 @@ CHROME_CANDIDATES = sorted(
 
 SKIP = {"script", "style", "noscript", "template", "svg", "head"}
 
+# A consent dialog is text a browser shows and a reader never wants: several
+# kilobytes of legalese, on top of the page, from a dozen vendors. Chrome
+# renders them all; the engine renders some. Counting them would reward
+# rendering junk, so both engines lose them before the count.
+CONSENT = re.compile(
+    r"onetrust|optanon|ot-sdk|cookielaw|CybotCookiebot|qc-cmp2|didomi|sp_message|sp_veil"
+    r"|usercentrics|osano|truste|trustarc|fc-consent|fc-dialog|cmpbox|cmp-container|cmp-wrapper"
+    r"|iubenda|cookie-?(banner|consent|notice|bar|law|policy|modal|popup|dialog|wall)"
+    r"|consent-?(banner|modal|manager|dialog|wall|popup|overlay)|gdpr|privacy-?(banner|modal|wall)",
+    re.I,
+)
+
+NOT_A_DIALOG = {"html", "body", "head", "link", "meta", "script", "style", "img", "input", "br", "hr",
+                "source", "base", "area", "col", "embed", "param", "track", "wbr", "iframe", "svg", "path"}
+
 class Text(HTMLParser):
     """Visible text with script and style subtrees actually removed. A regex
     cuts at the first `</script>` inside a JS string, and mar inlines bundles
-    into the document, so the error would land on one engine only."""
+    into the document, so the error would land on one engine only. Consent
+    dialogs, found by the ids and classes their vendors use, go the same way."""
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.depth = 0
         self.parts = []
+        # The consent element being skipped, and how deep in same-named
+        # descendants we are; end tags of void elements never come, which
+        # is why this is not a stack of everything.
+        self.consent_tag = None
+        self.consent_level = 0
     def handle_starttag(self, tag, attrs):
         if tag in SKIP:
             self.depth += 1
+        if self.consent_tag:
+            if tag == self.consent_tag:
+                self.consent_level += 1
+            return
+        # Only an element that can hold the dialog counts: a stylesheet link
+        # or a script tagged with the vendor's name has no end tag to wait
+        # for, and the document's own root is never the dialog.
+        if tag in NOT_A_DIALOG:
+            return
+        for name, value in attrs:
+            if name in ("id", "class") and value and CONSENT.search(value):
+                self.consent_tag, self.consent_level = tag, 1
+                return
     def handle_endtag(self, tag):
         if tag in SKIP and self.depth:
             self.depth -= 1
+        if self.consent_tag and tag == self.consent_tag:
+            self.consent_level -= 1
+            if self.consent_level <= 0:
+                self.consent_tag = None
     def handle_data(self, data):
-        if not self.depth:
+        if not self.depth and not self.consent_tag:
             self.parts.append(data)
 
 def visible_text(markup):
@@ -133,7 +171,7 @@ def main():
     ap.add_argument("--chrome", action="store_true", help="measure Chrome on every URL first")
     ap.add_argument("--chrome-from", default=None, help="reuse the Chrome column of an earlier results file")
     ap.add_argument("--chrome-binary", default=str(CHROME_CANDIDATES[-1]) if CHROME_CANDIDATES else None)
-    ap.add_argument("--chrome-workers", type=int, default=6)
+    ap.add_argument("--chrome-workers", type=int, default=2)
     ap.add_argument("--chrome-budget", type=int, default=8000)
     ap.add_argument("--timeout-ms", type=int, default=15000)
     ap.add_argument("--concurrency", type=int, default=6)
@@ -157,8 +195,16 @@ def main():
         with ThreadPoolExecutor(max_workers=args.chrome_workers) as ex:
             for url, res in zip(urls, ex.map(lambda u: chrome_one(args.chrome_binary, u, args.chrome_budget), urls)):
                 chrome[url] = res
+        # The headless shell hangs on a few sites in every batch, more of them
+        # the more of it run at once, and a hung Chrome is not a measurement
+        # of the site. Those get a second, unhurried try one at a time.
+        hung = [u for u in urls if not chrome[u]["ok"]]
+        for url in hung:
+            again = chrome_one(args.chrome_binary, url, args.chrome_budget)
+            if again["text"] > chrome[url]["text"]:
+                chrome[url] = again
         print(f"  [chrome] read {sum(1 for r in chrome.values() if r['text'] >= 400)}/{len(urls)} "
-              f"in {time.perf_counter()-started:.0f}s", flush=True)
+              f"in {time.perf_counter()-started:.0f}s; {len(hung)} retried alone", flush=True)
     else:
         print("  no Chrome column: pass --chrome or --chrome-from; classes will be relative to nothing", flush=True)
 

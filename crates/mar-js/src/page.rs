@@ -6,7 +6,8 @@ use crate::natives;
 use crate::net::NetworkProvider;
 use crate::state::{ConsoleMessage, Limits, Navigation, PageState, ScriptError, Shared, shared};
 use mar_dom::{Document, LocalName, NodeId};
-use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Persistent, Runtime};
+use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Persistent, Runtime, Value};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -138,6 +139,11 @@ pub struct Page<N: NetworkProvider + 'static> {
     started: Instant,
     scripts_run: usize,
     scripts_skipped: usize,
+    /// Promise rejections nobody has handled yet, by promise identity. A
+    /// rejection is reported when it happens and withdrawn if a handler
+    /// turns up later; what is still here when the page is read was never
+    /// handled, which is the nearest thing a silent page has to a reason.
+    rejections: Rc<RefCell<Vec<(usize, String)>>>,
 }
 
 impl<N: NetworkProvider + 'static> Page<N> {
@@ -169,6 +175,33 @@ impl<N: NetworkProvider + 'static> Page<N> {
         let deadline = Instant::now() + Duration::from_millis(limits.wall_ms);
         runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
         let context = Context::full(&runtime).map_err(|e| PageError::Engine(e.to_string()))?;
+
+        let rejections: Rc<RefCell<Vec<(usize, String)>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let pending = rejections.clone();
+            runtime.set_host_promise_rejection_tracker(Some(Box::new(
+                move |ctx: Ctx<'_>, promise: Value<'_>, reason: Value<'_>, handled: bool| {
+                    // SAFETY: reading a field of the raw value; the pointer is
+                    // only used as an identity, never dereferenced.
+                    let key = unsafe { promise.as_raw().u.ptr } as usize;
+                    let mut pending = pending.borrow_mut();
+                    if handled {
+                        pending.retain(|(k, _)| *k != key);
+                        return;
+                    }
+                    let text = ctx
+                        .globals()
+                        .get::<_, Function>("__mar_describe_error")
+                        .ok()
+                        .and_then(|f| f.call::<_, String>((reason.clone(),)).ok())
+                        .or_else(|| reason.get::<rquickjs::Coerced<String>>().ok().map(|c| c.0))
+                        .unwrap_or_else(|| "promise rejected".to_owned());
+                    if pending.len() < 100 {
+                        pending.push((key, text));
+                    }
+                },
+            )));
+        }
 
         let doc = SharedDoc::new(document);
         let state = shared(PageState::new(url.clone(), limits));
@@ -209,6 +242,7 @@ impl<N: NetworkProvider + 'static> Page<N> {
             started: Instant::now(),
             scripts_run: 0,
             scripts_skipped: 0,
+            rejections,
         })
     }
 
@@ -239,8 +273,14 @@ impl<N: NetworkProvider + 'static> Page<N> {
         self.fire_ready();
         tracing::debug!(us = phase.elapsed().as_micros(), "phase: ready events");
         self.state.borrow_mut().ready_state = "complete";
-        let truncated = self.settle();
+        let mut truncated = self.settle();
         tracing::debug!(us = phase.elapsed().as_micros(), "phase: settled");
+        // A person reading the page scrolls to the end of it. If anything was
+        // listening for that, let it react and settle once more.
+        if !truncated && self.scroll_through() {
+            truncated = self.settle();
+            tracing::debug!(us = phase.elapsed().as_micros(), "phase: scrolled");
+        }
         let outcome = self.finish(truncated);
         tracing::debug!(us = phase.elapsed().as_micros(), "phase: finished");
         outcome
@@ -749,7 +789,33 @@ impl<N: NetworkProvider + 'static> Page<N> {
         });
     }
 
+    /// Move the window's scroll position down the page, announcing each
+    /// step; true when the page had a listener that might have done
+    /// something with it.
+    fn scroll_through(&mut self) -> bool {
+        let state = self.state.clone();
+        self.context.with(|ctx| {
+            let Ok(scroll) = ctx.globals().get::<_, Function>("__mar_scroll_through") else {
+                return false;
+            };
+            match scroll.call::<_, bool>(()).catch(&ctx) {
+                Ok(listening) => listening,
+                Err(e) => {
+                    state.borrow_mut().record_error("scroll", format!("{e}"));
+                    false
+                }
+            }
+        })
+    }
+
     fn finish(&mut self, truncated: bool) -> PageOutcome {
+        let unhandled: Vec<(usize, String)> = self.rejections.borrow_mut().drain(..).collect();
+        {
+            let mut state = self.state.borrow_mut();
+            for (_, text) in unhandled {
+                state.record_error("unhandledrejection", text);
+            }
+        }
         self.state.borrow_mut().timers.clear();
         // Give QuickJS a chance to release the DOM handles before we read the
         // document, so the outcome reflects a settled heap.
