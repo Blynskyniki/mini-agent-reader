@@ -47,10 +47,10 @@ thing: run the scripts and print the resulting DOM.
 
 | Page | mar | Chromium | ratio |
 |---|---|---|---|
-| Article, 15 KB | **8 ms / 6 MB** | 121 ms / 66 MB | 15× time, 11× memory |
-| Client-rendered with `fetch` | **8 ms / 6 MB** | 118 ms / 66 MB | 15× / 11× |
-| Work spread over 3 s | **7 ms / 5 MB** | 119 ms / 66 MB | 17× / 13× |
-| Large page, 145 KB | **8 ms / 6 MB** | 139 ms / 70 MB | 17× / 12× |
+| Article, 15 KB | **9 ms / 6 MB** | 167 ms / 68 MB | 18× time, 11× memory |
+| Client-rendered with `fetch` | **10 ms / 7 MB** | 139 ms / 67 MB | 14× / 10× |
+| Work spread over 3 s | **9 ms / 7 MB** | 123 ms / 66 MB | 14× / 9× |
+| Large page, 145 KB | **10 ms / 7 MB** | 151 ms / 78 MB | 15× / 11× |
 
 The harness checks that both engines did the same work: it looks in each
 engine's output for a marker that only appears once the scripts have run. For
@@ -63,10 +63,10 @@ ones.
 
 | | mar | chrome-headless-shell |
 |---|---|---|
-| Cold start | **3.2 ms / 2.2 MB** | 9.4 ms / 5.8 MB |
-| On disk | **5.3 MB** | 193 MB |
+| Cold start | **4.2 ms / 2.3 MB** | 11.9 ms / 5.8 MB |
+| On disk | **6.0 MB** (9.6 MB with `browser-tls`) | 193 MB |
 
-The 36× disk difference has practical consequences: container image size,
+The 30× disk difference has practical consequences: container image size,
 deployment time, CI cache volume.
 
 ### As a service
@@ -75,41 +75,45 @@ The figures above include process startup on every page. A service starts once,
 and the picture changes:
 
 ```
-60 client-rendered pages on 4 workers in 68 ms  =  888 pages/sec, 1.1 ms each
+60 client-rendered pages on 4 workers in 93 ms  =  645 pages/sec, 1.6 ms each
 ```
 
 ### Real sites
 
 Here the wall time includes the network and says more about the site than the
-engine. Memory does not: it is set by document size and how much script the page
-runs.
+engine. So does most of the memory now: the engine runs the page's
+application — every chunk it loads, every worker it starts — and a news front
+page ships a great deal of both. What is left of the table's earlier, smaller
+numbers is the pages that ship little.
 
 | Site | total | render | memory | extracted | scripts |
 |---|---|---|---|---|---|
-| example.com | 268 ms | 10 ms | 6.9 MB | 125 chars | 0 |
-| lenta.ru | 213 ms | 9 ms | 9.1 MB | 15,982 | 10 |
-| ria.ru | 178 ms | 19 ms | 8.9 MB | 8,317 | 20 |
-| habr.com | 465 ms | 12 ms | 10.4 MB | 1,651 | 7 |
-| gosuslugi.ru | 36 s | 36 s | 15.5 MB | 0 | 1 |
-| docs.python.org | 1.0 s | 640 ms | 8.6 MB | 12,316 | 12 |
-| Wikipedia, long article | 572 ms | 80 ms | 27.7 MB | 91,550 | 4 |
-| MDN | 1.6 s | 1.3 s | 12.4 MB | 2,002 | 5 |
+| example.com | 316 ms | 4 ms | 7.7 MB | 125 chars | 0 |
+| lenta.ru | 522 ms | 405 ms | 38.1 MB | 14,469 | 14 |
+| ria.ru | 928 ms | 637 ms | 29.4 MB | 8,131 | 66 |
+| habr.com | 7.6 s | 6.7 s | 67.2 MB | 1,102 | 9 |
+| gosuslugi.ru | 3.0 s | 757 ms | 43.0 MB | 0 | 3 |
+| docs.python.org | 861 ms | 380 ms | 14.3 MB | 12,316 | 12 |
+| Wikipedia, long article | 1.2 s | 732 ms | 46.9 MB | 91,550 | 4 |
+| MDN | 7.2 s | 6.9 s | 18.4 MB | 2,002 | 5 |
+
+habr.com is the cost of running an application: its front page pulls forty
+chunks from its CDN, one import at a time, and runs them. MDN is the same
+story with a search index. Neither yields more text than the server-rendered
+markup already held, which is why `mar read` keeps that markup when the
+scripts leave less behind — but the scripts still have to run to find out.
 
 The gosuslugi.ru row is shown deliberately, and it is not what it looks like.
 The site does not serve the portal at all. It serves a 9 KB interstitial whose
 one script computes a CRC32 proof of work, sets a cookie and reloads, and only
-then is the real page served. That is where the 36 seconds go: they are the
-proof of work, and this is the one page in the table where an interpreter
-without a JIT is genuinely the wrong tool.
+then is the real page served. That is where the seconds go, and it is the one
+page in the table where an interpreter without a JIT is genuinely the wrong
+tool. It does get through inside the default budget now; nothing is extracted
+even then, because the portal draws its body from a JavaScript challenge of its
+own after the first.
 
-It does get through — the row above is the portal, not the interstitial — but
-the default 15-second budget is not enough, so this one needs
-`--timeout-ms 60000`. Nothing is extracted even then, for a reason further down
-this page: the portal's body arrives as ES modules whose graph is deeper than
-the request budget allows.
-
-Wikipedia is the memory ceiling: a document over a megabyte costs 27.7 MB, still
-half what Chromium spends on an empty tab.
+Wikipedia is the memory ceiling for a document: a page over a megabyte costs
+47 MB, which is what Chromium spends on an empty tab.
 
 ### Coverage
 

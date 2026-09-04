@@ -12,8 +12,13 @@
   const NodeProto = Node.prototype;
   const define = (obj, name, desc) =>
     Object.defineProperty(obj, name, { configurable: true, ...desc });
-  const method = (obj, name, fn) =>
-    define(obj, name, { writable: true, value: fn });
+  const method = (obj, name, fn) => {
+    // A browser's built-ins are named after the property that holds them,
+    // and pages read `fn.name`; a function expression assigned this way is
+    // anonymous unless told otherwise.
+    if (typeof fn === 'function' && !fn.name && typeof name === 'string') define(fn, 'name', { value: name });
+    return define(obj, name, { writable: true, value: fn });
+  };
 
   // -- console ------------------------------------------------------------
 
@@ -5354,62 +5359,37 @@
 
   // -- looking built in ----------------------------------------------------
 
-  // Almost everything above is written in JavaScript, and a page can read it:
-  // `Function.prototype.toString` hands back our source where a browser hands
-  // back `[native code]`, and the bridge the CDP layer calls sits on
-  // `globalThis` in plain sight of `Object.keys`. Neither changes what the
-  // page renders, and both say plainly what is running the page.
-  //
-  // This runs last, before any page script, so everything it can reach is
-  // ours. Nothing a page defines later is ever marked.
-  (function disguise() {
-    for (const name of Object.getOwnPropertyNames(globalThis)) {
-      if (name.startsWith('__mar')) {
-        define(globalThis, name, { enumerable: false, writable: true, value: globalThis[name] });
+  // The bridge the CDP layer calls sits on `globalThis` in plain sight of
+  // `Object.keys`; it says plainly what is running the page, so it is hidden
+  // from enumeration. Everything else here already looks built in: the
+  // prelude runs from bytecode with its source stripped, and QuickJS prints
+  // such a function as `[native code]`, exactly as a browser prints its own.
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (name.startsWith('__mar')) {
+      define(globalThis, name, { enumerable: false, writable: true, value: globalThis[name] });
+    }
+  }
+  // QuickJS prints a source-less function over three lines; Chrome prints
+  // its own on one. The one-line form is what a page compares against.
+  const realToString = Function.prototype.toString;
+  const masked = function toString() {
+    const source = realToString.call(this);
+    return source.includes('[native code]')
+      ? `function ${typeof this === 'function' && this.name ? this.name : ''}() { [native code] }`
+      : source;
+  };
+  method(Function.prototype, 'toString', masked);
+
+  // `globalThis.fetch = (...) => ...` leaves the function anonymous, and a
+  // page reads `fetch.name`. One level, no recursion: the names below are
+  // where a page looks, and `method()` has already named the rest.
+  for (const holder of [globalThis, navigator, location, history, performance, screen, console]) {
+    if (!holder) continue;
+    for (const name of Object.getOwnPropertyNames(holder)) {
+      const desc = Object.getOwnPropertyDescriptor(holder, name);
+      if (desc && typeof desc.value === 'function' && !desc.value.name) {
+        try { define(desc.value, 'name', { value: name }); } catch (e) { /* frozen */ }
       }
     }
-
-    const builtIn = new WeakSet();
-    const seen = new Set();
-    const mark = (value, name, depth) => {
-      if (value == null || depth > 3) return;
-      const kind = typeof value;
-      if (kind !== 'function' && kind !== 'object') return;
-      if (seen.has(value)) return;
-      seen.add(value);
-      if (kind === 'function') {
-        builtIn.add(value);
-        // A browser's built-ins are named after the property that holds them,
-        // and pages read `fn.name`. Ours are mostly anonymous expressions.
-        if (!value.name && name) {
-          define(value, 'name', { value: name });
-        }
-      }
-      for (const key of Object.getOwnPropertyNames(value)) {
-        // Reading a getter can run page-visible code or throw; only plain
-        // values are worth following.
-        const desc = Object.getOwnPropertyDescriptor(value, key);
-        if (!desc || !('value' in desc)) continue;
-        mark(desc.value, key, depth + 1);
-      }
-      if (kind === 'function' && value.prototype) mark(value.prototype, '', depth + 1);
-      const proto = Object.getPrototypeOf(value);
-      if (proto && proto !== Object.prototype) mark(proto, '', depth + 1);
-    };
-
-    for (const root of [globalThis, document, navigator, location, screen, history]) {
-      mark(root, '', 0);
-    }
-
-    const realToString = Function.prototype.toString;
-    const masked = function toString() {
-      if (builtIn.has(this)) {
-        return `function ${this.name || ''}() { [native code] }`;
-      }
-      return realToString.call(this);
-    };
-    builtIn.add(masked);
-    builtIn.add(realToString);
-    method(Function.prototype, 'toString', masked);
-  })();
+  }
 })();

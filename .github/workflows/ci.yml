@@ -76,7 +76,9 @@ jobs:
 
       - name: Drive the endpoint with a real client
         run: |
-          ./target/release/mar cdp --bind 127.0.0.1:9222 &
+          # The page under test is served from this runner, and loopback is
+          # refused by default.
+          ./target/release/mar --allow-private cdp --bind 127.0.0.1:9222 &
           for i in $(seq 1 40); do
             curl -sf http://127.0.0.1:9222/json/version > /dev/null && break
             sleep 0.25

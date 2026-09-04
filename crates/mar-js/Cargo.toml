@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[build-dependencies]
+# The prelude is compiled to bytecode by the same QuickJS the crate links.
+rquickjs.workspace = true
+
 [dependencies]
 tracing.workspace = true
 mar-dom.workspace = true
